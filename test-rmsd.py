@@ -1,7 +1,7 @@
 import numpy as np
 
-mat = np.load("mono-leu/minim-sorted-center.npy")
-lig = np.load("mono-leu/mono-leu-centered-pdb.npy")
+mat = np.load("mono-leu/minim-sorted.npy")
+lig = np.load("mono-leu/mono-leuc-pdb.npy")
 refe = np.load("mono-leu/minim-best-ligand-pdb.npy")
 assert lig.shape == refe.shape
 mask = (np.isin(lig["name"] , (b'CA', b'C', b'O', b'N')))
