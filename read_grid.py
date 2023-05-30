@@ -40,11 +40,11 @@ def read_grid(grid_data):
     d["alphabet"] = alphabet
     nr_potentials = d["alphabet"].sum()  # ignore electrostatic potential at 99
     x, y, z = read_float(), read_float(), read_float()
-    d["origin"] = x, y, z
+    d["origin"] = np.array((x, y, z))
     dx, dy, dz = read_int(), read_int(), read_int()
-    d["dim"] = dx, dy, dz
+    d["dim"] = np.array((dx, dy, dz))
     dx2, dy2, dz2 = read_int(), read_int(), read_int()
-    d["dim2"] = dx2, dy2, dz2
+    d["dim2"] = np.array((dx2, dy2, dz2))
     d["natoms"] = read_int()
     x, y, z = read_double(), read_double(), read_double()
     # d["pivot"] = x, y, z #ignored
@@ -72,7 +72,9 @@ def read_grid(grid_data):
     innergrid_dtype = np.dtype([("potential", np.uint32, 100), ("neighbourlist", np.int32), ("nr_neighbours", np.int16)], align=True)
     innergrid = np.frombuffer(grid_data, offset=pos, count=innergridsize, dtype=innergrid_dtype)
     pos += innergrid.nbytes
-    innergrid = innergrid.reshape((dx, dy, dz))
+    innergrid = innergrid.reshape((dz, dy, dx))
+    innergrid = innergrid.swapaxes(0, 2)
+    innergrid = np.ascontiguousarray(innergrid)
     if nr_energrads:
         inner_potential_grid = np.zeros((nr_potentials, dx, dy, dz), energies.dtype)
         pot_ind = innergrid["potential"]
@@ -99,7 +101,8 @@ def read_grid(grid_data):
         pos += biggrid.nbytes
 
         outer_potential_grid = np.zeros((nr_potentials, dx2, dy2, dz2), energies.dtype)
-        pot_ind = biggrid.reshape(dx2, dy2, dz2, 100)
+        pot_ind = biggrid.reshape(dz2, dy2, dx2, 100)
+        pot_ind = pot_ind.swapaxes(0, 2)
         pot_pos = 0
         for n in range(99):
             curr_pot_ind = pot_ind[:, :, :, n]

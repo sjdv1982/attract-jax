@@ -3,3 +3,5 @@ mono-leu/mono-leu.grid
 mono-leu/gmon.out
 mono-leu/mono-leuc.grid
 mono-leu/mono-leuc.nbgrid
+*.pyc
+gmon.out
