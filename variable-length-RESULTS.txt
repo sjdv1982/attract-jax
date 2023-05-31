@@ -1,0 +1,87 @@
+variable-length.py results
+
+On my laptop (CPU 12 cores):
+
+```
+Dummy variable lists 0.11952042579650879
+Dummy constant lists 0.1541438102722168
+No GPU/TPU found, falling back to CPU. (Set TF_CPP_MIN_LOG_LEVEL=0 and rerun for more info.)
+Start (1000000, 2) (4000000,) (1000000, 2) (4000000,)
+Variable lists 17.29905366897583
+Constant lists 18.317424774169922
+Variable lists 18.4588840007782
+Constant lists 18.12819504737854
+Variable lists 17.321150302886963
+Reference variable lists
+Reference variable lists 18.134197235107422
+1000000 0.0
+Reference variable lists, blocking 13.23334288597107
+1000000 4.7683716e-07
+Constant lists 18.80344009399414
+Reference constant lists
+Reference constant lists 120.61285352706909
+1000000 0.0
+Reference constant lists, blocking 136.1721351146698
+1000000 4.7683716e-07
+```
+- No speed difference between variable and constant lists
+- jitted main version runs on all cores. 
+- jitted main version does the same work for variable/constant.
+  Running time is what you would expect for constant lists 
+  (~18 secs where you would expect ~10 for perfect parallelization), 
+  but variable lists should run 10x faster!
+- All reference evaluations run on one core, even the non-blocking version
+
+
+Google Colab, T4 GPU
+
+Dummy variable lists 0.14696979522705078
+Dummy constant lists 0.16438651084899902
+Start (1000000, 2) (4000000,) (1000000, 2) (4000000,)
+Variable lists 0.044542789459228516
+Constant lists 0.04685521125793457
+Variable lists 0.044005632400512695
+Constant lists 0.04700040817260742
+Variable lists 0.044794559478759766
+Reference variable lists
+Reference variable lists 156.3317265510559
+1000000 0.0
+Reference variable lists, blocking 225.61824250221252
+1000000 4.7683716e-07
+Constant lists 0.049449920654296875
+Reference constant lists
+=> Ctrl-C
+
+Google Colab, T4 GPU, ELE x10, MAX_ITER=40 (x10), variable list: 1 % length-4 => 1 % length-40
+
+Dummy variable lists 1.5253303050994873
+Start (10000000, 2) (400000000,) (10000000, 2) (400000000,)
+Variable lists 2.1803696155548096
+Constant lists 2.470911979675293
+Variable lists 2.1836318969726562
+Constant lists 2.451901435852051
+Variable lists 2.195406913757324
+
+
+Increase MAX_ITER from 40 to 400:
+Dummy variable lists 2.05863881111145
+Start (10000000, 2) (400000000,) (10000000, 2) (400000000,)
+Variable lists 19.026074647903442
+Constant lists 21.215856552124023
+Variable lists 19.686607837677002
+Constant lists 22.032336473464966
+Variable lists 20.451146841049194
+
+
+ELE = 1000000 (back to initial)
+MAXITER = 400 (x100)
+MAXLEN = 40 (x10)
+CONVOLUTION = 2000 (x3)
+
+Dummy variable lists 0.1484203338623047
+Start (1000000, 2) (40000000,) (1000000, 2) (40000000,)
+Variable lists 5.778092384338379
+Constant lists 6.4381279945373535
+Variable lists 5.896908283233643
+Constant lists 6.555228233337402
+Variable lists 5.946376800537109
