@@ -1,0 +1,39 @@
+{ lambda ; . let
+    a:i32[200] = pjit[
+      jaxpr={ lambda ; . let
+          b:i32[200] = iota[dimension=0 dtype=int32 shape=(200,)] 
+          c:bool[200] = lt b 200
+          d:i32[200] = convert_element_type[new_dtype=int32 weak_type=False] c
+          e:bool[200] = eq d 0
+          _:i32[200] = select_n e b b
+          f:i32[200] = broadcast_in_dim[broadcast_dimensions=() shape=(200,)] 0
+          g:bool[200] = eq d 1
+          h:i32[200] = select_n g b b
+          i:i32[200] = pjit[
+            jaxpr={ lambda ; j:i32[200]. let
+                k:i32[1000000] = iota[dimension=0 dtype=int32 shape=(1000000,)] 
+                l:i32[1000,1000] = reshape[
+                  dimensions=None
+                  new_sizes=(1000, 1000)
+                ] k
+                m:i32[1,1000,1000] = broadcast_in_dim[
+                  broadcast_dimensions=(1, 2)
+                  shape=(1, 1000, 1000)
+                ] l
+                n:i32[200,1,1] = broadcast_in_dim[
+                  broadcast_dimensions=(0,)
+                  shape=(200, 1, 1)
+                ] j
+                o:i32[200,1000,1000] = add m n
+                p:i32[200,1000,1000] = dot_general[
+                  dimension_numbers=(([2], [1]), ([0], [0]))
+                ] o o
+                q:i32[200] = reduce_sum[axes=(1, 2)] p
+              in (q,) }
+            name=f
+          ] h
+          r:i32[200] = select_n d f i
+        in (r,) }
+      name=main
+    ] 
+  in (a,) }
