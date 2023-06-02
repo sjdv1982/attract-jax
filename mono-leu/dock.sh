@@ -22,4 +22,8 @@ for grid in grid nbgrid; do
 done
 wait
 
+# NOTE: In addition to minim-sorted-$grid.score above,
+# minim-sorted-$grid.TORQUE.score was also generated.
+# This was done by recompiling ATTRACT with a printout of 
+# the 3x3 torque gradient matrix in rota.f
 

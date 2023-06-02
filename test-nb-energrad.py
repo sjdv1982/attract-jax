@@ -8,6 +8,7 @@ from jax import jit
 from jax.lax import cond
 from functools import partial
 import time
+import sys
 
 from read_grid import read_grid
 
@@ -164,7 +165,7 @@ def main(mat):
             chunk_ligand_atom = sort_index[1][start:start+padded_size]
             offset = i
             energy = nb_energy(chunk_nb_index, offset, chunk_ligand_struc, chunk_ligand_atom, all_coors_lig)
-            print(i, start, realsize)
+            print(i, start, realsize, file=sys.stderr)
             chunk_energies.append((i, start, realsize, energy))
         
     nr_energies = iter_pos[-1]
@@ -193,5 +194,8 @@ print("Energies:")
 print(energies[:10])
 print()
 
-print("Gradients (translational):")  
+print("Gradients (translational):")
 print(-result[:10, 3, :3])  # sign is opposite of ATTRACT...
+
+print("Gradients (torque):")
+print(-result[:10, :3, :3])  # sign is opposite of ATTRACT...
