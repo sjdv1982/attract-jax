@@ -95,12 +95,8 @@ def generate_grid_table(all_coors_lig, grid, grid_dim):
     
     # we are interested in gridtype=2 (inner grid), sorted by length (nb_index[:,:,0]), in descending order
     # TODO: make sure that max #contacts is lower than 1000
-    key = (-1000.0 * gridtype - nb_index[:, :, 0]).astype(jnp.int16)
-    # Slow! 2 secs for 10k structures... (https://github.com/google/jax/issues/10434)
-    #   XLA argsort is slow on CPU. Should be fine on GPU. 
-    sort_index = jnp.unravel_index(jnp.argsort(key,axis=None), key.shape)    
 
-    return gridtype, nb_index, potential, sort_index
+    return gridtype, nb_index, potential
 
 
 @jit
@@ -142,7 +138,13 @@ def main(mat):
 
     grid_table = generate_grid_table(all_coors_lig, grid, tuple(grid.dim))
 
-    gridtype, nb_index, potential, sort_index = grid_table
+    gridtype, nb_index, potential = grid_table
+
+    key = (-1000.0 * gridtype - nb_index[:, :, 0]).astype(jnp.int16)
+    # Slow! 2 secs for 10k structures... (https://github.com/google/jax/issues/10434)
+    #   XLA argsort is slow on CPU. Should be fine on GPU. 
+    # => use hostcall on CPU
+    sort_index = jnp.unravel_index(run_argsort(key,axis=None), key.shape)    
 
     nr_inner_atoms = jnp.searchsorted(-gridtype[sort_index], -2, side="right")
     sort_index = sort_index[:nr_inner_atoms]
@@ -155,6 +157,7 @@ def main(mat):
     iter_pos = jnp.searchsorted(-sorted_nb_index[:, 0], jnp.arange(-max_contacts+1, 1))
 
     chunks = [chunker(int(ip)) for ip in iter_pos]
+    # chunks = chunks[:0]  # to dominate the timing by the argsort     
 
     chunk_energies = []
     for i, chs in enumerate(chunks[::-1]):
@@ -179,6 +182,40 @@ def main(mat):
 
     return energies
 
+def run_argsort_jax(arr:jnp.ndarray, axis) -> jnp.ndarray:
+    return jnp.argsort(arr,axis=axis)   
+
+def _run_argsort_numpy(args) -> jnp.ndarray:
+    arr, axis = args
+    return np.argsort(arr, axis=axis)
+
+def run_argsort_numpy(arr:jnp.ndarray, axis) -> jnp.ndarray:
+    from jax.experimental import host_callback as hcb
+    if jax.devices()[0].device_kind != "cpu":
+        return jnp.argsort(arr,axis=axis)
+
+    ########################################
+    # Comment out in jax/experimental/host_callback.py the following lines:
+    # 1402: if not params["identity"]:
+    # 1403:   raise NotImplementedError("JVP rule is implemented only for id_tap, not for call.")
+
+    print("Run argsort using Numpy")
+    if axis is None:
+        result_shape = arr.ravel().shape
+    else:
+        result_shape = arr.shape
+    result_shape=jax.ShapeDtypeStruct(result_shape, np.int32)
+
+    return hcb.call(
+        _run_argsort_numpy, (arr, axis), result_shape=result_shape
+    )    
+    
+
+
+# To test the timing of JAX argsort vs Numpy argsort
+#run_argsort = run_argsort_jax
+run_argsort = run_argsort_numpy
+
 print("Calculate energies...")
 energies = main(mat)  
 
@@ -188,6 +225,7 @@ def main2(mat):
 
 print("Calculate gradients...")
 grad_main = jax.grad(main2)
+
 result = grad_main(mat)
 
 print("Energies:")  
@@ -199,3 +237,10 @@ print(-result[:10, 3, :3])  # sign is opposite of ATTRACT...
 
 print("Gradients (torque):")
 print(-result[:10, :3, :3])  # sign is opposite of ATTRACT...
+
+print("Timing...", file=sys.stderr)
+t = time.time()
+jax.block_until_ready(main(mat))
+jax.block_until_ready(grad_main(mat))
+print("{:.2f} seconds".format(time.time() - t), file=sys.stderr)
+# CPU: 2.7 secs for Numpy argsort vs 6.3 secs for JAX argsort, when chunks is set to zero

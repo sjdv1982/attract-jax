@@ -1,8 +1,10 @@
 Calculate energies...
+Run argsort using Numpy
 Calculate gradients...
+Run argsort using Numpy
 Energies:
-[-27.288895    7.6893816 -42.801605  -11.969818   47.696606    8.379738
- -38.852676   52.46781    45.007317  -19.125679 ]
+[-27.288904    7.6893797 -42.80161   -11.969822   47.696606    8.379742
+ -38.852676   52.467815   45.007305  -19.125675 ]
 
 Gradients (translational):
 [[ 189.83322  -480.26788  -141.98044 ]
@@ -55,3 +57,5 @@ Gradients (torque):
  [[-1624.7158    1718.6025    -295.46814 ]
   [-2380.1707    4637.255     2579.8337  ]
   [-2796.4478    2943.8215    3074.434   ]]]
+Run argsort using Numpy
+Run argsort using Numpy
