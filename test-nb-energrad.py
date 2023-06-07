@@ -244,3 +244,5 @@ jax.block_until_ready(main(mat))
 jax.block_until_ready(grad_main(mat))
 print("{:.2f} seconds".format(time.time() - t), file=sys.stderr)
 # CPU: 2.7 secs for Numpy argsort vs 6.3 secs for JAX argsort, when chunks is set to zero
+# The rest of energy evaluation is ~1.7 secs on the CPU
+# Timings x2 (for argsort) - x6 (for energy eval) when calculating gradients, too.
