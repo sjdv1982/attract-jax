@@ -182,34 +182,34 @@ def main(mat):
 
     return energies
 
-def run_argsort_jax(arr:jnp.ndarray, axis) -> jnp.ndarray:
+def run_argsort_jax(arr:jnp.ndarray, axis) -> jnp.ndarray:    
     return jnp.argsort(arr,axis=axis)   
 
 def _run_argsort_numpy(args) -> jnp.ndarray:
+    jax.debug.print("Run argsort using Numpy")
     arr, axis = args
-    return np.argsort(arr, axis=axis)
+    return np.argsort(arr, axis=axis).astype(np.int32)
 
-def run_argsort_numpy(arr:jnp.ndarray, axis) -> jnp.ndarray:
-    from jax.experimental import host_callback as hcb
+def run_argsort_numpy(arr:jnp.ndarray, axis=None) -> jnp.ndarray:
     if jax.devices()[0].device_kind != "cpu":
         return jnp.argsort(arr,axis=axis)
-
-    ########################################
-    # Comment out in jax/experimental/host_callback.py the following lines:
-    # 1402: if not params["identity"]:
-    # 1403:   raise NotImplementedError("JVP rule is implemented only for id_tap, not for call.")
-
-    print("Run argsort using Numpy")
+    
     if axis is None:
         result_shape = arr.ravel().shape
     else:
         result_shape = arr.shape
     result_shape=jax.ShapeDtypeStruct(result_shape, np.int32)
 
-    return hcb.call(
-        _run_argsort_numpy, (arr, axis), result_shape=result_shape
+    return jax.pure_callback(
+        _run_argsort_numpy, result_shape, (arr, axis)
     )    
+
+if jax.devices()[0].device_kind == "cpu":
+    run_argsort_numpy = jax.custom_jvp(run_argsort_numpy)
     
+    @run_argsort_numpy.defjvp
+    def default_grad(primals, tangents):
+        return run_argsort_numpy(*primals), run_argsort_numpy(*tangents)
 
 
 # To test the timing of JAX argsort vs Numpy argsort
@@ -238,11 +238,19 @@ print(-result[:10, 3, :3])  # sign is opposite of ATTRACT...
 print("Gradients (torque):")
 print(-result[:10, :3, :3])  # sign is opposite of ATTRACT...
 
+total_energy = energies.sum()
+
 print("Timing...", file=sys.stderr)
 t = time.time()
-jax.block_until_ready(main(mat))
-jax.block_until_ready(grad_main(mat))
+
+## Energy and gradients:
+# total_energy0, gradients0 = jax.block_until_ready(jax.value_and_grad(main2))(mat)
+
+total_energy0 = main2(mat)  # energy only
+
+assert abs(total_energy0 - total_energy) < 0.00001
+
 print("{:.2f} seconds".format(time.time() - t), file=sys.stderr)
-# CPU: 2.7 secs for Numpy argsort vs 6.3 secs for JAX argsort, when chunks is set to zero
-# The rest of energy evaluation is ~1.7 secs on the CPU
-# Timings x2 (for argsort) - x6 (for energy eval) when calculating gradients, too.
+# CPU: 1.5 secs for Numpy argsort vs 3.5 secs for JAX argsort, when chunks is set to zero
+# The rest of energy evaluation is ~2.5 secs on the CPU
+# Energy eval timing x4-x6 when calculating gradients, too.
