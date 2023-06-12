@@ -33,17 +33,18 @@ rec_atomtypes = jnp.ones(len(coor_rec), np.uint8)
 
 # ATTRACT params for Leu CSE - Leu CSE (bead 15 - bead 15)
 
-rbc = 3.88
-abc = 13.81
-ipon = 1
-potshape = 8
 
-rc =abc*rbc**potshape
-ac =abc*rbc**6
+potshape = 8
+atomtype = 14
+
+par = np.load("attract-par.npz")
+rc, ac, ivor = par["rc"], par["ac"], par["ivor"]
+rc = rc[atomtype, atomtype]
+ac = ac[atomtype, atomtype]
+ivor = ivor[atomtype, atomtype]
 
 emin=-27.0*ac**4/(256.0*rc**3)
 rmin2=4.0*rc/(3.0*ac)
-ivor = ipon
 
 def nonbon(dsq, rc, ac, emin, rmin2, ivor):
     rr2 = 1/dsq
