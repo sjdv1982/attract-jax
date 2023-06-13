@@ -1,8 +1,12 @@
-mono-leu/mono-leu.nbgrid
-mono-leu/mono-leu.grid
-mono-leu/gmon.out
-mono-leu/mono-leuc.grid
 mono-leu/mono-leuc.nbgrid
+mono-leu/mono-leuc.grid
+mono-leu/gmon.out
+1B7F-bound/receptorgrid.alphabet
+1B7F-bound/receptorgrid.nbgrid
+1B7F-bound/receptorgrid.grid
+1B7F-bound/gmon.out
+1B7F-bound/bound-frag*.score
+1B7F-bound/*-pdb.npy
 *.pyc
 gmon.out
 attract-par.npz

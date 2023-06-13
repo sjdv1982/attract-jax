@@ -3,6 +3,8 @@ set -u -e
 
 # authors: Isaure Chauvot de Beauchene, Sjoerd de Vries, CNRS.
 
+# TODO: gravity??
+
 #trap "kill -- -$BASHPID; $ATTRACTDIR/shm-clean" ERR EXIT
 
 #set -u -e
