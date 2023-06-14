@@ -2,7 +2,7 @@ import struct
 import numpy as np
 from collections import namedtuple
 
-def read_grid(grid_data):
+def read_grid(grid_data, read_gradients=False):
     pos = 0
 
     def _r(token, size):
@@ -55,7 +55,8 @@ def read_grid(grid_data):
         assert shm_energrads == -1, "Can't read grid from shared memory"
         energrads = np.frombuffer(grid_data, offset=pos, count=nr_energrads * 4, dtype=np.float32)
         energrads = energrads.reshape(nr_energrads, 4)
-        energies = np.ascontiguousarray(energrads[:, 0])
+        if not read_gradients:
+            energies = np.ascontiguousarray(energrads[:, 0])
         pos += energrads.nbytes
     
     nr_neighbours = read_int()
@@ -76,7 +77,10 @@ def read_grid(grid_data):
     innergrid = innergrid.swapaxes(0, 2)
     innergrid = np.ascontiguousarray(innergrid)
     if nr_energrads:
-        inner_potential_grid = np.zeros((nr_potentials, dx, dy, dz), energies.dtype)
+        if read_gradients:
+            inner_potential_grid = np.zeros((nr_potentials, dx, dy, dz, 4), energrads.dtype)
+        else:
+            inner_potential_grid = np.zeros((nr_potentials, dx, dy, dz), energrads.dtype)
         pot_ind = innergrid["potential"]
         pot_pos = 0
         for n in range(99):
@@ -84,8 +88,11 @@ def read_grid(grid_data):
             if not alphabet[n]:
                 assert curr_pot_ind.max() == 0, (n, curr_pot_ind.min(), curr_pot_ind.max())
                 continue
-            assert curr_pot_ind.min() >= 1 and curr_pot_ind.max() <= len(energies), (n, curr_pot_ind.min(), curr_pot_ind.max(), len(energies))
-            inner_potential_grid[pot_pos] = energies[curr_pot_ind-1]
+            assert curr_pot_ind.min() >= 1 and curr_pot_ind.max() <= len(energrads), (n, curr_pot_ind.min(), curr_pot_ind.max(), len(energrads))
+            if read_gradients:
+                inner_potential_grid[pot_pos] = energrads[curr_pot_ind-1]
+            else:
+                inner_potential_grid[pot_pos] = energies[curr_pot_ind-1]
             pot_pos += 1
         del pot_ind
         d["inner_potential_grid"] = inner_potential_grid
@@ -100,7 +107,10 @@ def read_grid(grid_data):
         biggrid = np.frombuffer(grid_data, offset=pos, count=biggridsize*100, dtype=np.uint32)
         pos += biggrid.nbytes
 
-        outer_potential_grid = np.zeros((nr_potentials, dx2, dy2, dz2), energies.dtype)
+        if read_gradients:
+            outer_potential_grid = np.zeros((nr_potentials, dx2, dy2, dz2, 4), energrads.dtype)
+        else:
+            outer_potential_grid = np.zeros((nr_potentials, dx2, dy2, dz2), energrads.dtype)
         pot_ind = biggrid.reshape(dz2, dy2, dx2, 100)
         pot_ind = pot_ind.swapaxes(0, 2)
         pot_pos = 0
@@ -109,12 +119,17 @@ def read_grid(grid_data):
             if not alphabet[n]:
                 assert curr_pot_ind.max() == 0, (n, curr_pot_ind.min(), curr_pot_ind.max())
                 continue
-            assert curr_pot_ind.max() <= len(energies), (curr_pot_ind.max(), len(energies))
+            assert curr_pot_ind.max() <= len(energrads), (curr_pot_ind.max(), len(energrads))
             mask = (curr_pot_ind>0)
-            outer_potential_grid[pot_pos][mask] = energies[curr_pot_ind[mask]-1]
+            if read_gradients:
+                outer_potential_grid[pot_pos][mask] = energrads[curr_pot_ind[mask]-1]
+            else:
+                outer_potential_grid[pot_pos][mask] = energies[curr_pot_ind[mask]-1]
             pot_pos += 1
         del pot_ind
-        del energies
+        del energrads
+        if not read_gradients:
+            del energies
         d["outer_potential_grid"] = outer_potential_grid
     else:
         assert biggridsize == 0, biggridsize

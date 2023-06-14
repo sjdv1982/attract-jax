@@ -197,7 +197,7 @@ def potential_energy(all_coors_lig, lig_atomtype_pos, grid):
 
     vox_outergrid =  (vox_innergrid + grid.gridextension)/2
     x, y, z = vox_outergrid[:, :, 0], vox_outergrid[:, :, 1], vox_outergrid[:, :, 2]
-    in_outergrid = ((x >= 0) & (x < grid.dim2[0]) & (y >= 0) & (y < grid.dim2[1]) & (z >= 0) & (z < grid.dim2[2]))
+    in_outergrid = ((x >= 0) & (x < grid.dim2[0]-1) & (y >= 0) & (y < grid.dim2[1]-1) & (z >= 0) & (z < grid.dim2[2]-1))
 
     atom_energies = potential_energy_all(lig_atomtype_pos, vox_innergrid, in_innergrid, vox_outergrid, in_outergrid, grid.inner_potential_grid, grid.outer_potential_grid)
     return atom_energies.sum(axis=1)

@@ -7,6 +7,7 @@ mono-leu/gmon.out
 1B7F-bound/gmon.out
 1B7F-bound/bound-frag*.score
 1B7F-bound/*-pdb.npy
+__pycache__/*
 *.pyc
 gmon.out
 attract-par.npz

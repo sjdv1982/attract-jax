@@ -194,3 +194,5 @@ for i, start, realsize, energy in chunk_energies:
 energies = np.zeros(len(all_coors_lig))
 ligand_struc = sort_index[0][:nr_energies]
 np.add.at(energies, ligand_struc, atom_energies)    
+for e in energies[:10]:
+    print(e)
