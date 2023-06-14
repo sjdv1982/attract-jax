@@ -26,4 +26,5 @@ wait
 # minim-sorted-$grid.TORQUE.score was also generated.
 # This was done by recompiling ATTRACT with a printout of 
 # the 3x3 torque gradient matrix in rota.f
-
+# In addition, minim-sorted-grid.TORQUE-ONLYPOT.score, 
+#  where ATTRACT was recompiled with neighbour grids disabled
