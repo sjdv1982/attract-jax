@@ -243,7 +243,7 @@ def potential_energy(all_coors_lig, lig_atomtype_pos, grid):
     atom_energies = potential_energies(all_coors_lig, lig_atomtype_pos, grid)
     return atom_energies.sum(axis=1)
 
-@partial(jit, static_argnums=(2,))
+@partial(jit, static_argnames=("grid_dim",))
 def generate_nb_table(all_coors_lig, grid, grid_dim):
     vox_innergrid =  (all_coors_lig - grid.origin) / grid.gridspacing
     x, y, z = vox_innergrid[:, :, 0], vox_innergrid[:, :, 1], vox_innergrid[:, :, 2]
@@ -296,26 +296,24 @@ def neighbour_energy(coor_rec, rec_atomtypes, all_coors_lig, lig_atomtypes, ff, 
     return energies
 
 def main(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, lig_atomtype_pos, ff, grid):
-    coor_lig2 = np.concatenate((coor_lig, np.ones((len(coor_lig),1))),axis=1)
+    coor_lig2 = jnp.concatenate((coor_lig, jnp.ones((len(coor_lig),1))),axis=1)
     all_coors_lig = jnp.einsum("jk,ikl->ijl", coor_lig2, mat) #diagonally broadcasted form of coor_lig.dot(mat)
     all_coors_lig = all_coors_lig[:, :, :3]
 
     pot_energies = potential_energy(all_coors_lig, lig_atomtype_pos, grid)
     nb_energies = neighbour_energy(coor_rec, rec_atomtypes, all_coors_lig, lig_atomtypes, ff, grid)
-    return pot_energies + nb_energies
+    energies = pot_energies + nb_energies
+    return energies.sum(), energies
 
 coor_rec = jnp.array(coor_rec)
 coor_lig = jnp.array(coor_lig)
 rec_atomtypes = jnp.array(rec_atomtypes)
 lig_atomtypes = jnp.array(lig_atomtypes)
-energy = main(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, lig_atomtype_pos, ff, grid)
-for e in energy:
+_, energies = main(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, lig_atomtype_pos, ff, grid)
+for e in energies[:10]:
     print(e)
     
-def main2(mat, *args, **kwargs):
-    energies = main(mat, *args, **kwargs)
-    return energies.sum()
 
-print("Calculate gradients...")
-grad_main = jax.grad(main2)
-result = grad_main(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, lig_atomtype_pos, ff, grid)
+print("Calculate energies and gradients...")
+vgrad_main = jax.value_and_grad(main, has_aux=True)
+(_, energies), gradients = vgrad_main(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, lig_atomtype_pos, ff, grid)
