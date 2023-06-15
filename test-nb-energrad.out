@@ -1,10 +1,8 @@
-Calculate energies...
-Run argsort using Numpy
-Calculate gradients...
+Calculate energies and gradients...
 Run argsort using Numpy
 Energies:
-[-27.288904    7.6893797 -42.80161   -11.969822   47.696606    8.379742
- -38.852676   52.467815   45.007305  -19.125675 ]
+[-27.2889      7.689387  -42.80161   -11.969822   47.696606    8.3797455
+ -38.852673   52.467808   45.00731   -19.125683 ]
 
 Gradients (translational):
 [[ 189.83322  -480.26788  -141.98044 ]
