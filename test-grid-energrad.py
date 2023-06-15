@@ -310,10 +310,18 @@ coor_lig = jnp.array(coor_lig)
 rec_atomtypes = jnp.array(rec_atomtypes)
 lig_atomtypes = jnp.array(lig_atomtypes)
 _, energies = main(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, lig_atomtype_pos, ff, grid)
-for e in energies[:10]:
-    print(e)
     
 
 print("Calculate energies and gradients...")
 vgrad_main = jax.value_and_grad(main, has_aux=True)
 (_, energies), gradients = vgrad_main(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, lig_atomtype_pos, ff, grid)
+
+print("Energies:")  
+print(energies[:10])
+print()
+
+print("Gradients (translational):")
+print(-gradients[:10, 3, :3])  # sign is opposite of ATTRACT...
+
+print("Gradients (torque):")
+print(-gradients[:10, :3, :3])  # sign is opposite of ATTRACT...
