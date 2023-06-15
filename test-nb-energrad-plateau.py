@@ -154,27 +154,83 @@ def nb_energy_single(nb_index, offset, lig_struc, lig_atom, all_coors_lig, coor_
     dsq = (d*d).sum()
     return cond(dsq<plateaudissq, nonbon_dif, lambda *args: 0.0, d,ff, at1, at2)
 
+nb_energy = jnp.vectorize(nb_energy_single, excluded=(1,4,5,6,7,8), signature="(),(),()->()")
 
-nb_energy = jnp.vectorize(nb_energy_single, excluded=(1,4,5,6,7,8))
+@partial(jit, static_argnames=("padded_size",))
+def nb_energy_dyn(padded_size, realsize, nb_index, offset, lig_struc, lig_atom, all_coors_lig, coor_rec, rec_atomtypes, lig_atomtypes, ff):
+    ind = jnp.arange(padded_size,dtype=np.int32)
+    energies = nb_energy(nb_index, offset, lig_struc, lig_atom, all_coors_lig, coor_rec, rec_atomtypes, lig_atomtypes, ff)
+    return jnp.where(ind<realsize, energies, jnp.zeros_like(energies))
 
-MIN_CHUNK=2**21
+@partial(jit, static_argnames=("padded_size",))
+def nb_energy_dynblock(padded_size, realsizes, nb_index, offset, lig_struc, lig_atom, all_coors_lig, coor_rec, rec_atomtypes, lig_atomtypes, ff):    
+    for n in range(len(realsizes)):
+        e = nb_energy_dyn(padded_size, realsizes[n], nb_index, offset+n, lig_struc, lig_atom, all_coors_lig, coor_rec, rec_atomtypes, lig_atomtypes, ff)
+        assert len(e) == padded_size
+        if n == 0:
+            energies = e
+        else:
+            energies = energies + e
+    return energies
+2
+MIN_CHUNK_FULL_WIDTH=2**14
+MIN_CHUNK_FRAC = 0.6
+MIN_CHUNK_WIDE_FRAC = 0.4
+MIN_CHUNK=2**15
 MAX_CHUNK=2**26
 
 # TODO: in jnp, so it is on the GPU
 # anyway, probably unnecessary, always a single chunk should do on a GPU 
 # TODO: more clever tiling afterwards...
-def chunker(s, offset=0):
-    if s <= MIN_CHUNK:
-        result = [(offset, s, MIN_CHUNK)]
-    elif s > MAX_CHUNK:
-        result = [(offset, MAX_CHUNK, MAX_CHUNK)] + chunker(s-MAX_CHUNK, offset+MAX_CHUNK)
-    else:
-        c = MIN_CHUNK
-        while s > c:
-            c *= 2
-        c //= 2
-        result = [(offset, c, c)] + chunker(s-c, offset+c)
+def chunker(s,offset=0,first=True, remaining_s=None):
+    found = False
+    if first:
+        assert remaining_s is not None
+        if s <= MIN_CHUNK_FULL_WIDTH:
+            result = [(offset, remaining_s, MIN_CHUNK_FULL_WIDTH)]
+            found = True
+        elif s < MAX_CHUNK:
+            c = MIN_CHUNK
+            while s > c:
+                c *= 2
+            if s/c < MIN_CHUNK_WIDE_FRAC and MIN_CHUNK_WIDE_FRAC > 0.5:
+                c //= 2
+            slist = [s]
+            for s_next in remaining_s[1:]:
+                if s_next <= MIN_CHUNK_FULL_WIDTH or s_next/c < MIN_CHUNK_WIDE_FRAC:
+                    break
+                slist.append(s_next)
+            result = [(offset, jnp.array(slist,int), c)]
+            found = True
+    if not found:
+        if s == 0:
+            return []
+        if s <= MIN_CHUNK:
+            result = [(offset, s, MIN_CHUNK)]
+        elif s > MAX_CHUNK:
+            result = [(offset, MAX_CHUNK, MAX_CHUNK)] + chunker(s-MAX_CHUNK, offset+MAX_CHUNK,first=False)
+        else:
+            c = MIN_CHUNK
+            while s > c:
+                c *= 2
+            if s/c < MIN_CHUNK_FRAC:
+                c //= 2
+            result = [(offset, c, c)] + chunker(s-c, offset+c,first=False)    
     return result
+
+def chunker_all(iter_pos):
+    chunks = []
+    iter_pos2 = [int(ip) for ip in iter_pos[::-1]]
+    n = 0
+    while n < len(iter_pos2):
+        ip = iter_pos2[n]
+        result = chunker(ip, remaining_s=jnp.array(iter_pos2[n:]))
+        if len(result) and not isinstance(result[0][1], int):
+            n += len(result[0][1])
+        else:
+            n += 1
+        chunks.append(result)
+    return chunks
 
 @partial(jit, static_argnames=("grid_dim",))
 def generate_nb_table(all_coors_lig, grid, grid_dim):
@@ -192,6 +248,12 @@ def generate_nb_table(all_coors_lig, grid, grid_dim):
     nr_inner_atoms = jnp.searchsorted(key[sort_index], 0, side="left")
     return nb_index, sort_index, nr_inner_atoms
 
+@jit
+def neighbour_energy_accum(all_coors_lig, lig_struc, atom_energies):
+    energies = jnp.zeros(len(all_coors_lig))    
+    energies = energies.at[lig_struc].add(atom_energies)
+    return energies
+
 def neighbour_energy(coor_rec, rec_atomtypes, all_coors_lig, lig_atomtypes, ff, grid):
     nb_index, sort_index, nr_inner_atoms = generate_nb_table(all_coors_lig, grid, tuple(grid.dim))
     sort_index = (sort_index[0][:nr_inner_atoms], sort_index[1][:nr_inner_atoms])
@@ -199,33 +261,59 @@ def neighbour_energy(coor_rec, rec_atomtypes, all_coors_lig, lig_atomtypes, ff, 
     # we are interested in length > 0
     sorted_nb_index = nb_index[sort_index]
     max_contacts = sorted_nb_index[0, 0]
+    sorted_nb_index_p2 = sorted_nb_index[:, 1]
+    sort_index_p1 = sort_index[0]
+    sort_index_p2 = sort_index[1]
+    
+    sorted_nb_index_p2 = jnp.concatenate((sorted_nb_index_p2, jnp.zeros(MAX_CHUNK,sorted_nb_index.dtype)))
+    sort_index_p1 = jnp.concatenate((sort_index_p1, jnp.zeros(MAX_CHUNK,sort_index[0].dtype)))
+    sort_index_p2 = jnp.concatenate((sort_index_p2, jnp.zeros(MAX_CHUNK,sort_index[1].dtype)))
 
     # The number of atoms with contacts c: c=max_contacts, c>=max_contacts-1, c>=max_contacts-2, ..., c>=1 
     iter_pos = jnp.searchsorted(-sorted_nb_index[:, 0], jnp.arange(-max_contacts+1, 1))
 
-    chunks = [chunker(int(ip)) for ip in iter_pos]
+    chunks = chunker_all(iter_pos)
 
     chunk_energies = []
-    for i, chs in enumerate(chunks[::-1]):
+    pos = 0
+    for i, chs in enumerate(chunks):
         for ch in chs:
-            start, realsize, padded_size = ch
-            chunk_nb_index = sorted_nb_index[start:start+padded_size, 1]
-            chunk_lig_struc = sort_index[0][start:start+padded_size]
-            chunk_lig_atom = sort_index[1][start:start+padded_size]
-            offset = i
-            energy = nb_energy(chunk_nb_index, offset, chunk_lig_struc, chunk_lig_atom, all_coors_lig, coor_rec, rec_atomtypes, lig_atomtypes, ff)
-            print(i, start, realsize, file=sys.stderr)
-            chunk_energies.append((i, start, realsize, energy))
-        
-    nr_energies = iter_pos[-1]
-    atom_energies = jnp.zeros(nr_energies)
-    for i, start, realsize, energy in chunk_energies:
-        atom_energies = atom_energies.at[start:start+realsize].add(energy[:realsize])
-        
-    energies = jnp.zeros(len(all_coors_lig))
-    lig_struc = sort_index[0][:nr_energies]
-    energies = energies.at[lig_struc].add(atom_energies)
+            start, realsizes, padded_size = ch
+            assert start >= 0
+            chunk_nb_index = sorted_nb_index_p2[start:start+padded_size]
+            chunk_lig_struc = sort_index_p1[start:start+padded_size]
+            chunk_lig_atom = sort_index_p2[start:start+padded_size]
+            assert len(chunk_nb_index) == padded_size
+            assert len(chunk_lig_struc) == padded_size
+            assert len(chunk_lig_atom) == padded_size
+            offset = pos
+            if isinstance(realsizes, int):
+                realsize = realsizes
+                #energy = nb_energy(chunk_nb_index, offset, chunk_lig_struc, chunk_lig_atom, all_coors_lig, coor_rec, rec_atomtypes, lig_atomtypes, ff)                                
+                energy = nb_energy_dyn(padded_size, realsize, chunk_nb_index, offset, chunk_lig_struc, chunk_lig_atom, all_coors_lig, coor_rec, rec_atomtypes, lig_atomtypes, ff)
+                print(i, pos, start, realsize, energy.shape,  padded_size, file=sys.stderr)
+                chunk_energies.append((i, start, realsize, energy))
+                pos += 1
+            else:
+                energy = nb_energy_dynblock(padded_size, realsizes, chunk_nb_index, offset, chunk_lig_struc, chunk_lig_atom, all_coors_lig, coor_rec, rec_atomtypes, lig_atomtypes, ff)
+                print(i, (pos, pos + len(realsizes)), jnp.max(realsizes), energy.shape, padded_size, file=sys.stderr)
+                chunk_energies.append((i, start, jnp.max(realsizes), energy))
+                pos += len(realsizes)
 
+    nr_energies = iter_pos[-1]
+    nr_energies_pad = jnp.exp2(jnp.ceil(jnp.log2(nr_energies))).astype(int)
+    atom_energies = jnp.zeros(nr_energies_pad)
+    for i, start, realsize, energy in chunk_energies:
+        print(i, start, realsize, file=sys.stderr)
+        atom_energies = atom_energies.at[start:start+realsize].add(energy[:realsize])
+
+    if nr_energies_pad == nr_energies:
+        lig_struc = sort_index[0][:nr_energies]
+    else:
+        lig_struc = jnp.concatenate((sort_index[0][:nr_energies], jnp.zeros(nr_energies_pad-nr_energies, dtype=sort_index[0].dtype)))
+    
+    energies = neighbour_energy_accum(all_coors_lig, lig_struc, atom_energies)
+        
     return energies
 
 def main(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, lig_atomtype_pos, ff, grid):
@@ -259,7 +347,24 @@ print(-gradients[:10, :3, :3])  # sign is opposite of ATTRACT...
 
 total_energy = energies.sum()
 
-print("Timing...", file=sys.stderr)
+main(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, lig_atomtype_pos, ff, grid)
+
+print("Timing (energies)...", file=sys.stderr)
+t = time.time()
+
+total_energy0, energies = main(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, lig_atomtype_pos, ff, grid)
+
+assert abs(total_energy0 - total_energy) < 0.00001
+
+print("{:.2f} seconds".format(time.time() - t), file=sys.stderr)
+print(file=sys.stderr)
+
+
+(total_energy0, energies), gradients = vgrad_main(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, lig_atomtype_pos, ff, grid)
+
+assert abs(total_energy0 - total_energy) < 0.00001
+
+print("Timing (gradients)...", file=sys.stderr)
 t = time.time()
 
 (total_energy0, energies), gradients = vgrad_main(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, lig_atomtype_pos, ff, grid)
@@ -267,6 +372,3 @@ t = time.time()
 assert abs(total_energy0 - total_energy) < 0.00001
 
 print("{:.2f} seconds".format(time.time() - t), file=sys.stderr)
-# CPU: 1.5 secs for Numpy argsort vs 3.5 secs for JAX argsort, when chunks is set to zero
-# The rest of energy evaluation is ~2.5 secs on the CPU
-# Energy eval timing x4-x6 when calculating gradients, too.
