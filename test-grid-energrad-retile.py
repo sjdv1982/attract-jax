@@ -174,7 +174,7 @@ def nb_energy_single(nb_index, offset, lig_struc, lig_atom, all_coors_lig, coor_
     at2 = lig_atomtypes[lig_atom]
     d = (lig_c - rec_c)
     dsq = (d*d).sum()
-    return cond(dsq<plateaudissq, nonbon_dif, lambda *args: 0.0, d,ff, at1, at2)
+    return cond(((receptor_atom < 999999999) & (dsq<plateaudissq)), nonbon_dif, lambda *args: 0.0, d,ff, at1, at2)
 
 nb_energy_vec = jnp.vectorize(nb_energy_single, excluded=(1,4,5,6,7,8), signature="(),(),()->()")
 
