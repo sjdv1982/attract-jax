@@ -182,7 +182,9 @@ def pad_grid(grid, padding):
     lengths_nonzero = lengths[mask_length]
     indices_old = create_ranges(pos_old_nonzero, pos_old_nonzero + lengths_nonzero)
     indices_new = create_ranges(pos_nonzero, pos_nonzero + lengths_nonzero)
-    nb2 = np.zeros(padded_lengths.sum(), dtype=grid.neighbours.dtype)
+    nb2 = np.zeros(padded_lengths.sum(), dtype=np.uint32)
+    nan = np.iinfo(np.uint32).max
+    nb2[:] = nan
     nb2[indices_new] = grid.neighbours[indices_old]
     
     g[:, 1] = pos + 1
