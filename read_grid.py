@@ -137,3 +137,66 @@ def read_grid(grid_data, read_gradients=False):
     grid_class = namedtuple("Grid", d.keys())
     grid = grid_class(*d.values())
     return grid
+
+def pad_grid(grid, padding):
+    # pads neighbourlist grid, padding a list of size N with padding[N-1]
+    # if padding is an integer, it is repeated.
+    # if padding is a list with too few elements, the last element is repeated
+    neighbour_grid = np.array(grid.neighbour_grid)
+    g = neighbour_grid.reshape(-1,2)
+    max_contacts = g[:, 0].max()
+    try:
+        len(padding)
+    except Exception:    
+        padding = np.repeat(int(padding), max_contacts)
+    else:
+        padding2 = np.empty(max_contacts,np.uint16)
+        lp = min(len(padding2), len(padding))
+        padding2[:lp] = padding[:lp]
+        padding2[len(padding):max_contacts] = padding[-1]
+        padding = padding2
+        
+    lengths = g[:, 0]
+    pos_old = g[:, 1] - 1
+
+    padded_lengths = lengths + padding[lengths-1]
+    mask_length0 = (lengths==0)
+    padded_lengths[mask_length0] = 0
+    pos = np.empty_like(lengths)
+    pos[0] = 0
+    pos[1:] = np.cumsum(padded_lengths[:-1])
+
+    # from: https://stackoverflow.com/questions/47125697/concatenate-range-arrays-given-start-stop-numbers-in-a-vectorized-way-numpy
+    def create_ranges(starts, ends):
+        l = ends - starts
+        clens = l.cumsum()
+        ids = np.ones(clens[-1],dtype=int)
+        ids[0] = starts[0]
+        ids[clens[:-1]] = starts[1:] - ends[:-1]+1
+        out = ids.cumsum()
+        return out
+    
+    mask_length = ~mask_length0
+    pos_old_nonzero = pos_old[mask_length]
+    pos_nonzero = pos[mask_length]
+    lengths_nonzero = lengths[mask_length]
+    indices_old = create_ranges(pos_old_nonzero, pos_old_nonzero + lengths_nonzero)
+    indices_new = create_ranges(pos_nonzero, pos_nonzero + lengths_nonzero)
+    nb2 = np.zeros(padded_lengths.sum(), dtype=grid.neighbours.dtype)
+    nb2[indices_new] = grid.neighbours[indices_old]
+    
+    g[:, 1] = pos + 1
+    g[:, 1][mask_length0] = 0
+    
+    try:
+        import jax.numpy as jnp
+        if isinstance(grid.neighbours, jnp.ndarray):
+            nb2 = jnp.array(nb2)
+        if isinstance(grid.neighbour_grid, jnp.ndarray):
+            neighbour_grid = jnp.array(neighbour_grid)
+    except ImportError:
+        pass
+    grid = grid._replace(neighbours=nb2)
+    grid = grid._replace(neighbour_grid=neighbour_grid)
+    return grid
+
