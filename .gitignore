@@ -11,3 +11,13 @@ __pycache__/*
 *.pyc
 gmon.out
 attract-par.npz
+sxl-2stack/2stack-chunk-*
+sxl-2stack/2stack-chunk-*.lrmsd
+sxl-2stack/3sxl_dom2-r.grid
+sxl-2stack/3sxl_dom2-r.gridheader
+sxl-2stack/2stack-grid-lrmsd.txt
+sxl-2stack/2stack-rcut-lrmsd.txt
+sxl-2stack/2stack-rcut.score
+sxl-2stack/2stack-grid.score
+sxl-2stack/2stack.dat
+sxl-2stack/2stack.lrmsd
