@@ -1,5 +1,6 @@
 mono-leu/mono-leuc.nbgrid
 mono-leu/mono-leuc.grid
+mono-leu/mono-leuc-1atom.grid
 mono-leu/gmon.out
 1B7F-bound/receptorgrid.alphabet
 1B7F-bound/receptorgrid.nbgrid
@@ -11,3 +12,13 @@ __pycache__/*
 *.pyc
 gmon.out
 attract-par.npz
+sxl-2stack/2stack-chunk-*
+sxl-2stack/2stack-chunk-*.lrmsd
+sxl-2stack/3sxl_dom2-r.grid
+sxl-2stack/3sxl_dom2-r.gridheader
+sxl-2stack/2stack-grid-lrmsd.txt
+sxl-2stack/2stack-rcut-lrmsd.txt
+sxl-2stack/2stack-rcut.score
+sxl-2stack/2stack-grid.score
+sxl-2stack/2stack.dat
+sxl-2stack/2stack.lrmsd
