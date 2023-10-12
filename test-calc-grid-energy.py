@@ -205,3 +205,6 @@ print("Outer potential grid correlation:", pearsonr(
    outer_potential_grid[0].reshape(-1),
    grid.outer_potential_grid[lig_alphabet[0]-1].reshape(-1) 
 )[0])
+t = time.time()
+inner_potential_grid, outer_potential_grid = calc_grid()
+print("Time", time.time() - t)
