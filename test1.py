@@ -5,6 +5,7 @@
 CALC_GRADS = False
 ITER = 10
 ITER_GRAD = 5
+TOP = 100000
 
 import numpy as np
 import jax
@@ -54,8 +55,9 @@ else:
     conformers = None
     lig = lig[None, :, :]
 
-mat = mat[:500000] ###
-conformers = conformers[:len(mat)] ###
+if TOP and TOP > 0:
+    mat = mat[:TOP]
+    conformers = conformers[:len(mat)]
 
 rec_atomtypes00 = jnp.load(args.atrec).astype(np.uint8)
 assert rec_atomtypes00.ndim == 1 and len(rec_atomtypes00) == len(rec)
