@@ -1,18 +1,18 @@
-# test-grid-energrad-retile.py, taking command line parameters, and adding ensemble
+# version of test2.py using direct neighbour list access
+# (i.e. padded at max_nr_neighbours of any voxel)
 
 # from jax import config
 # config.update("jax_enable_x64", True)
-CALC_GRADS = True
-ITER = 10
-ITER_GRAD = 10
-TOP = 500000
+CALC_GRADS = False
+BATCH = 500000   # the number of structures to score in at a time
+NB_CHUNK_SIZE = 150000  # will be quadrupled for small ncontacts
 
 import numpy as np
 import jax
 import jax.numpy as jnp
 from jax import jit
 from jax.lax import cond
-from read_grid import read_grid, pad_grid
+from read_grid2 import read_grid
 from functools import partial
 from collections import namedtuple
 import time
@@ -29,10 +29,9 @@ parser.add_argument("--atrec", help="receptor atom types",required=True)
 parser.add_argument("--atlig", help="ligand atom types",required=True)
 parser.add_argument("--grid", help="ATTRACT docking grid",required=True)
 parser.add_argument("--conformers", help="ligand conformer indices")
+parser.add_argument("--output", help="output energies")
 
 args = parser.parse_args()
-
-mat = jnp.load(args.poses)
 
 rec = jnp.load(args.receptor)
 assert rec.dtype in (np.float32, np.float64)
@@ -43,21 +42,31 @@ assert lig.dtype in (np.float32, np.float64)
 assert lig.shape[-1] == 3, lig.shape
 assert lig.ndim in (2,3), lig.shape
 has_conformer = (lig.ndim == 3)
+
+mat = np.load(args.poses)
+scramble = np.arange(len(mat))
+np.random.seed(0)
+np.random.shuffle(scramble)
+mat = mat[scramble]
+
 if has_conformer:
-    assert args.conformers is not None
-    conformers = jnp.load(args.conformers).astype(int)
+    ###
+    if args.conformers is None: 
+        conformers = np.ones(len(mat)).astype(int)
+    else:
+        conformers = np.load(args.conformers).astype(int)  
+    ###
+    ###assert args.conformers is not None
+    ###conformers = np.load(args.conformers).astype(int)
     assert len(conformers) == len(mat)
     assert conformers.min() >= 1
     assert conformers.max() <= len(lig)
     conformers -= 1
+    conformers = conformers[scramble]
 else:
     assert args.conformers is None
-    conformers = None
+    conformers = None    
     lig = lig[None, :, :]
-
-if TOP and TOP > 0:
-    mat = mat[:TOP]
-    conformers = conformers[:len(mat)]
 
 rec_atomtypes00 = jnp.load(args.atrec).astype(np.uint8)
 assert rec_atomtypes00.ndim == 1 and len(rec_atomtypes00) == len(rec)
@@ -77,20 +86,20 @@ coor_lig = lig
 lig_alphabet, lig_atomtypes = np.unique(lig_atomtypes0, return_inverse=True)
 rec_alphabet, rec_atomtypes = np.unique(rec_atomtypes0, return_inverse=True)
 
+##############################################
 
 grid = read_grid(open(args.grid, "rb").read(), read_gradients=True)
-grid.neighbours[:] = rec_mapping[grid.neighbours]
+nb_grid_flat0 = grid.neighbour_grid.reshape(-1)
+mask = (nb_grid_flat0 < 2**16-1)
+nb_grid_flat0[mask] = rec_mapping[nb_grid_flat0[mask]]
 
-print("Pad grid")
-max_contacts = grid.neighbour_grid.reshape(-1,2)[:,0].max()
-lp5 = list(range(5)[::-1])
-lp = list(range(10)[::-1])
-padding = [0] * 5 + lp5 + lp5 + lp5 + lp + lp
-print(f"Maximum padding from {len(padding)+1} to {max_contacts}")
-padding  += list(range(max_contacts-len(padding))[::-1])
-grid2 = pad_grid(grid, padding=padding)
-print("Padding increase:",  len(grid.neighbours), len(grid2.neighbours))
-grid = grid2
+nb_chunk_thresholds = (0,1,2,3,4,5,10,15,20)
+for n in range(nb_chunk_thresholds[-1]+10, grid.max_nr_neighbours, 10):
+    nb_chunk_thresholds += (n,)
+nb_chunk_thresholds += (grid.max_nr_neighbours,)
+print("Neighbour list chunk thresholds:", nb_chunk_thresholds)
+
+##############################################
 
 potshape = 8
 
@@ -112,6 +121,8 @@ ff["emin"] = emin
 ff["rmin2"] = rmin2
 ff = namedtuple("ff", field_names=ff.keys())(**ff)
 
+##############################################
+
 alpos = (np.where(grid.alphabet)[0]+1).tolist()
 lig_alphabet_pos = np.array([alpos.index(a) for a in lig_alphabet])
 lig_atomtype_pos = jnp.array(lig_alphabet_pos[lig_atomtypes])
@@ -120,8 +131,9 @@ d = {}
 for field in grid._fields:
     value = getattr(grid, field)
     if isinstance(value, np.ndarray) and value.shape != (3,):
-        value = jnp.array(value)
+        value = jnp.array(value, dtype=value.dtype)
     d[field] = value
+d["neighbour_grid_ravel"] = d["neighbour_grid"].reshape(-1, grid.neighbour_grid.shape[-1])
 grid = type(grid)(**d)
 
 
@@ -199,24 +211,23 @@ def nonbon_dif_jvp(primals, tangents):
     return ans, gradient
 
 @jit
-def nb_energy_single(nb_index, offset, lig_struc, lig_atom, all_coors_lig, coor_rec, rec_atomtypes, lig_atomtypes, ff):
-
-    receptor_atom = grid.neighbours[nb_index + offset - 1]
+def nb_energy_single(ind_innergrid, offset, lig_struc, lig_atom, all_coors_lig, coor_rec, rec_atomtypes, lig_atomtypes, ff):
+    receptor_atom = grid.neighbour_grid_ravel[ind_innergrid, offset]
     rec_c = coor_rec[receptor_atom]
     at1 = rec_atomtypes[receptor_atom]
     lig_c = all_coors_lig[lig_struc, lig_atom]
     at2 = lig_atomtypes[lig_atom]
     d = (lig_c - rec_c)
     dsq = (d*d).sum()
-    return cond(((receptor_atom < 999999999) & (dsq<plateaudissq)), nonbon_dif, lambda *args: 0.0, d,ff, at1, at2)
+    return cond(((receptor_atom < 2**16-1) & (dsq<plateaudissq)), nonbon_dif, lambda *args: 0.0, d,ff, at1, at2)
 
 nb_energy_vec = jnp.vectorize(nb_energy_single, excluded=(1,4,5,6,7,8), signature="(),(),()->()")
 
 @partial(jit, static_argnames=("ncontacts",))
-def nb_energy(nb_index, ncontacts, lig_struc, lig_atom, all_coors_lig, coor_rec, rec_atomtypes, lig_atomtypes, ff):
+def nb_energy(ind_innergrid, ncontacts, lig_struc, lig_atom, all_coors_lig, coor_rec, rec_atomtypes, lig_atomtypes, ff):
     for n in range(ncontacts):
-        e = nb_energy_vec(nb_index, n, lig_struc, lig_atom, all_coors_lig, coor_rec, rec_atomtypes, lig_atomtypes, ff)
-        assert len(e) == len(nb_index)
+        e = nb_energy_vec(ind_innergrid, n, lig_struc, lig_atom, all_coors_lig, coor_rec, rec_atomtypes, lig_atomtypes, ff)
+        assert len(e) == len(ind_innergrid)
         if n == 0:
             energies = e
         else:
@@ -291,20 +302,25 @@ def potential_energy(mat, coor_lig, conformers, lig_atomtype_pos, grid):
     return atom_energies.sum(axis=1)
 
 @partial(jit, static_argnames=("grid_dim",))
-def generate_nb_table(all_coors_lig, grid, grid_dim):
+def generate_ind_innergrid(all_coors_lig, grid, grid_dim):
     vox_innergrid =  (all_coors_lig - grid.origin) / grid.gridspacing
     x, y, z = vox_innergrid[:, :, 0], vox_innergrid[:, :, 1], vox_innergrid[:, :, 2]
     in_innergrid = ((x >= 0) & (x < grid.dim[0]-1) & (y >= 0) & (y < grid.dim[1]-1) & (z >= 0) & (z < grid.dim[2]-1))
-    pos_innergrid = jnp.where(in_innergrid[:, :, None], jnp.floor(vox_innergrid+0.5), 0).astype(np.int32)
+    out_of_bounds=max(grid_dim)+2
+    pos_innergrid = jnp.where(in_innergrid[:, :, None], jnp.floor(vox_innergrid+0.5).astype(np.int32), out_of_bounds)
     ind_innergrid = jnp.ravel_multi_index((pos_innergrid[:, :, 0], pos_innergrid[:, :, 1],pos_innergrid[:, :, 2]),dims=grid_dim, mode="clip")
-    nb_index = jnp.take(grid.neighbour_grid.reshape(-1, 2), ind_innergrid,axis=0)
+    ind_innergrid = ind_innergrid + out_of_bounds**3 * (1 - in_innergrid.astype(np.uint8))
 
-    in_innergrid2 = in_innergrid.astype(jnp.int8)
-    key = in_innergrid2 * -nb_index[:, :, 0]
-    sort_index = jnp.unravel_index(run_argsort(key,axis=None), key.shape)
-    nr_inner_atoms = jnp.searchsorted(key[sort_index], 0, side="left")
-    return nb_index, sort_index, nr_inner_atoms
+    nb_index = jnp.take(grid.nr_neighbours, ind_innergrid, fill_value=0)
+    max_contacts = nb_index.max()
+    return ind_innergrid, nb_index, max_contacts 
 
+@jit
+def generate_sort_index(nb_index):
+    k=-nb_index
+    sort_index = jnp.unravel_index(run_argsort(k,axis=None), nb_index.shape)
+    nr_inner_atoms = jnp.searchsorted(k[sort_index], 0, side="left")
+    return sort_index, nr_inner_atoms
 
 @jit
 def neighbour_energy_accum(all_coors_lig, lig_struc, atom_energies):
@@ -312,52 +328,62 @@ def neighbour_energy_accum(all_coors_lig, lig_struc, atom_energies):
     energies = energies.at[lig_struc].add(atom_energies)
     return energies
 
-@partial(jit, static_argnames=("grid_dim","chunks"))
-def neighbour_energy(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers, ff, grid, chunks, grid_dim):
+def neighbour_energy(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers, ff, grid, nb_chunk_thresholds, nb_chunk_size, grid_dim):
     coor_lig2 = jnp.concatenate((coor_lig, jnp.ones(coor_lig.shape[:2] + (1,))),axis=2)
     all_coors_lig = jnp.einsum("ijk,ikl->ijl", coor_lig2[conformers], mat) #diagonally broadcasted form of coor_lig.dot(mat)
     all_coors_lig = all_coors_lig[:, :, :3]
 
-    nb_index, sort_index, nr_inner_atoms = generate_nb_table(all_coors_lig, grid, grid_dim)
-    max_nr_inner_atoms = chunks[-1][-1]
-    # assert nr_inner_atoms <= max_nr_inner_atoms
-    sort_index = (sort_index[0][:max_nr_inner_atoms], sort_index[1][:max_nr_inner_atoms])
+    ind_innergrid, nb_index, max_contacts  = generate_ind_innergrid(all_coors_lig, grid, grid_dim)
+    if max_contacts == 0:
+        return jnp.zeros(len(mat))
 
-    # we are interested in length > 0
-    sorted_nb_index = nb_index[sort_index]
+    sort_index, nr_inner_atoms = generate_sort_index(nb_index)
+    sorted_ind_innergrid = ind_innergrid[sort_index[0], sort_index[1]]
+    sorted_nb_index = nb_index[sort_index[0], sort_index[1]]
+
+    nr_inner_atoms = int(nr_inner_atoms)
     
-    atom_energies = jnp.zeros(max_nr_inner_atoms)
-    for ncontacts, start, length, end in chunks:
-        if length == 0:
-            continue
-        sorted_nb_index_chunk = sorted_nb_index[start-1:end, 1]
-        chunk_lig_struc = sort_index[0][start-1:end]
-        chunk_lig_atom = sort_index[1][start-1:end]
-        chunk_energies = nb_energy(sorted_nb_index_chunk, ncontacts, chunk_lig_struc, chunk_lig_atom, all_coors_lig, coor_rec, rec_atomtypes, lig_atomtypes, ff)
-        atom_energies = atom_energies.at[start-1:end].set(chunk_energies)
+    tot_atoms = len(sort_index[0])
 
-    lig_struc = sort_index[0][:max_nr_inner_atoms]
+    max_ncontacts_map = {}
+    for n in range(0, len(nb_chunk_thresholds)-1):
+        p1 = nb_chunk_thresholds[n]
+        p2 = nb_chunk_thresholds[n+1]
+        for p in range(p1+1, p2+1):
+            max_ncontacts_map[p] = p2
+
+    atom_energies = jnp.zeros(tot_atoms)  #only :nr_inner_atoms will be used    
+
+    n = 0
+    while n < nr_inner_atoms:
+        start = n
+        max_ncontacts0 = int(sorted_nb_index[start])
+        max_ncontacts = max_ncontacts_map[max_ncontacts0]
+
+        n += nb_chunk_size
+
+        if max_ncontacts0 > 0:
+            max_ncontacts0_next = int(sorted_nb_index[n-1])
+            if max_ncontacts - max_ncontacts0_next < 5:
+                #print("QUAD", start, max_ncontacts0_next, max_ncontacts)
+                n +=  3 * nb_chunk_size
+        end = n
+    
+        sorted_ind_innergrid_chunk = sorted_ind_innergrid[start:end]
+        chunk_lig_struc = sort_index[0][start:end]
+        chunk_lig_atom = sort_index[1][start:end]            
+
+        chunk_energies = nb_energy(sorted_ind_innergrid_chunk, max_ncontacts, chunk_lig_struc, chunk_lig_atom, all_coors_lig, coor_rec, rec_atomtypes, lig_atomtypes, ff)
+        
+        atom_energies = atom_energies.at[start:end].set(chunk_energies)
+
+    lig_struc = sort_index[0]
     energies = neighbour_energy_accum(all_coors_lig, lig_struc, atom_energies)
     return energies
 
-def get_contact_lengths(mat, coor_lig,  conformers, grid):
-    coor_lig2 = jnp.concatenate((coor_lig, jnp.ones(coor_lig.shape[:2] + (1,))),axis=2)
-    all_coors_lig = jnp.einsum("ijk,ikl->ijl", coor_lig2[conformers], mat) #diagonally broadcasted form of coor_lig.dot(mat)
-    all_coors_lig = all_coors_lig[:, :, :3]
+def main(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers, lig_atomtype_pos, ff, grid, nb_chunk_thresholds, grid_dim):
 
-    nb_index, sort_index, nr_inner_atoms = generate_nb_table(all_coors_lig, grid, tuple(grid.dim))
-    sort_index = (sort_index[0][:nr_inner_atoms], sort_index[1][:nr_inner_atoms])
-
-    # we are interested in length > 0
-    sorted_nb_index = nb_index[sort_index]
-    max_contacts = sorted_nb_index[0, 0]
-    contact_lengths = jnp.searchsorted(-sorted_nb_index[:, 0], jnp.arange(-max_contacts+1, 1))
-    return tuple(contact_lengths.tolist())
-    
-@partial(jit, static_argnames=("grid_dim","chunks"))
-def main(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers, lig_atomtype_pos, ff, grid, chunks, grid_dim):
-
-    nb_energies = neighbour_energy(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers, ff, grid, chunks, grid_dim)
+    nb_energies = neighbour_energy(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers, ff, grid, nb_chunk_thresholds, NB_CHUNK_SIZE, grid_dim)
     pot_energies = potential_energy(mat, coor_lig, conformers, lig_atomtype_pos, grid)
     energies = pot_energies + nb_energies
     return energies.sum(), energies
@@ -367,49 +393,21 @@ coor_lig = jnp.array(coor_lig)
 rec_atomtypes = jnp.array(rec_atomtypes)
 lig_atomtypes = jnp.array(lig_atomtypes)
 
-
-contact_lengths = get_contact_lengths(mat, coor_lig, conformers, grid)
-data_max_contacts = len(contact_lengths)
-print("Original contact lengths")
-print(contact_lengths, data_max_contacts)
-#print(list(zip(contact_lengths,range(data_max_contacts,0,-1))))
-print("Contact chunks")
-c = []
-pos = 0
-last = data_max_contacts
-done = 0
-
-#for n in range(data_max_contacts,-1,-1): ###   #disable padding requirement
-for n in (0,1,2,3,4,5,10,15,20,30,40)[::-1]:
-    if n >= data_max_contacts:
-        continue
-    done2 = contact_lengths[data_max_contacts-n-1]
-    c.append((last, done+1, done2-done, done2))
-    done = done2
-    last = n    
-chunks = tuple(c)
-for cnr,c in enumerate(chunks):
-    ncontacts = c[0]
-    if cnr == len(chunks) - 1:
-        minrealcontacts = 1
-    else:
-        minrealcontacts = chunks[cnr+1][0]+1
-    for n in range(minrealcontacts, ncontacts):
-        assert n+padding[n-1] >= ncontacts, (c, n, padding[n-1])
-
-
-print(chunks)
-
 grid_dim = tuple(grid.dim)
+
+
+print("JIT warmup...")
 
 
 if CALC_GRADS:
     print("Calculate energies and gradients...")
     vgrad_main = jax.value_and_grad(main, has_aux=True)
-    (_, energies), gradients = vgrad_main(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers, lig_atomtype_pos, ff, grid, chunks, grid_dim)
+
+    (_, energies), gradients = vgrad_main(mat[:BATCH], coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers[:BATCH], lig_atomtype_pos, ff, grid, nb_chunk_thresholds, grid_dim)
 
     print("Energies:")  
     print(energies[:10])
+    print(scramble[:10])
     print()
 
     print("Gradients (translational):")
@@ -419,39 +417,42 @@ if CALC_GRADS:
     print(-gradients[:10, :3, :3])  # sign is opposite of ATTRACT...
 else:
     print("Calculate energies...")
-    _, energies = main(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers, lig_atomtype_pos, ff, grid, chunks, grid_dim)
+    _, energies = main(mat[:BATCH], coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers[:BATCH], lig_atomtype_pos, ff, grid, nb_chunk_thresholds, grid_dim)
 
     print("Energies:")  
     print(energies[:10])
+    print(scramble[:10])
     print()
 
-total_energy = energies.sum()
-
-main(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers, lig_atomtype_pos, ff, grid, chunks, grid_dim)
-
-print(f"Timing (energies, x{ITER})...", file=sys.stderr)
+print("JIT warmup DONE...", file=sys.stderr)
 t = time.time()
 
-for n in range(ITER):
-    total_energy0, energies = main(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers, lig_atomtype_pos, ff, grid, chunks, grid_dim)
+assert len(mat) == len(conformers)
+energies = np.zeros(len(mat))
+gradients = np.zeros((len(mat), 4, 4))
+for offset in range(0, len(mat), BATCH):
+    for it in range(1):
+        print(time.time() - t, offset)
+        start, end = offset, offset + BATCH
+        if end > len(mat):
+            end = len(mat)
+            start = end - BATCH
+            if start < 0:
+                start = 0
+        batch = end - start
+        mat_batch = mat[start:end]
+        conformers_batch = conformers[start:end]
+        if CALC_GRADS:
+            (total_energy0, energies_batch), gradients_batch = vgrad_main(mat_batch, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers_batch, lig_atomtype_pos, ff,grid, nb_chunk_thresholds, grid_dim)
+            gradients[start:end] = gradients_batch
+        else:
+            total_energy0, energies_batch = main(mat_batch, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers_batch, lig_atomtype_pos, ff,grid, nb_chunk_thresholds, grid_dim)
+        energies[start:end] = energies_batch
 
-    #assert abs(total_energy0 - total_energy) < 0.1, (total_energy0, total_energy)
-
-print("{:.3f} seconds".format((time.time() - t)/ITER), file=sys.stderr)
+print("{:.3f} seconds".format((time.time() - t)), file=sys.stderr)
 print(file=sys.stderr)
 
-if CALC_GRADS:
-    (total_energy0, energies), gradients = vgrad_main(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers, lig_atomtype_pos, ff,grid, chunks, grid_dim)
-
-    #assert abs(total_energy0 - total_energy) < 0.1, (total_energy0, total_energy)
-
-    print(f"Timing (energy + gradients, x{ITER_GRAD})...", file=sys.stderr)
-    t = time.time()
-
-    for n in range(ITER_GRAD):
-
-        (total_energy0, energies), gradients = vgrad_main(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers, lig_atomtype_pos, ff, grid, chunks, grid_dim)
-
-        #assert abs(total_energy0 - total_energy) < 0.1, (total_energy0, total_energy)
-
-    print("{:.3f} seconds".format((time.time() - t)/ITER_GRAD), file=sys.stderr)
+final_energies = np.zeros(len(mat))
+final_energies[scramble] = energies
+if args.output:
+    np.save(args.output, final_energies)

@@ -1,4 +1,8 @@
-# test-grid-energrad-retile.py, taking command line parameters, and adding ensemble
+# version of test1.py where JIT is disabled for outer functions
+# Loss of efficiency: about a factor 2
+# Allows pre-definition of neighbour chunks (test2.py)
+#  allowing for more flexible energy evaluation
+# For crocodile, where all poses are known in advance, better stick to jit to maximize speed
 
 # from jax import config
 # config.update("jax_enable_x64", True)
@@ -312,7 +316,6 @@ def neighbour_energy_accum(all_coors_lig, lig_struc, atom_energies):
     energies = energies.at[lig_struc].add(atom_energies)
     return energies
 
-@partial(jit, static_argnames=("grid_dim","chunks"))
 def neighbour_energy(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers, ff, grid, chunks, grid_dim):
     coor_lig2 = jnp.concatenate((coor_lig, jnp.ones(coor_lig.shape[:2] + (1,))),axis=2)
     all_coors_lig = jnp.einsum("ijk,ikl->ijl", coor_lig2[conformers], mat) #diagonally broadcasted form of coor_lig.dot(mat)
@@ -354,7 +357,6 @@ def get_contact_lengths(mat, coor_lig,  conformers, grid):
     contact_lengths = jnp.searchsorted(-sorted_nb_index[:, 0], jnp.arange(-max_contacts+1, 1))
     return tuple(contact_lengths.tolist())
     
-@partial(jit, static_argnames=("grid_dim","chunks"))
 def main(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers, lig_atomtype_pos, ff, grid, chunks, grid_dim):
 
     nb_energies = neighbour_energy(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers, ff, grid, chunks, grid_dim)
