@@ -4,8 +4,12 @@
 # from jax import config
 # config.update("jax_enable_x64", True)
 CALC_GRADS = False
-BATCH = 500000   # the number of structures to score in at a time
-NB_CHUNK_SIZE = 150000  # will be quadrupled for small ncontacts
+BATCH = 2000000   # the number of structures to score in at a time
+NB_CHUNK_SIZE = 1000000  # will be quadrupled for small ncontacts
+
+# The following is 10-15% slower:
+# BATCH = 200000 
+# NB_CHUNK_SIZE = 100000
 
 import numpy as np
 import jax
@@ -311,7 +315,9 @@ def generate_ind_innergrid(all_coors_lig, grid, grid_dim):
     ind_innergrid = jnp.ravel_multi_index((pos_innergrid[:, :, 0], pos_innergrid[:, :, 1],pos_innergrid[:, :, 2]),dims=grid_dim, mode="clip")
     ind_innergrid = ind_innergrid + out_of_bounds**3 * (1 - in_innergrid.astype(np.uint8))
 
-    nb_index = jnp.take(grid.nr_neighbours, ind_innergrid, fill_value=0)
+    #nb_index = jnp.take(grid.nr_neighbours, ind_innergrid, fill_value=0)
+    nb_index = jnp.take(grid.nr_neighbours, ind_innergrid)
+    nb_index = jnp.where(nb_index != -32768, nb_index, 0)
     max_contacts = nb_index.max()
     return ind_innergrid, nb_index, max_contacts 
 
@@ -333,7 +339,7 @@ def neighbour_energy(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conf
     all_coors_lig = jnp.einsum("ijk,ikl->ijl", coor_lig2[conformers], mat) #diagonally broadcasted form of coor_lig.dot(mat)
     all_coors_lig = all_coors_lig[:, :, :3]
 
-    ind_innergrid, nb_index, max_contacts  = generate_ind_innergrid(all_coors_lig, grid, grid_dim)
+    ind_innergrid, nb_index, max_contacts  = generate_ind_innergrid(all_coors_lig, grid, grid_dim)    
     if max_contacts == 0:
         return jnp.zeros(len(mat))
 
@@ -425,13 +431,13 @@ else:
     print()
 
 print("JIT warmup DONE...", file=sys.stderr)
-t = time.time()
+for it in range(2):
+    t = time.time()
 
-assert len(mat) == len(conformers)
-energies = np.zeros(len(mat))
-gradients = np.zeros((len(mat), 4, 4))
-for offset in range(0, len(mat), BATCH):
-    for it in range(1):
+    assert len(mat) == len(conformers)
+    energies = np.zeros(len(mat))
+    gradients = np.zeros((len(mat), 4, 4))
+    for offset in range(0, len(mat), BATCH):
         print(time.time() - t, offset)
         start, end = offset, offset + BATCH
         if end > len(mat):
@@ -449,8 +455,8 @@ for offset in range(0, len(mat), BATCH):
             total_energy0, energies_batch = main(mat_batch, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers_batch, lig_atomtype_pos, ff,grid, nb_chunk_thresholds, grid_dim)
         energies[start:end] = energies_batch
 
-print("{:.3f} seconds".format((time.time() - t)), file=sys.stderr)
-print(file=sys.stderr)
+    print("{:.3f} seconds".format((time.time() - t)), file=sys.stderr)
+    print(file=sys.stderr)
 
 final_energies = np.zeros(len(mat))
 final_energies[scramble] = energies
