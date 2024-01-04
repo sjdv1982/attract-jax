@@ -1,21 +1,18 @@
-# version of test2.py using direct neighbour list access
-# (i.e. padded at max_nr_neighbours of any voxel)
+# version of test4.py with gravity (hardcoded) and optimized learning rate/steps
+# not cut 
 
 # from jax import config
 # config.update("jax_enable_x64", True)
-CALC_GRADS = False
-BATCH = 2000000   # the number of structures to score in at a time
-NB_CHUNK_SIZE = 1000000  # will be quadrupled for small ncontacts
-
-# The following is 10-15% slower on newton (but 2x slower on mbi-node!):
-# BATCH = 200000 
-# NB_CHUNK_SIZE = 100000
+BATCH = 200000   # the number of structures to score in at a time
+NB_CHUNK_SIZE = 100000  # will be quadrupled for small ncontacts
 
 import numpy as np
 import jax
 import jax.numpy as jnp
 from jax import jit
 from jax.lax import cond
+from jax.scipy.spatial.transform import Rotation
+import optax
 from read_grid2 import read_grid
 from functools import partial
 from collections import namedtuple
@@ -387,12 +384,21 @@ def neighbour_energy(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conf
     energies = neighbour_energy_accum(all_coors_lig, lig_struc, atom_energies)
     return energies
 
-def main(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers, lig_atomtype_pos, ff, grid, nb_chunk_thresholds, grid_dim):
+def main0(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers, lig_atomtype_pos, ff, grid, nb_chunk_thresholds, grid_dim):
 
     nb_energies = neighbour_energy(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers, ff, grid, nb_chunk_thresholds, NB_CHUNK_SIZE, grid_dim)
     pot_energies = potential_energy(mat, coor_lig, conformers, lig_atomtype_pos, grid)
     energies = pot_energies + nb_energies
     return energies.sum(), energies
+
+def main(rotations: Rotation, translations, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers, lig_atomtype_pos, ff, grid, nb_chunk_thresholds, grid_dim):
+    assert len(rotations) == len(translations) == len(conformers)
+    mat = jnp.ones((len(rotations), 4, 4))
+    mat = mat.at[:, :3, :3].set(rotations.as_matrix())
+    mat = mat.at[:, 3, :3].set(translations)
+    tot_energy, energies = main0(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers, lig_atomtype_pos, ff, grid, nb_chunk_thresholds, grid_dim)
+    gravity = jnp.linalg.norm(translations, axis=1)**2 * 0.1
+    return tot_energy + gravity.sum(), energies + gravity
 
 coor_rec = jnp.array(coor_rec)
 coor_lig = jnp.array(coor_lig)
@@ -405,58 +411,51 @@ grid_dim = tuple(grid.dim)
 print("JIT warmup...")
 
 
-if CALC_GRADS:
-    print("Calculate energies and gradients...")
-    vgrad_main = jax.value_and_grad(main, has_aux=True)
+print("Calculate energies and gradients...")
+vgrad_main = jax.value_and_grad(main, argnums=(0,1), has_aux=True)
+mat_batch = mat[:BATCH]
+rotations_batch = Rotation.from_matrix(mat_batch[:, :3, :3])
+translations_batch = mat_batch[:, 3, :3]
 
-    (_, energies), gradients = vgrad_main(mat[:BATCH], coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers[:BATCH], lig_atomtype_pos, ff, grid, nb_chunk_thresholds, grid_dim)
+(_, energies), gradients = vgrad_main(rotations_batch, translations_batch, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers[:BATCH], lig_atomtype_pos, ff, grid, nb_chunk_thresholds, grid_dim)
 
-    print("Energies:")  
-    print(energies[:10])
-    print(scramble[:10])
-    print()
-
-    print("Gradients (translational):")
-    print(-gradients[:10, 3, :3])  # sign is opposite of ATTRACT...
-
-    print("Gradients (torque):")
-    print(-gradients[:10, :3, :3])  # sign is opposite of ATTRACT...
-else:
-    print("Calculate energies...")
-    _, energies = main(mat[:BATCH], coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers[:BATCH], lig_atomtype_pos, ff, grid, nb_chunk_thresholds, grid_dim)
-
-    print("Energies:")  
-    print(energies[:10])
-    print(scramble[:10])
-    print()
+print("Energies:")  
+print(energies[:10])
+print(scramble[:10])
+print()
 
 print("JIT warmup DONE...", file=sys.stderr)
-for it in range(2):
-    t = time.time()
+t = time.time()
 
-    assert len(mat) == len(conformers)
-    energies = np.zeros(len(mat))
-    gradients = np.zeros((len(mat), 4, 4))
-    for offset in range(0, len(mat), BATCH):
-        print(time.time() - t, offset)
-        start, end = offset, offset + BATCH
-        if end > len(mat):
-            end = len(mat)
-            start = end - BATCH
-            if start < 0:
-                start = 0
-        batch = end - start
-        mat_batch = mat[start:end]
-        conformers_batch = conformers[start:end]
-        if CALC_GRADS:
-            (total_energy0, energies_batch), gradients_batch = vgrad_main(mat_batch, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers_batch, lig_atomtype_pos, ff,grid, nb_chunk_thresholds, grid_dim)
-            gradients[start:end] = gradients_batch
-        else:
-            total_energy0, energies_batch = main(mat_batch, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers_batch, lig_atomtype_pos, ff,grid, nb_chunk_thresholds, grid_dim)
-        energies[start:end] = energies_batch
+assert len(mat) == len(conformers)
+energies = np.zeros(len(mat))
+for offset in range(0, len(mat), BATCH):
+    print(time.time() - t, offset)
+    start, end = offset, offset + BATCH
+    if end > len(mat):
+        end = len(mat)
+        start = end - BATCH
+        if start < 0:
+            start = 0
+    batch = end - start
+    mat_batch = mat[start:end]
+    rotations_batch = Rotation.from_matrix(mat_batch[:, :3, :3])
+    translations_batch = mat_batch[:, 3, :3]
+    conformers_batch = conformers[start:end]
+    ### optimizer
+    start_learning_rate = 5
+    optimizer = optax.adam(start_learning_rate)    
+    opt_state = optimizer.init((rotations_batch, translations_batch))
+    for epoch in range(50):
+        (total_energy_batch, energies_batch), gradients_batch = vgrad_main(rotations_batch, translations_batch, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers_batch, lig_atomtype_pos, ff,grid, nb_chunk_thresholds, grid_dim)
+        print(f"Batch {start} epoch {epoch} mean energy {total_energy_batch/len(rotations_batch)}")
+        updates, opt_state = optimizer.update(gradients_batch, opt_state)
+        rotations_batch, translations_batch = optax.apply_updates((rotations_batch, translations_batch), updates)
+        rotations_batch = Rotation.from_quat(rotations_batch.as_quat())
+    energies[start:end] = energies_batch
 
-    print("{:.3f} seconds".format((time.time() - t)), file=sys.stderr)
-    print(file=sys.stderr)
+print("{:.3f} seconds".format((time.time() - t)), file=sys.stderr)
+print(file=sys.stderr)
 
 final_energies = np.zeros(len(mat))
 final_energies[scramble] = energies

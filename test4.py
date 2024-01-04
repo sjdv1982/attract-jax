@@ -1,17 +1,18 @@
-# version of test2.py using direct neighbour list access
-# (i.e. padded at max_nr_neighbours of any voxel)
+# version of test3.py using ADAM minimization
+# cut at 1 million strucs
 
 # from jax import config
 # config.update("jax_enable_x64", True)
-CALC_GRADS = False
-BATCH = 500000   # the number of structures to score in at a time
-NB_CHUNK_SIZE = 150000  # will be quadrupled for small ncontacts
+BATCH = 200000   # the number of structures to score in at a time
+NB_CHUNK_SIZE = 100000  # will be quadrupled for small ncontacts
 
 import numpy as np
 import jax
 import jax.numpy as jnp
 from jax import jit
 from jax.lax import cond
+from jax.scipy.spatial.transform import Rotation
+import optax
 from read_grid2 import read_grid
 from functools import partial
 from collections import namedtuple
@@ -44,6 +45,7 @@ assert lig.ndim in (2,3), lig.shape
 has_conformer = (lig.ndim == 3)
 
 mat = np.load(args.poses)
+mat = mat[:1000000] ###
 scramble = np.arange(len(mat))
 np.random.seed(0)
 np.random.shuffle(scramble)
@@ -54,10 +56,11 @@ if has_conformer:
     if args.conformers is None: 
         conformers = np.ones(len(mat)).astype(int)
     else:
-        conformers = np.load(args.conformers).astype(int)    
+        conformers = np.load(args.conformers).astype(int)  
     ###
     ###assert args.conformers is not None
     ###conformers = np.load(args.conformers).astype(int)
+    conformers = conformers[:1000000] ###
     assert len(conformers) == len(mat)
     assert conformers.min() >= 1
     assert conformers.max() <= len(lig)
@@ -90,7 +93,8 @@ rec_alphabet, rec_atomtypes = np.unique(rec_atomtypes0, return_inverse=True)
 
 grid = read_grid(open(args.grid, "rb").read(), read_gradients=True)
 nb_grid_flat0 = grid.neighbour_grid.reshape(-1)
-nb_grid_flat0[:] = rec_mapping[nb_grid_flat0]
+mask = (nb_grid_flat0 < 2**16-1)
+nb_grid_flat0[mask] = rec_mapping[nb_grid_flat0[mask]]
 
 nb_chunk_thresholds = (0,1,2,3,4,5,10,15,20)
 for n in range(nb_chunk_thresholds[-1]+10, grid.max_nr_neighbours, 10):
@@ -130,7 +134,7 @@ d = {}
 for field in grid._fields:
     value = getattr(grid, field)
     if isinstance(value, np.ndarray) and value.shape != (3,):
-        value = jnp.array(value)
+        value = jnp.array(value, dtype=value.dtype)
     d[field] = value
 d["neighbour_grid_ravel"] = d["neighbour_grid"].reshape(-1, grid.neighbour_grid.shape[-1])
 grid = type(grid)(**d)
@@ -211,7 +215,6 @@ def nonbon_dif_jvp(primals, tangents):
 
 @jit
 def nb_energy_single(ind_innergrid, offset, lig_struc, lig_atom, all_coors_lig, coor_rec, rec_atomtypes, lig_atomtypes, ff):
-
     receptor_atom = grid.neighbour_grid_ravel[ind_innergrid, offset]
     rec_c = coor_rec[receptor_atom]
     at1 = rec_atomtypes[receptor_atom]
@@ -306,12 +309,14 @@ def generate_ind_innergrid(all_coors_lig, grid, grid_dim):
     vox_innergrid =  (all_coors_lig - grid.origin) / grid.gridspacing
     x, y, z = vox_innergrid[:, :, 0], vox_innergrid[:, :, 1], vox_innergrid[:, :, 2]
     in_innergrid = ((x >= 0) & (x < grid.dim[0]-1) & (y >= 0) & (y < grid.dim[1]-1) & (z >= 0) & (z < grid.dim[2]-1))
-    shift=max(grid_dim)+2
-    pos_innergrid = jnp.where(in_innergrid[:, :, None], jnp.floor(vox_innergrid+0.5).astype(np.int32), shift)
+    out_of_bounds=max(grid_dim)+2
+    pos_innergrid = jnp.where(in_innergrid[:, :, None], jnp.floor(vox_innergrid+0.5).astype(np.int32), out_of_bounds)
     ind_innergrid = jnp.ravel_multi_index((pos_innergrid[:, :, 0], pos_innergrid[:, :, 1],pos_innergrid[:, :, 2]),dims=grid_dim, mode="clip")
-    ind_innergrid = ind_innergrid + shift**3 * (1 - in_innergrid.astype(np.uint8))
+    ind_innergrid = ind_innergrid + out_of_bounds**3 * (1 - in_innergrid.astype(np.uint8))
 
-    nb_index = jnp.take(grid.nr_neighbours, ind_innergrid, fill_value=0)
+    #nb_index = jnp.take(grid.nr_neighbours, ind_innergrid, fill_value=0)
+    nb_index = jnp.take(grid.nr_neighbours, ind_innergrid)
+    nb_index = jnp.where(nb_index != -32768, nb_index, 0)
     max_contacts = nb_index.max()
     return ind_innergrid, nb_index, max_contacts 
 
@@ -333,15 +338,13 @@ def neighbour_energy(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conf
     all_coors_lig = jnp.einsum("ijk,ikl->ijl", coor_lig2[conformers], mat) #diagonally broadcasted form of coor_lig.dot(mat)
     all_coors_lig = all_coors_lig[:, :, :3]
 
-    ind_innergrid, nb_index, max_contacts  = generate_ind_innergrid(all_coors_lig, grid, grid_dim)
+    ind_innergrid, nb_index, max_contacts  = generate_ind_innergrid(all_coors_lig, grid, grid_dim)    
     if max_contacts == 0:
-        #print("EMPTY")
         return jnp.zeros(len(mat))
 
     sort_index, nr_inner_atoms = generate_sort_index(nb_index)
     sorted_ind_innergrid = ind_innergrid[sort_index[0], sort_index[1]]
     sorted_nb_index = nb_index[sort_index[0], sort_index[1]]
-    del nb_index
 
     nr_inner_atoms = int(nr_inner_atoms)
     
@@ -383,12 +386,19 @@ def neighbour_energy(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conf
     energies = neighbour_energy_accum(all_coors_lig, lig_struc, atom_energies)
     return energies
 
-def main(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers, lig_atomtype_pos, ff, grid, nb_chunk_thresholds, grid_dim):
+def main0(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers, lig_atomtype_pos, ff, grid, nb_chunk_thresholds, grid_dim):
 
     nb_energies = neighbour_energy(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers, ff, grid, nb_chunk_thresholds, NB_CHUNK_SIZE, grid_dim)
     pot_energies = potential_energy(mat, coor_lig, conformers, lig_atomtype_pos, grid)
     energies = pot_energies + nb_energies
     return energies.sum(), energies
+
+def main(rotations: Rotation, translations, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers, lig_atomtype_pos, ff, grid, nb_chunk_thresholds, grid_dim):
+    assert len(rotations) == len(translations) == len(conformers)
+    mat = jnp.ones((len(rotations), 4, 4))
+    mat = mat.at[:, :3, :3].set(rotations.as_matrix())
+    mat = mat.at[:, 3, :3].set(translations)
+    return main0(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers, lig_atomtype_pos, ff, grid, nb_chunk_thresholds, grid_dim)
 
 coor_rec = jnp.array(coor_rec)
 coor_lig = jnp.array(coor_lig)
@@ -401,55 +411,48 @@ grid_dim = tuple(grid.dim)
 print("JIT warmup...")
 
 
-if CALC_GRADS:
-    print("Calculate energies and gradients...")
-    vgrad_main = jax.value_and_grad(main, has_aux=True)
+print("Calculate energies and gradients...")
+vgrad_main = jax.value_and_grad(main, argnums=(0,1), has_aux=True)
+mat_batch = mat[:BATCH]
+rotations_batch = Rotation.from_matrix(mat_batch[:, :3, :3])
+translations_batch = mat_batch[:, 3, :3]
 
-    (_, energies), gradients = vgrad_main(mat[:BATCH], coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers[:BATCH], lig_atomtype_pos, ff, grid, nb_chunk_thresholds, grid_dim)
+(_, energies), gradients = vgrad_main(rotations_batch, translations_batch, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers[:BATCH], lig_atomtype_pos, ff, grid, nb_chunk_thresholds, grid_dim)
 
-    print("Energies:")  
-    print(energies[:10])
-    print(scramble[:10])
-    print()
-
-    print("Gradients (translational):")
-    print(-gradients[:10, 3, :3])  # sign is opposite of ATTRACT...
-
-    print("Gradients (torque):")
-    print(-gradients[:10, :3, :3])  # sign is opposite of ATTRACT...
-else:
-    print("Calculate energies...")
-    _, energies = main(mat[:BATCH], coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers[:BATCH], lig_atomtype_pos, ff, grid, nb_chunk_thresholds, grid_dim)
-
-    print("Energies:")  
-    print(energies[:10])
-    print(scramble[:10])
-    print()
+print("Energies:")  
+print(energies[:10])
+print(scramble[:10])
+print()
 
 print("JIT warmup DONE...", file=sys.stderr)
 t = time.time()
 
 assert len(mat) == len(conformers)
 energies = np.zeros(len(mat))
-gradients = np.zeros((len(mat), 4, 4))
 for offset in range(0, len(mat), BATCH):
-    for it in range(1):
-        print(time.time() - t, offset)
-        start, end = offset, offset + BATCH
-        if end > len(mat):
-            end = len(mat)
-            start = end - BATCH
-            if start < 0:
-                start = 0
-        batch = end - start
-        mat_batch = mat[start:end]
-        conformers_batch = conformers[start:end]
-        if CALC_GRADS:
-            (total_energy0, energies_batch), gradients_batch = vgrad_main(mat_batch, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers_batch, lig_atomtype_pos, ff,grid, nb_chunk_thresholds, grid_dim)
-            gradients[start:end] = gradients_batch
-        else:
-            total_energy0, energies_batch = main(mat_batch, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers_batch, lig_atomtype_pos, ff,grid, nb_chunk_thresholds, grid_dim)
-        energies[start:end] = energies_batch
+    print(time.time() - t, offset)
+    start, end = offset, offset + BATCH
+    if end > len(mat):
+        end = len(mat)
+        start = end - BATCH
+        if start < 0:
+            start = 0
+    batch = end - start
+    mat_batch = mat[start:end]
+    rotations_batch = Rotation.from_matrix(mat_batch[:, :3, :3])
+    translations_batch = mat_batch[:, 3, :3]
+    conformers_batch = conformers[start:end]
+    ### optimizer
+    start_learning_rate = 1e-3
+    optimizer = optax.adam(start_learning_rate)    
+    opt_state = optimizer.init((rotations_batch, translations_batch))
+    for epoch in range(20):
+        (total_energy_batch, energies_batch), gradients_batch = vgrad_main(rotations_batch, translations_batch, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers_batch, lig_atomtype_pos, ff,grid, nb_chunk_thresholds, grid_dim)
+        print(f"Batch {start} epoch {epoch} total energy {total_energy_batch}")
+        updates, opt_state = optimizer.update(gradients_batch, opt_state)
+        rotations_batch, translations_batch = optax.apply_updates((rotations_batch, translations_batch), updates)
+        rotations_batch = Rotation.from_quat(rotations_batch.as_quat())
+    energies[start:end] = energies_batch
 
 print("{:.3f} seconds".format((time.time() - t)), file=sys.stderr)
 print(file=sys.stderr)
