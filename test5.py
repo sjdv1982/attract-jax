@@ -1,10 +1,26 @@
 # version of test4.py with gravity (hardcoded) and optimized learning rate/steps
+# writes out poses and energies
 # not cut 
+# and no JIT warmup
+
+# ***Performs about as well (slightly worse) as current ATTRACT***
+# Minimizes 3 million structures/hour on Newton
 
 # from jax import config
 # config.update("jax_enable_x64", True)
 BATCH = 200000   # the number of structures to score in at a time
 NB_CHUNK_SIZE = 100000  # will be quadrupled for small ncontacts
+
+SCHEMA = [
+    # learning rate,  epochs,  gravity
+    [5, 10, True],
+    [10, 5, True],
+    [10, 1, True],  
+    [50, 0.5, True], 
+    [100, 0.1, False],
+    [100, 0.05, False],
+    [100, 0.02, False],
+]
 
 import numpy as np
 import jax
@@ -30,7 +46,8 @@ parser.add_argument("--atrec", help="receptor atom types",required=True)
 parser.add_argument("--atlig", help="ligand atom types",required=True)
 parser.add_argument("--grid", help="ATTRACT docking grid",required=True)
 parser.add_argument("--conformers", help="ligand conformer indices")
-parser.add_argument("--output", help="output energies")
+parser.add_argument("--out_poses", help="output poses",required=True)
+parser.add_argument("--out_ene", help="output energies",required=True)
 
 args = parser.parse_args()
 
@@ -391,14 +408,16 @@ def main0(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers, lig
     energies = pot_energies + nb_energies
     return energies.sum(), energies
 
-def main(rotations: Rotation, translations, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers, lig_atomtype_pos, ff, grid, nb_chunk_thresholds, grid_dim):
+def main(rotations: Rotation, translations, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers, lig_atomtype_pos, ff, grid, nb_chunk_thresholds, grid_dim, *, gravity):
     assert len(rotations) == len(translations) == len(conformers)
     mat = jnp.ones((len(rotations), 4, 4))
     mat = mat.at[:, :3, :3].set(rotations.as_matrix())
     mat = mat.at[:, 3, :3].set(translations)
     tot_energy, energies = main0(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers, lig_atomtype_pos, ff, grid, nb_chunk_thresholds, grid_dim)
-    gravity = jnp.linalg.norm(translations, axis=1)**2 * 0.1
-    return tot_energy + gravity.sum(), energies + gravity
+    if not gravity:
+        return tot_energy, energies
+    gravity_energy = jnp.linalg.norm(translations, axis=1)**2 * 0.1
+    return tot_energy + gravity_energy.sum(), energies + gravity_energy
 
 coor_rec = jnp.array(coor_rec)
 coor_lig = jnp.array(coor_lig)
@@ -407,28 +426,13 @@ lig_atomtypes = jnp.array(lig_atomtypes)
 
 grid_dim = tuple(grid.dim)
 
-
-print("JIT warmup...")
-
-
-print("Calculate energies and gradients...")
 vgrad_main = jax.value_and_grad(main, argnums=(0,1), has_aux=True)
-mat_batch = mat[:BATCH]
-rotations_batch = Rotation.from_matrix(mat_batch[:, :3, :3])
-translations_batch = mat_batch[:, 3, :3]
 
-(_, energies), gradients = vgrad_main(rotations_batch, translations_batch, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers[:BATCH], lig_atomtype_pos, ff, grid, nb_chunk_thresholds, grid_dim)
-
-print("Energies:")  
-print(energies[:10])
-print(scramble[:10])
-print()
-
-print("JIT warmup DONE...", file=sys.stderr)
 t = time.time()
 
 assert len(mat) == len(conformers)
-energies = np.zeros(len(mat))
+minimized_energies = np.zeros(len(mat))
+minimized_poses = np.ones_like(mat)
 for offset in range(0, len(mat), BATCH):
     print(time.time() - t, offset)
     start, end = offset, offset + BATCH
@@ -443,21 +447,35 @@ for offset in range(0, len(mat), BATCH):
     translations_batch = mat_batch[:, 3, :3]
     conformers_batch = conformers[start:end]
     ### optimizer
-    start_learning_rate = 5
-    optimizer = optax.adam(start_learning_rate)    
-    opt_state = optimizer.init((rotations_batch, translations_batch))
-    for epoch in range(50):
-        (total_energy_batch, energies_batch), gradients_batch = vgrad_main(rotations_batch, translations_batch, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers_batch, lig_atomtype_pos, ff,grid, nb_chunk_thresholds, grid_dim)
-        print(f"Batch {start} epoch {epoch} mean energy {total_energy_batch/len(rotations_batch)}")
-        updates, opt_state = optimizer.update(gradients_batch, opt_state)
-        rotations_batch, translations_batch = optax.apply_updates((rotations_batch, translations_batch), updates)
-        rotations_batch = Rotation.from_quat(rotations_batch.as_quat())
-    energies[start:end] = energies_batch
+    for epochs, learning_rate, gravity in SCHEMA:
+        optimizer = optax.adabelief(learning_rate)    
+        opt_state = optimizer.init((rotations_batch, translations_batch))
+        for epoch in range(epochs):
+            (total_energy_batch, energies_batch), gradients_batch = vgrad_main(rotations_batch, translations_batch, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers_batch, lig_atomtype_pos, ff,grid, nb_chunk_thresholds, grid_dim, gravity=gravity)
+            print(f"Batch {start}-{end} epoch {epoch} median energy {np.sort(energies_batch)[len(energies_batch)//2]}")
+            updates, opt_state = optimizer.update(gradients_batch, opt_state)
+            rotations_batch, translations_batch = optax.apply_updates((rotations_batch, translations_batch), updates)
+            rotations_batch = Rotation.from_quat(rotations_batch.as_quat())
+    
+    # Final scoring
+    energies_minimized_batch = energies_batch ###
+    ###total_minimized_energy_batch, energies_minimized_batch = main(rotations_batch, translations_batch, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers_batch, lig_atomtype_pos, ff,grid, nb_chunk_thresholds, grid_dim, gravity=False)
+    ###print(f"Batch {start}-{end} Final median energy{np.sort(energies_batch)[len(energies_batch)//2]}")
+
+    minimized_energies[start:end] = energies_minimized_batch
+    minimized_poses[start:end, :3, :3] = rotations_batch.as_matrix()
+    minimized_poses[start:end, 3, :3] = translations_batch
+    
 
 print("{:.3f} seconds".format((time.time() - t)), file=sys.stderr)
 print(file=sys.stderr)
 
+final_poses = np.zeros_like(mat)
+final_poses[scramble] = minimized_poses
+if args.out_poses:
+    np.save(args.out_poses, final_poses)
+
 final_energies = np.zeros(len(mat))
-final_energies[scramble] = energies
-if args.output:
-    np.save(args.output, final_energies)
+final_energies[scramble] = minimized_energies
+if args.out_ene:
+    np.save(args.out_ene, final_energies)
