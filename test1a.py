@@ -1,14 +1,17 @@
 # version of test1.py where JIT is disabled for outer functions
-# Loss of efficiency: about a factor 2
+# Loss of efficiency: about 10 %
 # Allows pre-definition of neighbour chunks (test2.py)
 #  allowing for more flexible energy evaluation
 # For crocodile, where all poses are known in advance, better stick to jit to maximize speed
 
+
+# test-grid-energrad-retile.py, taking command line parameters, and adding ensemble
+
 # from jax import config
 # config.update("jax_enable_x64", True)
-CALC_GRADS = True
-ITER = 10
-ITER_GRAD = 10
+CALC_GRADS = False
+ITER = 50
+ITER_GRAD = 50
 TOP = 500000
 
 import numpy as np
@@ -294,7 +297,6 @@ def potential_energy(mat, coor_lig, conformers, lig_atomtype_pos, grid):
     atom_energies = potential_energies(all_coors_lig, lig_atomtype_pos, grid)
     return atom_energies.sum(axis=1)
 
-@partial(jit, static_argnames=("grid_dim",))
 def generate_nb_table(all_coors_lig, grid, grid_dim):
     vox_innergrid =  (all_coors_lig - grid.origin) / grid.gridspacing
     x, y, z = vox_innergrid[:, :, 0], vox_innergrid[:, :, 1], vox_innergrid[:, :, 2]
@@ -310,7 +312,6 @@ def generate_nb_table(all_coors_lig, grid, grid_dim):
     return nb_index, sort_index, nr_inner_atoms
 
 
-@jit
 def neighbour_energy_accum(all_coors_lig, lig_struc, atom_energies):
     energies = jnp.zeros(len(all_coors_lig))    
     energies = energies.at[lig_struc].add(atom_energies)
@@ -431,15 +432,59 @@ total_energy = energies.sum()
 
 main(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers, lig_atomtype_pos, ff, grid, chunks, grid_dim)
 
+import gc
+gc.collect()
+
+print(f"Timing (energies, x10)...", file=sys.stderr)
+t = time.time()
+
+for n in range(10):
+    total_energy0, energies = main(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers, lig_atomtype_pos, ff, grid, chunks, grid_dim)
+    print(n+1, time.time() - t)
+
+    #assert abs(total_energy0 - total_energy) < 0.1, (total_energy0, total_energy)
+
+print("{:.3f} seconds".format((time.time() - t)/10), file=sys.stderr)
+print(file=sys.stderr)
+
 print(f"Timing (energies, x{ITER})...", file=sys.stderr)
 t = time.time()
 
 for n in range(ITER):
     total_energy0, energies = main(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers, lig_atomtype_pos, ff, grid, chunks, grid_dim)
+    print(n+1, time.time() - t)
 
     #assert abs(total_energy0 - total_energy) < 0.1, (total_energy0, total_energy)
 
 print("{:.3f} seconds".format((time.time() - t)/ITER), file=sys.stderr)
+print(file=sys.stderr)
+
+print(f"Timing (energies, scrambled, x{ITER})...", file=sys.stderr)
+
+scrambles = []
+scramble = np.arange(len(mat))
+np.random.seed(0)
+
+for n in range(ITER):
+    np.random.shuffle(scramble) 
+    scrambles.append(jnp.array(scramble))
+
+t = time.time()
+for n in range(ITER):
+    mat_scramble, conformers_scramble = mat[scrambles[n]], conformers[scrambles[n]]
+overhead = time.time() - t
+
+import gc
+gc.collect()
+
+t = time.time()
+for n in range(ITER):
+    mat_scramble, conformers_scramble = mat[scrambles[n]], conformers[scrambles[n]]
+    total_energy0, energies = main(mat_scramble, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers_scramble, lig_atomtype_pos, ff, grid, chunks, grid_dim)
+
+    #assert abs(total_energy0 - total_energy) < 0.1, (total_energy0, total_energy)
+
+print("{:.3f} seconds".format((time.time() - t - overhead)/ITER), file=sys.stderr)
 print(file=sys.stderr)
 
 if CALC_GRADS:
@@ -447,12 +492,26 @@ if CALC_GRADS:
 
     #assert abs(total_energy0 - total_energy) < 0.1, (total_energy0, total_energy)
 
+    print(f"Timing (energy + gradients, x10)...", file=sys.stderr)
+    t = time.time()
+
+    for n in range(10):
+
+        (total_energy0, energies), gradients = vgrad_main(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers, lig_atomtype_pos, ff, grid, chunks, grid_dim)
+        print(n+1, time.time() - t)
+
+        #assert abs(total_energy0 - total_energy) < 0.1, (total_energy0, total_energy)
+
+    print("{:.3f} seconds".format((time.time() - t)/10), file=sys.stderr)
+
+
     print(f"Timing (energy + gradients, x{ITER_GRAD})...", file=sys.stderr)
     t = time.time()
 
     for n in range(ITER_GRAD):
 
         (total_energy0, energies), gradients = vgrad_main(mat, coor_rec, rec_atomtypes, coor_lig, lig_atomtypes, conformers, lig_atomtype_pos, ff, grid, chunks, grid_dim)
+        print(n+1, time.time() - t)
 
         #assert abs(total_energy0 - total_energy) < 0.1, (total_energy0, total_energy)
 

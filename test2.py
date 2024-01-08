@@ -5,6 +5,12 @@
 
 # About three times slower than test1
 # For crocodile, where all poses are known in advance, don't pre-define (triple speed)
+# #####
+# UPDATE: NOT QUITE TRUE!!! earlier test1 timing were artificially enhanced, need scrambling for fair comparison
+# True timings for test1 (on newton) are about 0.8 sec/million for energies and double that for ene+grad
+# The current version is at most twice as slow, 1.5 sec/million for energies and 2.75 sec/million for ene+grad
+# (compared to test1a that has less JIT, the slowdown is about 1.5x, a bit better for grad)
+# #####
 
 # from jax import config
 # config.update("jax_enable_x64", True)
@@ -435,13 +441,12 @@ else:
 print("JIT warmup DONE...", file=sys.stderr)
 t = time.time()
 
-
 assert len(mat) == len(conformers)
 energies = np.zeros(len(mat))
 gradients = np.zeros((len(mat), 4, 4))
 for offset in range(0, len(mat), BATCH):
     for it in range(1):
-        print(time.time() - t, offset)
+        ###print(time.time() - t, offset)
         start, end = offset, offset + BATCH
         if end > len(mat):
             end = len(mat)
