@@ -29,6 +29,7 @@ parser.add_argument("--atrec", help="receptor atom types",required=True)
 parser.add_argument("--atlig", help="ligand atom types",required=True)
 parser.add_argument("--grid", help="ATTRACT docking grid",required=True)
 parser.add_argument("--conformers", help="ligand conformer indices")
+parser.add_argument("--conformers-from-zero", help="conformer indices start from zero instead of one", action="store_true")
 
 args = parser.parse_args()
 
@@ -46,6 +47,8 @@ has_conformer = (lig.ndim == 3)
 if has_conformer:
     assert args.conformers is not None
     conformers = jnp.load(args.conformers).astype(int)
+    if args.conformers_from_zero:
+        conformers += 1
     assert len(conformers) == len(mat)
     assert conformers.min() >= 1
     assert conformers.max() <= len(lig)
