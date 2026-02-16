@@ -128,9 +128,9 @@ def write_dat_two_body(path, header, ens, dofs, energies=None):
         for line in header:
             f.write(line)
         for i in range(len(dofs)):
+            f.write(f"#{i+1}\n")
             if energies is not None and np.isfinite(energies[i]):
                 f.write(f"## Energy: {energies[i]:.15e}\n")
-            f.write(f"#{i+1}\n")
             f.write(f"{int(ens[i]):12d}{0:12d}{0:12d}{0:12d}{0:12d}{0:12d}{0:12d}\n")
             phi, ssi, rot, xa, ya, za = dofs[i]
             f.write(
@@ -673,6 +673,8 @@ def minfor_minimize_batched(
     init_metric=0.01,
     acc=1e-9,
     trace_every=0,
+    traj_prefix=None,
+    traj_header=None,
 ):
     """Batch-minimize all poses using VA13 with batched oracle calls.
 
@@ -717,6 +719,10 @@ def minfor_minimize_batched(
     xbb = dofs0.copy()  # next trial point
     active = np.ones(N, dtype=bool)
 
+    # --- Trajectory state: track last evaluated (dofs, energy) per pose ---
+    traj_dofs = dofs0.copy()  # last evaluated point per pose
+    traj_energies = np.full(N, np.nan, dtype=np.float64)
+
     # --- Initial batch evaluation ---
     e0, g0 = oracle.score_batch(ens, dofs0)
     nfev[:] = 1
@@ -724,6 +730,12 @@ def minfor_minimize_batched(
     g[:] = g0
     f_best[:] = e0
     x_best[:] = dofs0
+    traj_energies[:] = e0
+
+    if traj_prefix and traj_header is not None:
+        write_dat_two_body(
+            f"{traj_prefix}.{0:04d}.dat", traj_header, ens, traj_dofs, traj_energies
+        )
 
     # --- Set up first outer iteration for all poses ---
     for i in range(N):
@@ -779,6 +791,19 @@ def minfor_minimize_batched(
         _cum_kernel += _t1 - _t0
         nfev[act_idx] += 1
         tick += 1
+
+        # Update trajectory state for active poses
+        if traj_prefix and traj_header is not None:
+            for k, ii in enumerate(act_idx):
+                traj_dofs[ii] = xbb[ii]
+                traj_energies[ii] = float(e_batch[k])
+            write_dat_two_body(
+                f"{traj_prefix}.{tick:04d}.dat",
+                traj_header,
+                ens,
+                traj_dofs,
+                traj_energies,
+            )
 
         # Process each active pose's line search result
         need_label_110 = []  # failed line search → reset to global best
@@ -1137,6 +1162,11 @@ def parse_args():
         action="store_true",
         help="disable JAX JIT compilation (slower per-eval but no compilation time)",
     )
+    ap.add_argument(
+        "--traj",
+        action="store_true",
+        help="write trajectory .dat files (one per tick: {out-prefix}.traj.NNNN.dat)",
+    )
     return ap.parse_args()
 
 
@@ -1183,9 +1213,10 @@ def main():
         lig_pivot = np.mean(coor, axis=0)
     print(f"Ligand pivot: {lig_pivot}")
 
-    # --- Convert centered → non-centered if needed ---
+    # --- Convert centered → non-centered for JAX oracle only ---
     input_centered = bool(centered_ligands) if centered_ligands is not None else False
-    if input_centered:
+    converted_for_oracle = input_centered and args.oracle == "jax"
+    if converted_for_oracle:
         dofs0 = dofs0.copy()
         dofs0[:, 3:6] -= lig_pivot[None, :]
         print(
@@ -1253,6 +1284,7 @@ def main():
 
         if args.method == "dfp-batch":
             # --- Batched minimization (one oracle call per tick) ---
+            traj_prefix = f"{args.out_prefix}.traj" if args.traj else None
             dofs_out, energies_out, nfev_out = minfor_minimize_batched(
                 oracle,
                 ens,
@@ -1260,6 +1292,8 @@ def main():
                 maxfun=args.maxfun,
                 init_metric=args.init_metric,
                 trace_every=args.trace_every,
+                traj_prefix=traj_prefix,
+                traj_header=header,
             )
         else:
             # --- Per-pose minimization ---
@@ -1323,8 +1357,8 @@ def main():
         if tmpdir_ctx is not None:
             tmpdir_ctx.__exit__(None, None, None)
 
-    # --- Convert back to centered if input was centered ---
-    if input_centered:
+    # --- Convert back to centered if we converted for JAX input ---
+    if converted_for_oracle:
         dofs_out = dofs_out.copy()
         dofs_out[:, 3:6] += lig_pivot[None, :]
 

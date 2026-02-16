@@ -292,7 +292,8 @@ class JaxScoreOracle:
 
             _vg_single = jax.value_and_grad(_single_energy)
             # vmap over (dof, rec_coor, rec_charge): each pose carries its own
-            # receptor ensemble data, allowing all ensembles in one call.
+            # receptor data.  At large scale (165k poses) this avoids the
+            # per-ensemble Python dispatch overhead (np.where + scatter-back).
             _vg_batch = jax.jit(jax.vmap(_vg_single, in_axes=(0, 0, 0)))
             self._vg_batch = _vg_batch
         else:
@@ -411,10 +412,9 @@ class JaxScoreOracle:
     def score_batch(self, ens, dofs):
         """Score a batch of poses with analytical gradients (jax.value_and_grad).
 
-        Uses a merged-ensemble approach: per-pose receptor data is gathered
-        from stacked arrays so that all ensembles are processed in a single
-        (or few) vmap call(s), eliminating the per-ensemble loop and the
-        padding waste it caused.
+        Merged-ensemble approach: per-pose receptor data is gathered from
+        stacked numpy arrays per chunk, so all ensembles are processed in
+        a single sequential loop without per-ensemble Python dispatch.
 
         Parameters
         ----------
@@ -428,17 +428,11 @@ class JaxScoreOracle:
         """
         self._call_count += 1
         n = len(dofs)
-
-        # Gather per-pose receptor coordinates and charges (numpy indexing).
         ens0 = np.asarray(ens, dtype=np.intp) - 1  # (N,) 0-based
-        rec_coor_np = self._rec_coor_ens_np[ens0]  # (N, Nrec, 3)
-        rec_charge_np = self._rec_charge_ens_np[ens0]  # (N, Nrec)
 
         energies = np.zeros(n, dtype=np.float64)
         gradients = np.zeros((n, 6), dtype=np.float64)
 
-        # Process in sub-batches sized to energy_batch.
-        # Each sub-batch is padded to the next _BATCH_SIZES bucket.
         chunk = self.energy_batch
         for start in range(0, n, chunk):
             end = min(start + chunk, n)
@@ -446,8 +440,10 @@ class JaxScoreOracle:
             pad_n = _round_up_batch(m)
 
             dofs_j = jnp.array(dofs[start:end], dtype=jnp.float64)
-            rc_j = jnp.array(rec_coor_np[start:end], dtype=jnp.float64)
-            rq_j = jnp.array(rec_charge_np[start:end], dtype=jnp.float64)
+            rc_j = jnp.array(self._rec_coor_ens_np[ens0[start:end]], dtype=jnp.float64)
+            rq_j = jnp.array(
+                self._rec_charge_ens_np[ens0[start:end]], dtype=jnp.float64
+            )
 
             if m < pad_n:
                 dofs_j = jnp.pad(dofs_j, ((0, pad_n - m), (0, 0)))

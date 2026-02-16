@@ -624,8 +624,15 @@ def build_kernel(
         d = lig_c - rec_c
         dsq = (d * d).sum()
         charge = rec_charge_scaled0[safe_atom] * lig_charge_scaled0[lig_atom]
+        # Legacy nonbon_grid (non-rigid mode) evaluates both neighbour types:
+        # - type 1: within plateau at grid-build time
+        # - type 2: between plateau and neighbour cutoff at build time
+        # Type-2 neighbours can still move inside plateau at runtime.
         valid = (
-            (receptor_atom < 2**16 - 1) & (receptor_type == 1) & (dsq < plateaudissq)
+            (receptor_atom < 2**16 - 1)
+            & (receptor_type > 0)
+            & (receptor_type <= 2)
+            & (dsq < plateaudissq)
         )
         return cond(valid, pair_dif, lambda *_: 0.0, d, ff0, at1, at2, charge)
 
@@ -794,9 +801,15 @@ def build_kernel(
                 ind_innergrid[:, None], offsets[None, :]
             ]
 
-            # Validity: real neighbour with type==1
+            # Legacy non-rigid runtime includes both type-1 and type-2
+            # neighbour entries; type-2 can contribute when they cross
+            # inside plateau in the current pose.
             nrec = coor_rec.shape[0]
-            valid_nb = (receptor_atoms < (2**16 - 1)) & (receptor_types == 1)
+            valid_nb = (
+                (receptor_atoms < (2**16 - 1))
+                & (receptor_types > 0)
+                & (receptor_types <= 2)
+            )
             safe_atoms = jnp.where(receptor_atoms < nrec, receptor_atoms, 0)
 
             # Coordinates: (N, K, 3) and (N, 1, 3)
