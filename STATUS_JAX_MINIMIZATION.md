@@ -89,7 +89,7 @@ The full 165,528-pose minimization **completed** in **~8 hours** (single process
 
 ### Correctness Issue: cap40 vs cap180
 
-The full run used `max_nb_cap=40`, which was validated to give identical energies for a small set of tested poses. However, **only cap180 (i.e. no capping) gives correct energies in general**. Since the nb kernel dominates >80% of wall time, and cap180 has ~4.5× more work per atom than cap40, the **true slowdown with correct settings is ~40×** vs legacy ATTRACT.
+The full run used `max_nb_cap=40`, which was validated to give identical energies for a small set of tested poses. However, **only cap180 (i.e. no capping) gives correct energies in general**. Since the nb kernel dominates >80% of wall time, and cap180 has ~3.4× more nb kernel time than cap40 (measured), the **true slowdown with correct settings is ~30-35×** vs legacy ATTRACT.
 
 ### What Remains
 
@@ -329,53 +329,125 @@ Bucketing requires **sorting**, which is data-dependent control flow. JAX's func
 - The crocodile approach works by keeping the sort **outside JIT/vmap**, in Python/numpy. This is only possible when the entire scoring pass is a single forward call (no per-pose AD gradient needed, or AD taken on the full flattened batch).
 - During minimization, `score_batch()` is called repeatedly with ~256 active poses. AD gradients are needed per pose. The sort must either happen inside JIT (slow) or the AD must be restructured to work on the flattened atom pool (complex but potentially viable).
 
-### When Each Bucketing Scheme Could Work
+### Bucketing vs Special Kernel: Conclusion
 
-**Crocodile-style (flat pool, numpy sort, static ncontacts)**:
+**Current bucketed mode in jax_scorer.py**: should be **removed**. It is slower than fixed mode in all tested configurations.
 
-- Scoring-only passes (no AD gradient needed): always viable, scales well.
-- Minimization with AD: viable **if** `value_and_grad` is taken on the full batch energy (sum over all poses), not vmapped per pose. The gradient would flow through the nb_energy calls naturally since each call has a static, unrolled loop. **Requires restructuring** the AD path to match.
-- GPU: works well — static ncontacts means each bucket is a fixed-shape kernel launch with good occupancy.
-- CPU: works but the real win is Path B (C kernel). Bucketing on CPU is a stopgap.
+**Crocodile-style bucketing is viable for GPU production**, including minimization. The key insight: `value_and_grad` on the batch energy sum gives per-pose gradients correctly (cross-derivatives are zero since each pose's energy depends only on its own DOFs). This is already proven in the crocodile code. So the AD restructuring needed for minimization is straightforward — no vmap needed.
 
-**Current bucketed mode**: should be **removed or rewritten**. It is slower than the fixed mode in all tested configurations.
+For ensemble grids (max_nb=180), bucketing to e.g. (8, 16, 32, 64, 128, 180) saves dramatically vs padding to 180. A surface atom with nb=5 processes 8 offsets instead of 180 — a ~20× reduction for that atom. The sort cost (numpy argsort of ~20k entries for 256 poses × 80 atoms) is negligible.
+
+**A CUDA kernel is strictly better but complementary**: even a CUDA kernel benefits from pre-sorting atoms by nb count to reduce warp divergence (adjacent threads in a warp with nb=5 and nb=150 cause the fast thread to idle). So bucketing isn't replaced by native kernels — it's a useful technique at both levels.
+
+**For CPU production**: C kernel with early termination dominates. No bucketing needed.
 
 ---
 
 ## Paths Forward: Nb Kernel Optimization
 
-### Path A: Better Bucketing / Batching (pure JAX)
+### Path A: Crocodile-Style Bucketing for GPU (pure JAX)
 
-Redesign bucketing based on the crocodile approach, adapted for minimization:
+Adapt the proven crocodile bucketing approach for minimization:
 
 - **Flatten (pose, atom) pairs** across the batch, sort by nb count in numpy (outside JIT).
 - **Dispatch per bucket** with static `ncontacts` — XLA compiles optimal code per bucket.
-- **AD via `value_and_grad` on the batch sum**, not per-pose vmap. The gradient flows through the flattened dispatch naturally.
-- **Atom-level culling**: skip atoms with nb=0 before entering any kernel (already done implicitly by the sort).
+- **AD via `value_and_grad` on the batch energy sum** — gives per-pose gradients correctly (cross-derivatives are zero). No vmap needed. Already proven in crocodile code.
+- **Atom-level culling**: atoms with nb=0 are naturally excluded by the sort.
 
-**Pros**: stays pure JAX, works on GPU, benefits from AD. Proven approach (crocodile).
-**Cons**: requires restructuring the AD path. Multiple JIT traces (one per bucket threshold). Sort overhead per `score_batch` call — acceptable if batch is large enough.
+**Pros**: pure JAX, works on any GPU, AD-compatible, proven approach. Large speedup over fixed-cap for ensemble grids (surface atoms with nb=5 process 8 offsets instead of 180).
+**Cons**: still wastes some compute on intra-bucket padding. Multiple JIT traces (one per bucket threshold). Sort overhead per `score_batch` call (negligible at 256×80 = 20k entries).
 
-### Path B: Special C Kernel for Nb Energy+Gradient
+**Target**: default GPU production path for all energy functions.
 
-Write a C (or C++) kernel that computes both energy and analytical gradients for the nb correction using nested for-loops, callable from Python via ctypes/cffi:
+### Path B: C Kernel for CPU
 
-- **Early termination**: skip padded entries, break out of loops when nb list ends.
-- **Cache-friendly traversal**: process atoms sequentially, prefetch grid data.
-- **No vmap overhead**: direct iteration, no XLA compilation.
-- **Analytical gradients**: the LJ gradient is simple enough to hand-code (and is already done in Fortran `nonbon8.f`).
+Write a C kernel for the nb energy+gradient, callable from Python via ctypes/cffi:
 
-**Pros**: expected to match or approach legacy ATTRACT speed. Straightforward to implement given the existing Fortran reference.
-**Cons**: maintains two implementations of the same physics. Not differentiable via JAX AD. CPU-only (would need a CUDA version for GPU).
+- Nested for-loops with early termination (break when nb list ends).
+- Cache-friendly sequential atom traversal.
+- Hand-coded analytical gradients (reference: Fortran `nonbon8.f`).
+- Expected to match or approach legacy ATTRACT speed on CPU.
+
+**Target**: CPU production. Straightforward to implement given the Fortran reference.
+
+### Path C: CUDA Kernel for GPU (when justified)
+
+Write a CUDA kernel for the nb energy+gradient:
+
+- One thread per (pose, atom) pair — embarrassingly parallel.
+- Pre-sort atoms by nb count (reuse bucketing logic) to reduce warp divergence.
+- Per-thread loop with early termination.
+- Shared memory for receptor coordinate caching if beneficial.
+- Potentially **faster than legacy ATTRACT** due to massive parallelism.
+
+**Target**: specific energy functions that bottleneck the heaviest GPU workloads (see assessment below).
+
+### GPU Performance Assessment: Bucketed JAX vs C/CUDA Kernel
+
+Assessment by Claude Opus 4.6, 2026-02-17.
+
+#### The question
+
+For production GPU use, is bucketed JAX (Path A) sufficient, or does one realistically always need a C/CUDA kernel (Paths B/C)? This matters because new energy functions will be added, and the answer determines whether each one requires a hand-written kernel or can rely on JAX with bucketing.
+
+#### Bucketed JAX efficiency relative to a CUDA kernel
+
+For the nb kernel specifically, XLA generates good GPU code from the bucketed JAX path. Each bucket dispatch becomes a GPU kernel where every thread processes one atom through a fully-unrolled loop of `ncontacts` gather-compute-accumulate steps. The memory access pattern (scattered reads from the grid and receptor arrays) is identical to what a hand-written CUDA kernel would do.
+
+The efficiency loss from bucketed JAX vs CUDA is **intra-bucket padding**: an atom with nb=17 in a bucket capped at 20 wastes 3 iterations. With fine-grained thresholds (1,2,3,4,5,10,15,20,...), this waste averages roughly 10-30% of actual work. So bucketed JAX operates at approximately **70-90% of theoretical CUDA efficiency** for the nb kernel itself.
+
+However, this relative efficiency says nothing about the absolute gap vs legacy ATTRACT, which is the real question.
+
+#### Absolute performance: the XLA constant-factor gap
+
+On CPU, JAX with cap40 (fixed, no bucketing) is already ~12× slower than legacy multi-core ATTRACT for the full minimization run. This gap comes from XLA overhead: vmap unrolling into sequential operations, poor codegen for scattered memory access, Python/JIT dispatch. Bucketing eliminates padding waste but does not address this ~12× constant factor.
+
+On GPU, some of this gap shrinks: vmap maps to real parallelism, and GPUs handle scattered gathers via latency hiding. But legacy ATTRACT is already multi-core, and a CUDA kernel would also have early termination (no padding at all). **The magnitude of the GPU speedup over JAX-on-CPU for this code is unknown — no GPU benchmarks exist.**
+
+#### Per-workload verdict
+
+**Ensemble + large ligand (this test case, max_nb=180)**:
+
+- JAX-CPU cap180 fixed: ~27 hours (~35× slower than legacy).
+- JAX-CPU cap180 bucketed: ~8 hours (bucketing reduces effective cap to ~20-30 average, comparable to cap40 fixed). Still ~12× slower than legacy.
+- JAX-GPU bucketed: unknown, but the ~12× CPU constant factor is unlikely to fully close on GPU. Estimated ~3-5× slower than legacy multi-core. **Not competitive for production.** A C kernel (CPU) or CUDA kernel (GPU) is needed.
+
+**Single-conformation + large ligand (max_nb ~20-30)**:
+
+- Padding waste is small even without bucketing (pad to 32).
+- The ~12× XLA constant factor still applies on CPU, but the absolute time is much lower.
+- On GPU, JAX fixed-cap may be adequate since the nb kernel is a smaller fraction of total work. **Unknown — needs benchmarking.**
+
+**Small ligand (any grid)**:
+
+- Nb kernel is cheap per pose regardless of max_nb.
+- JAX-GPU likely adequate. Bucketing may not even be needed.
+- **Probably viable for production without a special kernel.**
+
+#### CPU: bucketing does not help
+
+On CPU, bucketing addresses the wrong bottleneck. The ~12× constant-factor gap (cap40 JAX vs legacy) is not caused by padding — it comes from XLA's CPU codegen: vmap unrolled to sequential operations, scattered memory access that XLA cannot optimize into cache-friendly loops, and Python/JIT dispatch overhead. Bucketing eliminates padding waste but leaves the ~12× untouched.
+
+Even in the best case (single-conf, max_nb ~25): padding waste is only ~25% (pad to 32), so bucketing saves at most ~1.2× on the nb kernel. The ~12× constant factor remains. **On CPU, a C kernel is the only viable production path. Bucketing is strictly a GPU technique** — it trades padding waste for parallelism, which only pays off with thousands of GPU threads.
+
+#### Conclusion
+
+Bucketed JAX is not a universal production solution. For the heaviest workload (ensemble + large ligand), the XLA constant-factor overhead (~12× on CPU, unknown on GPU) means a C/CUDA kernel is needed for production performance. For lighter workloads (single-conf or small ligand), bucketed JAX may be sufficient — but this is unproven.
+
+**Implication for new energy functions**: implement in JAX first (research mode). For production, measure the actual wall-time gap. If the energy function dominates and the workload is heavy, a C/CUDA kernel will be needed. The architecture should make it easy to swap in a native kernel per-function, but many energy functions may never need one — it depends on how much time they consume relative to the nb kernel.
+
+### Interface
+
+All paths expose the same oracle API: `score_batch(ens, dofs) → (energies, gradients)`. The oracle selects the kernel at init time based on hardware and configuration (`--nb-kernel jax|jax-bucketed|c|cuda`).
 
 ### Dual-Purpose Architecture
 
-Both paths should be pursued. The codebase will have a **dual function**:
+The codebase has a **dual function**:
 
-1. **Research mode** (JAX): implement and iterate on energy functions in Python. JAX provides automatic differentiation and GPU parallelization for free. Correctness is the priority; performance is secondary.
-2. **Production mode** (special kernel): for workloads where performance matters (large-scale docking runs), use the optimized C kernel. The correct choice of kernel depends on the workload (problem size, hardware, whether AD is needed).
+1. **Research mode** (JAX, fixed cap): implement and iterate on energy functions in Python. JAX provides automatic differentiation and GPU parallelization for free. Correctness is the priority; performance is secondary.
+2. **Production mode** (bucketed JAX on GPU, C on CPU, or CUDA when justified): for workloads where performance matters. Validated against the JAX reference implementation.
 
-This duality is appropriate and should be embraced rather than avoided. The JAX implementation serves as the reference/ground-truth, and the C kernel is validated against it.
+This duality is appropriate and should be embraced. The JAX implementation serves as the reference/ground-truth, and production kernels are validated against it. New energy functions follow the path: JAX implementation → bucketing for GPU production → CUDA only if profiling shows it's the bottleneck at scale.
 
 ---
 
@@ -409,35 +481,36 @@ The near-surface regime is where poses spend most function evaluations (convergi
 
 ### Workload Matrix
 
-| Scenario                        | Plateau | Ligand size | max_nb | Bucketing value | C kernel value | JAX-vs-legacy gap   |
-|---------------------------------|---------|-------------|--------|-----------------|----------------|---------------------|
-| Protein–protein, ensemble       | 10 Å    | large       | ~180   | **High** (GPU)  | **High** (CPU) | ~40× (measured)     |
-| Protein–protein, single conf    | 5 Å     | large       | ~20-30 | Medium (GPU)    | **High** (CPU) | ~6-7×? (hypothesis) |
-| Peptide/nucleotide, ensemble    | 10 Å    | small       | ~180   | Medium (GPU)    | Medium (CPU)   | unknown             |
-| Peptide/nucleotide, single conf | 5 Å     | small       | ~20-30 | Low             | Low            | unknown             |
+| Scenario                        | Plateau | Ligand size | max_nb | C/CUDA kernel value | JAX-vs-legacy gap   |
+|---------------------------------|---------|-------------|--------|---------------------|---------------------|
+| Protein–protein, ensemble       | 10 Å    | large       | ~180   | **High**            | ~35× (measured)     |
+| Protein–protein, single conf    | 5 Å     | large       | ~20-30 | **High**            | ~6-7×? (hypothesis) |
+| Peptide/nucleotide, ensemble    | 10 Å    | small       | ~180   | Medium              | unknown             |
+| Peptide/nucleotide, single conf | 5 Å     | small       | ~20-30 | Low                 | unknown             |
 
 **Note**: only the ensemble protein–protein case has been benchmarked. The single-conformation estimates (~6× less nb work due to lower cap) are hypothetical — the actual JAX-vs-legacy gap needs to be measured. Other constant-factor overheads (grid lookup, potential evaluation, Python dispatch) may keep the gap larger than the nb reduction alone would predict.
 
 ### Optimization Priority by Hardware
 
-**CPU production** → Path B (C kernel) dominates for all workloads. Early termination in nested for-loops eliminates padding waste entirely. Bucketing is irrelevant.
+**CPU production** → Path B (C kernel). Early termination in nested for-loops eliminates padding waste entirely. Straightforward port from Fortran `nonbon8.f`.
 
-**GPU production** → Path A (bucketing) is the primary strategy:
-- Most beneficial for large-ligand ensemble docking (high max_nb, high variance at convergence).
-- For single-conformation grids with low max_nb, simple padding to a small fixed cap may suffice without bucketing.
-- For small ligands, batch more poses together rather than bucketing atoms within a pose.
+**GPU production (light workloads)** → Path A (bucketed JAX). Adequate for single-conformation grids and small-ligand docking. Default starting point for new energy functions.
 
-**Research / prototyping** → neither optimization needed. Current JAX kernel with a reasonable cap is fine for correctness testing on small pose counts.
+**GPU production (heavy workloads)** → Path C (CUDA kernel). Required for ensemble + large ligand at production scale, where the XLA constant-factor overhead makes bucketed JAX uncompetitive. The architecture should make it easy to swap in a CUDA kernel per energy function.
+
+**Research / prototyping** → current JAX kernel (fixed cap) is adequate. No optimization needed for correctness testing on small pose counts.
 
 ---
 
 ## Next Steps
 
-1. **Measure single-conformation grid nb distribution** — build a grid with plateau=5 Å and check max_nb. This determines whether bucketing is needed for the common case.
-2. **Investigate bucketing strategies** (Path A) — understand the nb count distribution per pose and estimate potential speedup from variable-length dispatch on GPU.
-3. **Prototype C nb kernel** (Path B) — port `nonbon8.f` logic to C with ctypes interface, benchmark against JAX kernel.
+1. **Prototype C nb kernel** (Path B) — port `nonbon8.f` logic to C with ctypes/cffi interface. Validate against JAX kernel, benchmark against legacy ATTRACT.
+2. **Adapt crocodile bucketing for minimization** (Path A) — restructure AD path to use `value_and_grad` on batch sum. Validate per-pose gradients match vmapped approach.
+3. **Remove broken bucketed mode** — delete the `nb_mode="bucketed"` path from `reproduce_grid_score.py` and `jax_scorer.py`, along with the sequential single-pose gradient fallback (`_vg_batch = None` / `for j in range(m)` loop) that only exists to work around it. The vmapped `_vg_batch` handles all cases including batch size 1.
 4. **Result validation** — compare cap40 full run output (RMSD, fnat) against legacy ATTRACT.
-5. **Correct full run** — once kernel is optimized, re-run with cap180 for correct energies.
+5. **Correct full run** — re-run 165k poses with cap180 (correct energies) using C kernel or bucketed JAX. Expected wall time: ~1 hour (C kernel). Bucketed JAX wall time is unknown — depends on the actual nb distribution during minimization (needs profiling, see below).
+6. **Measure single-conformation grid** — build a grid with plateau=5 Å, check max_nb (~20-30 expected), validate that fixed-cap JAX kernel is adequate for this case.
+7. **CUDA kernel** (Path C, long-term) — once C kernel is proven, port to CUDA with pre-sorted atoms for GPU production.
 
 ---
 
