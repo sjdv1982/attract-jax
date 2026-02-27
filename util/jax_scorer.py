@@ -67,6 +67,44 @@ def _round_up_batch(n: int) -> int:
     return ((n + 255) // 256) * 256
 
 
+def _parse_nb_bucket_thresholds(spec, max_nb: int):
+    """Parse bucket threshold config.
+
+    Accepted forms:
+    - int/str single value: interpreted as bucket step size
+    - comma-separated str: explicit thresholds
+    - list/tuple/ndarray: explicit thresholds
+    """
+    max_nb = int(max_nb)
+    if max_nb <= 0:
+        return ()
+
+    if spec is None:
+        vals = list(range(8, max_nb, 8))
+    elif isinstance(spec, (list, tuple, np.ndarray)):
+        vals = [int(v) for v in spec]
+    elif isinstance(spec, str):
+        s = spec.strip()
+        if not s:
+            vals = list(range(8, max_nb, 8))
+        elif "," in s:
+            vals = [int(x.strip()) for x in s.split(",") if x.strip()]
+        else:
+            step = int(s)
+            if step <= 0:
+                raise ValueError("nb_bucket_thresholds step must be > 0")
+            vals = list(range(step, max_nb, step))
+    else:
+        step = int(spec)
+        if step <= 0:
+            raise ValueError("nb_bucket_thresholds step must be > 0")
+        vals = list(range(step, max_nb, step))
+
+    vals = sorted({int(v) for v in vals if 1 <= int(v) < max_nb})
+    vals.append(max_nb)
+    return tuple(vals)
+
+
 class JaxScoreOracle:
     """ATTRACT-JAX grid energy oracle with finite-difference gradients.
 
@@ -92,6 +130,13 @@ class JaxScoreOracle:
         Cap max_nr_neighbours to this value (0 = no cap).
         Reduces computation for high-neighbour voxels at the cost of
         accuracy (missing some pair corrections).
+    nb_mode : {"fixed", "bucketed"}
+        Neighbour kernel mode. "fixed" evaluates a fixed K per atom
+        (K=max_nb_cap or grid max). "bucketed" groups atoms by neighbour
+        count buckets to reduce padded neighbour work.
+    nb_bucket_thresholds : str|list|tuple|int
+        Bucket thresholds for "bucketed" mode. A single integer value is
+        interpreted as step size (default: 8).
     """
 
     def __init__(
@@ -105,8 +150,11 @@ class JaxScoreOracle:
         cdie: bool = False,
         energy_batch: int = 256,
         max_nb_cap: int = 0,
+        nb_mode: str = "fixed",
+        nb_bucket_thresholds="8",
     ):
         self.energy_batch = int(max(1, energy_batch))
+        self._nb_mode = str(nb_mode)
         self._call_count = 0
         self._total_kernel_calls = 0
         self._total_kernel_time = 0.0
@@ -206,9 +254,6 @@ class JaxScoreOracle:
         dgrid["neighbour_grid_ravel"] = dgrid["neighbour_grid"].reshape(
             -1, grid.neighbour_grid.shape[-1]
         )
-        dgrid["neighbour_type_grid_ravel"] = dgrid["neighbour_type_grid"].reshape(
-            -1, grid.neighbour_type_grid.shape[-1]
-        )
         GridJax = namedtuple("GridJax", tuple(dgrid.keys()))
         grid_j = GridJax(**dgrid)
 
@@ -218,6 +263,12 @@ class JaxScoreOracle:
             nb_chunk_thresholds += (n0,)
         nb_chunk_thresholds += (int(grid.max_nr_neighbours),)
         grid_dim = tuple(int(x) for x in grid.dim)
+        max_nb_effective = int(grid.max_nr_neighbours)
+        if max_nb_cap > 0:
+            max_nb_effective = min(max_nb_effective, int(max_nb_cap))
+        bucket_thresholds = _parse_nb_bucket_thresholds(
+            nb_bucket_thresholds, max_nb_effective
+        )
 
         # --- Build JAX kernel (forward pass only, no jax.grad) ---
         n_lig_atoms = int(lig_coords.shape[0])
@@ -233,6 +284,8 @@ class JaxScoreOracle:
             cdie=bool(cdie),
             padded_nb_size=padded_nb_size,
             max_nb_cap=int(max_nb_cap),
+            nb_mode=str(nb_mode),
+            nb_bucket_thresholds=bucket_thresholds,
         )
 
         # Store per-ensemble data
@@ -291,12 +344,20 @@ class JaxScoreOracle:
                 return per_pose[0]
 
             _vg_single = jax.value_and_grad(_single_energy)
-            # vmap over (dof, rec_coor, rec_charge): each pose carries its own
-            # receptor data.  At large scale (165k poses) this avoids the
-            # per-ensemble Python dispatch overhead (np.where + scatter-back).
-            _vg_batch = jax.jit(jax.vmap(_vg_single, in_axes=(0, 0, 0)))
-            self._vg_batch = _vg_batch
+            self._vg_single = jax.jit(_vg_single)
+            if self._nb_mode == "bucketed":
+                # Bucketed neighbour mode currently uses control flow that can
+                # become very memory-heavy when vmapped in reverse mode.
+                # Keep a JIT-compiled single-pose grad path and batch in Python.
+                self._vg_batch = None
+            else:
+                # vmap over (dof, rec_coor, rec_charge): each pose carries its own
+                # receptor data.  At large scale (165k poses) this avoids the
+                # per-ensemble Python dispatch overhead (np.where + scatter-back).
+                _vg_batch = jax.jit(jax.vmap(_vg_single, in_axes=(0, 0, 0)))
+                self._vg_batch = _vg_batch
         else:
+            self._vg_single = None
             self._vg_batch = None
 
     def _vg_ensemble(self, ens0: int, dofs_j: jnp.ndarray):
@@ -437,27 +498,33 @@ class JaxScoreOracle:
         for start in range(0, n, chunk):
             end = min(start + chunk, n)
             m = end - start
-            pad_n = _round_up_batch(m)
-
             dofs_j = jnp.array(dofs[start:end], dtype=jnp.float64)
             rc_j = jnp.array(self._rec_coor_ens_np[ens0[start:end]], dtype=jnp.float64)
             rq_j = jnp.array(
                 self._rec_charge_ens_np[ens0[start:end]], dtype=jnp.float64
             )
 
-            if m < pad_n:
-                dofs_j = jnp.pad(dofs_j, ((0, pad_n - m), (0, 0)))
-                rc_j = jnp.pad(rc_j, ((0, pad_n - m), (0, 0), (0, 0)))
-                rq_j = jnp.pad(rq_j, ((0, pad_n - m), (0, 0)))
-
             t0 = time.monotonic()
-            e_b, g_b = self._vg_batch(dofs_j, rc_j, rq_j)
-            e_b.block_until_ready()
+            if self._vg_batch is not None:
+                pad_n = _round_up_batch(m)
+                if m < pad_n:
+                    dofs_j = jnp.pad(dofs_j, ((0, pad_n - m), (0, 0)))
+                    rc_j = jnp.pad(rc_j, ((0, pad_n - m), (0, 0), (0, 0)))
+                    rq_j = jnp.pad(rq_j, ((0, pad_n - m), (0, 0)))
+                e_b, g_b = self._vg_batch(dofs_j, rc_j, rq_j)
+                e_b.block_until_ready()
+                energies[start:end] = np.asarray(e_b[:m])
+                gradients[start:end] = np.asarray(g_b[:m])
+            else:
+                # Bucketed mode: sequential single-pose gradients to avoid
+                # vmapped reverse-mode memory blow-up.
+                for j in range(m):
+                    e_j, g_j = self._vg_single(dofs_j[j], rc_j[j], rq_j[j])
+                    e_j.block_until_ready()
+                    energies[start + j] = float(e_j)
+                    gradients[start + j] = np.asarray(g_j)
             self._total_kernel_time += time.monotonic() - t0
             self._total_kernel_calls += 1
-
-            energies[start:end] = np.asarray(e_b[:m])
-            gradients[start:end] = np.asarray(g_b[:m])
 
         return energies, gradients
 

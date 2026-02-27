@@ -268,7 +268,6 @@ def read_grid_with_electro(grid_data: bytes):
     )
     pos += neighbours.nbytes
     neighbour_index = np.ascontiguousarray(neighbours["index"])
-    neighbour_type = np.ascontiguousarray(neighbours["type"])
 
     innergridsize = read_long()
     if innergridsize != dx * dy * dz:
@@ -318,15 +317,12 @@ def read_grid_with_electro(grid_data: bytes):
     max_nr_neighbours = int(nr_neighbours_inner.max())
     d["max_nr_neighbours"] = max_nr_neighbours
     neighbour_grid = np.full((dx, dy, dz, max_nr_neighbours), 2**16 - 1, np.uint16)
-    neighbour_type_grid = np.zeros((dx, dy, dz, max_nr_neighbours), np.uint8)
     for n in range(max_nr_neighbours):
         maskn = nr_neighbours_inner > n
         nb_ind = neighbourlist[maskn]
         nb = nb_ind - 1 + n
         neighbour_grid[maskn, n] = neighbour_index[nb]
-        neighbour_type_grid[maskn, n] = neighbour_type[nb]
     d["neighbour_grid"] = neighbour_grid
-    d["neighbour_type_grid"] = neighbour_type_grid
 
     biggridsize = read_long()
     if biggridsize != dx2 * dy2 * dz2:
@@ -447,6 +443,8 @@ def build_kernel(
     cdie: bool,
     padded_nb_size: int = 0,
     max_nb_cap: int = 0,
+    nb_mode: str = "fixed",
+    nb_bucket_thresholds=(),
 ):
     plateaudissq = jnp.float64(grid.plateaudis**2)
     inv50sq = jnp.float64(1.0 / (50.0 * 50.0))
@@ -614,7 +612,6 @@ def build_kernel(
         ff0,
     ):
         receptor_atom = grid.neighbour_grid_ravel[ind_innergrid, offset]
-        receptor_type = grid.neighbour_type_grid_ravel[ind_innergrid, offset]
         nrec = coor_rec.shape[0]
         safe_atom = jnp.where(receptor_atom < nrec, receptor_atom, 0)
         rec_c = coor_rec[safe_atom]
@@ -624,16 +621,7 @@ def build_kernel(
         d = lig_c - rec_c
         dsq = (d * d).sum()
         charge = rec_charge_scaled0[safe_atom] * lig_charge_scaled0[lig_atom]
-        # Legacy nonbon_grid (non-rigid mode) evaluates both neighbour types:
-        # - type 1: within plateau at grid-build time
-        # - type 2: between plateau and neighbour cutoff at build time
-        # Type-2 neighbours can still move inside plateau at runtime.
-        valid = (
-            (receptor_atom < 2**16 - 1)
-            & (receptor_type > 0)
-            & (receptor_type <= 2)
-            & (dsq < plateaudissq)
-        )
+        valid = (receptor_atom < 2**16 - 1) & (dsq < plateaudissq)
         return cond(valid, pair_dif, lambda *_: 0.0, d, ff0, at1, at2, charge)
 
     nb_energy_vec = jnp.vectorize(
@@ -751,6 +739,20 @@ def build_kernel(
     max_nr_neighbours_int = int(grid.max_nr_neighbours)
     if max_nb_cap > 0:
         max_nr_neighbours_int = min(max_nr_neighbours_int, max_nb_cap)
+    if max_nr_neighbours_int < 1:
+        max_nr_neighbours_int = 1
+
+    bucket_ubs = tuple(
+        sorted(
+            {
+                int(v)
+                for v in nb_bucket_thresholds
+                if 1 <= int(v) < max_nr_neighbours_int
+            }
+        )
+    ) + (max_nr_neighbours_int,)
+    if not bucket_ubs:
+        bucket_ubs = (max_nr_neighbours_int,)
 
     if padded_nb_size > 0:
         # Precompute plateau energy lookup tables for the vectorized
@@ -771,8 +773,8 @@ def build_kernel(
         else:
             _plateau_el_per_charge = jnp.maximum(_prr2 - inv50sq, 0.0)
 
-        @jit
-        def nb_energy_vectorized(
+        @partial(jit, static_argnames=("k",))
+        def nb_energy_vectorized_k(
             ind_innergrid,
             lig_struc,
             lig_atom,
@@ -783,21 +785,18 @@ def build_kernel(
             rec_charge_scaled0,
             lig_charge_scaled0,
             ff0,
+            k,
         ):
             """Fully vectorized neighbour energy: no loop, all offsets at once.
 
             ind_innergrid : (N,) int32 — raveled inner grid index per atom
             Returns        : (N,) float64 — per-atom energies
             """
-            N = ind_innergrid.shape[0]
-            K = max_nr_neighbours_int
+            K = k
             offsets = jnp.arange(K, dtype=jnp.int32)  # (K,)
 
             # Gather neighbour data: (N, K)
             receptor_atoms = grid.neighbour_grid_ravel[
-                ind_innergrid[:, None], offsets[None, :]
-            ]
-            receptor_types = grid.neighbour_type_grid_ravel[
                 ind_innergrid[:, None], offsets[None, :]
             ]
 
@@ -805,11 +804,7 @@ def build_kernel(
             # neighbour entries; type-2 can contribute when they cross
             # inside plateau in the current pose.
             nrec = coor_rec.shape[0]
-            valid_nb = (
-                (receptor_atoms < (2**16 - 1))
-                & (receptor_types > 0)
-                & (receptor_types <= 2)
-            )
+            valid_nb = receptor_atoms < (2**16 - 1)
             safe_atoms = jnp.where(receptor_atoms < nrec, receptor_atoms, 0)
 
             # Coordinates: (N, K, 3) and (N, 1, 3)
@@ -862,6 +857,33 @@ def build_kernel(
             # Total per-pair energy, masked by validity
             e_pair = jnp.where(valid, e_lj_corr + e_el, 0.0)  # (N, K)
             return e_pair.sum(axis=1)  # (N,)
+
+        @jit
+        def nb_energy_vectorized(
+            ind_innergrid,
+            lig_struc,
+            lig_atom,
+            all_coors_lig,
+            coor_rec,
+            rec_atomtypes,
+            lig_atomtypes0,
+            rec_charge_scaled0,
+            lig_charge_scaled0,
+            ff0,
+        ):
+            return nb_energy_vectorized_k(
+                ind_innergrid,
+                lig_struc,
+                lig_atom,
+                all_coors_lig,
+                coor_rec,
+                rec_atomtypes,
+                lig_atomtypes0,
+                rec_charge_scaled0,
+                lig_charge_scaled0,
+                ff0,
+                max_nr_neighbours_int,
+            )
 
     def neighbour_energy(
         mats,
@@ -1066,24 +1088,88 @@ def build_kernel(
             flat_atom = jnp.tile(jnp.arange(A, dtype=jnp.int32), B)
             flat_is_inner = is_inner.reshape(-1).astype(jnp.float64)
 
-            # Vectorized nb energy for all atom slots
-            nb_e_flat = nb_energy_vectorized(
-                flat_ind,
-                flat_struc,
-                flat_atom,
-                all_coors_lig,
-                coor_rec,
-                rec_atomtypes,
-                lig_atomtypes0,
-                rec_charge_scaled0,
-                lig_charge_scaled0,
-                ff0,
-            )
-            nb_e_flat = nb_e_flat * flat_is_inner  # zero out non-inner atoms
+            # Neighbour energy for all atom slots.
+            if nb_mode == "bucketed":
+                nb_count_raw = jnp.take(grid0.nr_neighbours, flat_ind)
+                nb_count_raw = jnp.where(flat_is_inner > 0.5, nb_count_raw, 0)
+                nb_count = jnp.minimum(nb_count_raw, max_nr_neighbours_int).astype(
+                    jnp.int32
+                )
 
-            # Sum per structure
-            nb_e = jnp.zeros(B, dtype=jnp.float64)
-            nb_e = nb_e.at[flat_struc].add(nb_e_flat)
+                bucket_edges = jnp.array(bucket_ubs, dtype=jnp.int32)
+                # bucket_id = 0 means "no neighbours"; ids 1..nbuckets map to bucket_ubs
+                bucket_id = jnp.where(
+                    nb_count > 0,
+                    jnp.searchsorted(bucket_edges, nb_count, side="left") + 1,
+                    0,
+                ).astype(jnp.int32)
+
+                nbuckets = len(bucket_ubs)
+                counts = jnp.bincount(bucket_id, length=nbuckets + 1).astype(jnp.int32)
+                starts = jnp.cumsum(counts) - counts
+                # Use jnp.argsort here (instead of run_argsort/pure_callback)
+                # because this path is vmapped in jax_scorer and pure_callback
+                # does not support that batching mode.
+                sort_idx = jnp.argsort(bucket_id, axis=0).astype(jnp.int32)
+                chunk = NB_BUCKET_CHUNK
+                sort_idx_pad = jnp.pad(sort_idx, (0, chunk), constant_values=0)
+                max_steps = (flat_ind.shape[0] + chunk - 1) // chunk
+                max_start = sort_idx_pad.shape[0] - chunk
+
+                nb_e = jnp.zeros(B, dtype=jnp.float64)
+                for b, ub in enumerate(bucket_ubs, start=1):
+                    m = counts[b]
+                    start = starts[b]
+
+                    def body_fn(sid, acc):
+                        off = sid * chunk
+                        base = jnp.minimum(start + off, max_start)
+                        idx_chunk = jax.lax.dynamic_slice_in_dim(
+                            sort_idx_pad, base, chunk
+                        )
+                        remaining = m - off
+                        valid = (
+                            (remaining > 0)
+                            & (jnp.arange(chunk, dtype=jnp.int32) < remaining)
+                        ).astype(jnp.float64)
+                        ind_chunk = flat_ind[idx_chunk]
+                        struc_chunk = flat_struc[idx_chunk]
+                        atom_chunk = flat_atom[idx_chunk]
+                        inner_chunk = flat_is_inner[idx_chunk]
+                        e_chunk = nb_energy_vectorized_k(
+                            ind_chunk,
+                            struc_chunk,
+                            atom_chunk,
+                            all_coors_lig,
+                            coor_rec,
+                            rec_atomtypes,
+                            lig_atomtypes0,
+                            rec_charge_scaled0,
+                            lig_charge_scaled0,
+                            ff0,
+                            ub,
+                        )
+                        e_chunk = e_chunk * valid * inner_chunk
+                        acc = acc.at[struc_chunk].add(e_chunk)
+                        return acc
+
+                    nb_e = jax.lax.fori_loop(0, max_steps, body_fn, nb_e)
+            else:
+                nb_e_flat = nb_energy_vectorized(
+                    flat_ind,
+                    flat_struc,
+                    flat_atom,
+                    all_coors_lig,
+                    coor_rec,
+                    rec_atomtypes,
+                    lig_atomtypes0,
+                    rec_charge_scaled0,
+                    lig_charge_scaled0,
+                    ff0,
+                )
+                nb_e_flat = nb_e_flat * flat_is_inner  # zero out non-inner atoms
+                nb_e = jnp.zeros(B, dtype=jnp.float64)
+                nb_e = nb_e.at[flat_struc].add(nb_e_flat)
 
             energies = pot_e + nb_e
             return energies.sum(), energies
@@ -1138,6 +1224,7 @@ def summarize(name: str, ref: np.ndarray, cand: np.ndarray):
 
 
 NB_CHUNK_SIZE = 100_000
+NB_BUCKET_CHUNK = 4096
 
 
 def main():
@@ -1267,9 +1354,6 @@ def main():
     dgrid["elec_channel_index"] = np.int32(elec_channel_index)
     dgrid["neighbour_grid_ravel"] = dgrid["neighbour_grid"].reshape(
         -1, grid.neighbour_grid.shape[-1]
-    )
-    dgrid["neighbour_type_grid_ravel"] = dgrid["neighbour_type_grid"].reshape(
-        -1, grid.neighbour_type_grid.shape[-1]
     )
     GridJax = namedtuple(
         "GridJax",
