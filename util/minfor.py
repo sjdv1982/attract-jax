@@ -10,7 +10,9 @@ minfor (Harwell VA13 variable-metric method):
 - Step extrapolation up to 9x current step
 - DFP Hessian update
 
-Uses the compiled ATTRACT binary ($ATTRACTDIR) in --score mode as energy oracle.
+Primary path uses ATTRACT-JAX (optionally with fused C++ NB kernel). The
+compiled ATTRACT binary ($ATTRACTDIR) in --score mode remains available as a
+fallback oracle.
 """
 
 import argparse
@@ -18,6 +20,7 @@ import math
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -870,18 +873,23 @@ def summarize(name, ref, cand):
     )
 
 
-def resolve_attract_paths(test_dir):
+def resolve_attract_paths(test_dir, ligand_pdb=None):
     attractdir = os.environ.get("ATTRACTDIR", "")
     if not attractdir:
         raise RuntimeError("$ATTRACTDIR is not set")
     attract_bin = os.path.join(attractdir, "attract")
     attract_par = os.path.join(attractdir, "..", "attract.par")
     test_dir = os.path.abspath(test_dir)
+    ligand_pdb_path = (
+        os.path.abspath(ligand_pdb)
+        if ligand_pdb is not None
+        else os.path.join(test_dir, "ligandr.pdb")
+    )
     return {
         "attract_bin": attract_bin,
         "attract_par": attract_par,
         "receptor_pdb": os.path.join(test_dir, "partner1-ensemble", "model-1r.pdb"),
-        "ligand_pdb": os.path.join(test_dir, "ligandr.pdb"),
+        "ligand_pdb": ligand_pdb_path,
         "ens_list": os.path.join(test_dir, "partner1-ensemble.list"),
         "grid_header": os.path.join(test_dir, "receptorgrid.gridheader"),
     }
@@ -892,7 +900,11 @@ def resolve_attract_paths(test_dir):
 # ---------------------------------------------------------------------------
 def parse_args():
     ap = argparse.ArgumentParser(
-        description="Custom DFP minimizer with legacy ATTRACT --score oracle",
+        description=(
+            "Batched VA13/DFP minimizer. Primary path: ATTRACT-JAX "
+            "(default, fused NB by default). Legacy ATTRACT --score oracle "
+            "is retained as fallback."
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     ap.add_argument("input_dat", help="starting .dat file")
@@ -922,9 +934,12 @@ def parse_args():
     # --- JAX oracle options ---
     ap.add_argument(
         "--oracle",
-        default="legacy",
-        choices=["legacy", "jax"],
-        help="energy oracle: 'legacy' (ATTRACT binary) or 'jax' (ATTRACT-JAX)",
+        default="jax",
+        choices=["jax", "legacy"],
+        help=(
+            "energy oracle: 'jax' (primary production path) or "
+            "'legacy' (fallback ATTRACT binary)"
+        ),
     )
     ap.add_argument(
         "--grid", default=None, help="path to .grid file (required for --oracle jax)"
@@ -933,20 +948,46 @@ def parse_args():
     ap.add_argument(
         "--receptor-ens-list", default=None, help="path to receptor ensemble list"
     )
-    ap.add_argument("--ligand-pdb", default=None, help="path to ligand PDB")
-    ap.add_argument("--epsilon", type=float, default=15.0, help="dielectric constant")
+    ap.add_argument(
+        "--ligand-pdb",
+        default=None,
+        help=(
+            "path to ligand PDB used by both oracles "
+            "(default: {test-dir}/ligandr.pdb)"
+        ),
+    )
+    ap.add_argument(
+        "--epsilon",
+        type=float,
+        default=15.0,
+        help="JAX-only dielectric constant",
+    )
     ap.add_argument("--cdie", action="store_true", help="distance-dependent dielectric")
     ap.add_argument(
         "--energy-batch",
         type=int,
         default=256,
-        help="max poses per JAX kernel call (merged-ensemble: all ensembles in one call)",
+        help=(
+            "JAX-only: max poses per kernel call "
+            "(merged-ensemble: all ensembles in one call)"
+        ),
     )
     ap.add_argument(
         "--nb-kernel",
-        default="jax",
+        default="fused",
         choices=["jax", "fused"],
-        help="NB backend for --oracle jax: 'jax' (pure JAX) or 'fused' (C++ fused NB)",
+        help=(
+            "JAX-only NB backend: 'fused' (C++ fused NB, default) or "
+            "'jax' (pure JAX)"
+        ),
+    )
+    ap.add_argument(
+        "--autodiff-potentials",
+        action="store_true",
+        help=(
+            "JAX-only: derive potential-grid gradients via AD from energy channels "
+            "(disables stored grid-gradient usage)"
+        ),
     )
     ap.add_argument(
         "--disable-jit",
@@ -963,7 +1004,39 @@ def parse_args():
         action="store_true",
         help="print a progress line whenever a batched minimization tick completes",
     )
-    return ap.parse_args()
+    args = ap.parse_args()
+    argv = sys.argv[1:]
+
+    def _opt_used(opt_name: str) -> bool:
+        return any(tok == opt_name or tok.startswith(opt_name + "=") for tok in argv)
+
+    if args.oracle == "legacy":
+        jax_only_opts = [
+            "--grid",
+            "--attract-par-npz",
+            "--receptor-ens-list",
+            "--epsilon",
+            "--cdie",
+            "--energy-batch",
+            "--nb-kernel",
+            "--autodiff-potentials",
+            "--disable-jit",
+        ]
+        used = [opt for opt in jax_only_opts if _opt_used(opt)]
+        if used:
+            ap.error(
+                "The following options are JAX-only and cannot be used with "
+                "--oracle legacy: " + ", ".join(used)
+            )
+    else:
+        if not args.grid:
+            ap.error("--grid is required for --oracle jax")
+        if not args.attract_par_npz:
+            ap.error("--attract-par-npz is required for --oracle jax")
+        if args.energy_batch <= 0:
+            ap.error("--energy-batch must be >= 1")
+
+    return args
 
 
 def main():
@@ -1000,10 +1073,10 @@ def main():
         print(f"Ensemble ids: {np.unique(ens)}, centered_ligands: {centered_ligands}")
 
     # --- Resolve ligand pivot ---
+    ligand_pdb_path = args.ligand_pdb or os.path.join(test_dir, "ligandr.pdb")
     if 2 in pivots:
         lig_pivot = pivots[2]
     else:
-        ligand_pdb_path = args.ligand_pdb or os.path.join(test_dir, "ligandr.pdb")
         coor = []
         with open(ligand_pdb_path) as f:
             for line in f:
@@ -1034,13 +1107,8 @@ def main():
         ens_list_path = args.receptor_ens_list or os.path.join(
             test_dir, "partner1-ensemble.list"
         )
-        ligand_pdb_path = args.ligand_pdb or os.path.join(test_dir, "ligandr.pdb")
         grid_path = args.grid
         par_npz = args.attract_par_npz
-        if not grid_path:
-            raise ValueError("--grid is required for --oracle jax")
-        if not par_npz:
-            raise ValueError("--attract-par-npz is required for --oracle jax")
         oracle = JaxScoreOracle(
             receptor_ens_list=ens_list_path,
             ligand_pdb=ligand_pdb_path,
@@ -1051,14 +1119,16 @@ def main():
             cdie=bool(args.cdie),
             energy_batch=args.energy_batch,
             nb_kernel=args.nb_kernel,
+            autodiff_potentials=bool(args.autodiff_potentials),
         )
         if verbose:
             print(
                 "JAX oracle initialized "
-                f"(energy_batch={args.energy_batch}, nb_kernel={args.nb_kernel})"
+                f"(energy_batch={args.energy_batch}, nb_kernel={args.nb_kernel}, "
+                f"autodiff_potentials={bool(args.autodiff_potentials)})"
             )
     else:
-        paths = resolve_attract_paths(test_dir)
+        paths = resolve_attract_paths(test_dir, ligand_pdb=ligand_pdb_path)
         import tempfile as _tempfile
 
         tmpdir_ctx = _tempfile.TemporaryDirectory()

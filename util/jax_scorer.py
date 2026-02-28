@@ -156,6 +156,7 @@ class JaxScoreOracle:
         cdie: bool = False,
         energy_batch: int = 256,
         nb_kernel: str = "jax",
+        autodiff_potentials: bool = False,
     ):
         self.energy_batch = int(max(1, energy_batch))
         self._call_count = 0
@@ -239,7 +240,9 @@ class JaxScoreOracle:
         self._nb_kernel = str(nb_kernel)
         if self._nb_kernel not in ("jax", "fused"):
             raise ValueError(f"Unsupported nb_kernel={self._nb_kernel!r}")
-        self._use_precomputed_grid_gradients = self._nb_kernel != "fused"
+        # Default behavior: use stored grid gradients via custom JVP.
+        # Optional behavior: AD through energy-only potentials.
+        self._use_precomputed_grid_gradients = not bool(autodiff_potentials)
 
         # Combine potential + electrostatic grids.
         # For fused NB mode we only keep energy channels; JAX AD handles grid gradients.
