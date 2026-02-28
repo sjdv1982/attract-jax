@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimizer benchmark: custom DFP/BFGS with legacy ATTRACT --score as oracle.
+"""Minimizer benchmark: batched VA13 minimizer with ATTRACT-style oracles.
 
 Implements a quasi-Newton minimizer matching the key parameters of legacy
 minfor (Harwell VA13 variable-metric method):
@@ -8,7 +8,7 @@ minfor (Harwell VA13 variable-metric method):
 - Curvature condition threshold = 0.7
 - Cubic interpolation backtracking
 - Step extrapolation up to 9x current step
-- DFP (or BFGS) Hessian update
+- DFP Hessian update
 
 Uses the compiled ATTRACT binary ($ATTRACTDIR) in --score mode as energy oracle.
 """
@@ -443,238 +443,6 @@ def init_hpack_diag(n=6, diag_value=0.01):
         h[k] = diag_value
         k += n - i
     return h
-
-
-# ---------------------------------------------------------------------------
-# Custom minimizer — faithful VA13 reimplementation
-# ---------------------------------------------------------------------------
-def minfor_minimize(
-    oracle,
-    ens_id,
-    x0,
-    maxfun=150,
-    init_metric=0.01,
-    acc=1e-9,
-):
-    """Minimize a single pose using VA13 variable-metric method.
-
-    This is a faithful reimplementation of the Harwell VA13 algorithm used
-    by legacy ATTRACT's minfor, using the same packed LDL^T Hessian
-    representation and identical line search logic.
-
-    The outer loop has two entry points matching the Fortran labels:
-      - Label 110: reset xaa/fa/ga from the global best (first call +
-        after failed line search with isfv >= 2).
-      - Label 135: compute next search direction from the *current* xaa/fa/ga
-        (after a successful Hessian update — does NOT reset to global best).
-
-    Parameters
-    ----------
-    oracle : LegacyScoreOracle
-    ens_id : int
-    x0 : ndarray (6,)
-    maxfun : int
-    init_metric : float
-        Initial diagonal Hessian (minfor default: 0.01)
-    acc : float
-        Convergence tolerance (minfor default: 1e-9)
-
-    Returns
-    -------
-    x_best, f_best, nfev
-    """
-    n = len(x0)
-
-    # Packed Hessian B (LDL^T factorization)
-    hpack = init_hpack_diag(n, init_metric)
-    w = np.zeros(n, dtype=np.float64)
-    ir = n  # rank indicator (starts full rank)
-
-    # Current best point
-    x = x0.copy()
-    gesa, g = oracle.score_single(ens_id, x)
-    nfev = 1
-    f_best = gesa
-    x_best = x.copy()
-    g_best = g.copy()
-
-    dff = 0.0
-    # State variables that persist across outer iterations:
-    xaa = x.copy()
-    fa = gesa
-    ga = g.copy()
-    isfv = 1
-    entry_label = 110  # first entry is always label 110
-
-    while nfev < maxfun:
-        if entry_label == 110:
-            # --- Label 110: reset base to global best ---
-            xaa = x.copy()
-            fa = gesa
-            isfv = 1
-            ga = g.copy()
-        # else entry_label == 135: keep current xaa/fa/ga from Hessian update
-
-        # --- Label 135: compute search direction ---
-        d_in = -ga
-        d, w = mc11e_packed(hpack, d_in, w, ir, n)
-
-        cmax = float(np.max(np.abs(d)))
-        dga = float(np.dot(ga, d))
-
-        if cmax <= 0.0 or dga >= 0.0:
-            # Fortran: go to 240 → isfv is 1 after label 110, so terminate
-            break
-
-        stmin = 0.0
-        stepbd = 0.0
-        steplb = acc / cmax
-        fmin = fa
-        gmin = dga
-
-        step = 1.0
-        if dff <= 0.0:
-            step = min(step, 1.0 / cmax)
-        else:
-            step = min(step, 2.0 * dff / (-dga))
-
-        # --- Line search ---
-        entry_label = 0  # will be set before next outer iteration
-        while nfev < maxfun:
-            nfev += 1
-            c = stmin + step
-            xbb = xaa + c * d
-            fb, gb = oracle.score_single(ens_id, xbb)
-
-            # Track global best (isfv logic)
-            isfv = min(2, isfv)
-            if fb <= gesa:
-                better = fb < gesa
-                if not better:
-                    gl1 = float(np.dot(g, g))
-                    gl2 = float(np.dot(gb, gb))
-                    better = gl2 < gl1
-                if better:
-                    isfv = 3
-                    gesa = fb
-                    x = xbb.copy()
-                    g = gb.copy()
-                    if fb < f_best:
-                        f_best = fb
-                        x_best = xbb.copy()
-                        g_best = gb.copy()
-
-            dgb = float(np.dot(gb, d))
-
-            # Armijo sufficient decrease test
-            if fb - fa <= 0.1 * c * dga:
-                # --- Extrapolation ---
-                stepbd -= step
-                stmin = c
-                fmin = fb
-                gmin = dgb
-
-                step = 9.0 * stmin
-                if stepbd > 0.0:
-                    step = 0.5 * stepbd
-
-                ctmp = dga + 3.0 * dgb - 4.0 * (fb - fa) / stmin
-                if ctmp > 0.0:
-                    step = min(step, stmin * max(1.0, -dgb / ctmp))
-
-                if dgb < 0.7 * dga:
-                    # Curvature not satisfied — continue line search
-                    if stmin + step <= steplb:
-                        # Step too small; Fortran: go to 240
-                        if isfv >= 2:
-                            entry_label = 110  # restart from global best
-                        break
-                    continue
-
-                # Curvature satisfied
-                isfv = 4 - isfv
-                if stmin + step <= steplb:
-                    # Fortran: go to 240
-                    if isfv >= 2:
-                        entry_label = 110
-                    break
-
-                # VA13 two-step mc11a Hessian update
-                ga_old = ga.copy()
-                y = gb - ga
-
-                denom1 = dga
-                denom2 = stmin * (dgb - dga)
-                if abs(denom1) < 1e-16 or abs(denom2) < 1e-16:
-                    break
-
-                h1, _, w1, ir1 = mc11a_packed(
-                    hpack,
-                    ga_old,
-                    1.0 / denom1,
-                    w,
-                    -n,
-                    1,
-                    0.0,
-                    n=n,
-                )
-                h2, _, _, ir2 = mc11a_packed(
-                    h1,
-                    y,
-                    1.0 / denom2,
-                    y.copy(),
-                    -ir1,
-                    0,
-                    0.0,
-                    n=n,
-                    alias_zw=True,
-                )
-                if ir2 < n:
-                    break  # rank deficient — abort
-
-                hpack = h2
-                w = w1
-                ir = ir2
-
-                # Update base point to accepted step (Fortran label 280)
-                dff = fa - fb
-                fa = fb
-                xaa = xbb.copy()
-                ga = gb.copy()
-                entry_label = 135  # → label 135: next direction, NO reset
-                break
-
-            else:
-                # --- Backtracking ---
-                if step > steplb:
-                    stepbd = step
-                    ctmp = gmin + dgb - 3.0 * (fb - fmin) / step
-                    disc = ctmp * ctmp - gmin * dgb
-                    if disc < 0.0:
-                        disc = 0.0
-                    denom = ctmp + gmin - math.sqrt(disc)
-                    if abs(denom) < 1e-16:
-                        fac = 0.1
-                    else:
-                        fac = max(0.1, gmin / denom)
-                    step = step * fac
-                    continue
-                else:
-                    # Step too small; Fortran: go to 240
-                    if isfv >= 2:
-                        entry_label = 110
-                    break
-
-        if entry_label == 135:
-            # Successful Hessian update → continue to next direction
-            continue
-        if entry_label == 110:
-            # Failed line search but had improvement → restart from best
-            continue
-        # entry_label == 0: no progress, terminate
-        break
-
-    return x_best, f_best, nfev
 
 
 # ---------------------------------------------------------------------------
@@ -1151,12 +919,6 @@ def parse_args():
         default=0.01,
         help="initial diagonal Hessian (minfor default: 0.01)",
     )
-    ap.add_argument(
-        "--method",
-        default="dfp-batch",
-        choices=["dfp", "dfp-batch", "scipy-lbfgsb", "scipy-bfgs", "scipy-cg"],
-        help="minimizer method (dfp-batch is batched, much faster)",
-    )
     # --- JAX oracle options ---
     ap.add_argument(
         "--oracle",
@@ -1232,7 +994,7 @@ def main():
     n = len(dofs0)
     if verbose:
         print(
-            f"Poses: {n} (offset={args.pose_offset}), Method: {args.method}, "
+            f"Poses: {n} (offset={args.pose_offset}), "
             f"maxfun: {args.maxfun}, oracle: {args.oracle}"
         )
         print(f"Ensemble ids: {np.unique(ens)}, centered_ligands: {centered_ligands}")
@@ -1329,76 +1091,19 @@ def main():
         # Minimize
         t1 = time.time()
 
-        if args.method == "dfp-batch":
-            # --- Batched minimization (one oracle call per tick) ---
-            traj_prefix = f"{args.out_prefix}.traj" if args.traj else None
-            dofs_out, energies_out, nfev_out = minfor_minimize_batched(
-                oracle,
-                ens,
-                dofs0,
-                maxfun=args.maxfun,
-                init_metric=args.init_metric,
-                trace_every=args.trace_every,
-                traj_prefix=traj_prefix,
-                traj_header=header,
-                report_step_complete=bool(args.report_step_complete),
-            )
-        else:
-            # --- Per-pose minimization ---
-            dofs_out = np.zeros_like(dofs0)
-            energies_out = np.full(n, np.nan, dtype=np.float64)
-            nfev_out = np.zeros(n, dtype=np.int32)
-
-            for i in range(n):
-                ens_id = int(ens[i])
-
-                if args.method == "dfp":
-                    x_best, f_best, nfev = minfor_minimize(
-                        oracle,
-                        ens_id,
-                        dofs0[i],
-                        maxfun=args.maxfun,
-                        init_metric=args.init_metric,
-                    )
-                elif args.method.startswith("scipy-"):
-                    scipy_method = args.method.replace("scipy-", "").upper()
-                    if scipy_method == "LBFGSB":
-                        scipy_method = "L-BFGS-B"
-
-                    def _fg(x, _eid=ens_id):
-                        e, g = oracle.score_single(_eid, x)
-                        return e, g.astype(np.float64)
-
-                    from scipy.optimize import minimize as scipy_minimize
-
-                    res = scipy_minimize(
-                        _fg,
-                        dofs0[i],
-                        method=scipy_method,
-                        jac=True,
-                        options={
-                            "maxfun": args.maxfun,
-                            "maxiter": args.maxfun,
-                            "ftol": 1e-15,
-                            "gtol": 1e-10,
-                        },
-                    )
-                    x_best, f_best, nfev = res.x, res.fun, res.nfev
-                else:
-                    raise ValueError(f"Unknown method: {args.method}")
-
-                dofs_out[i] = x_best
-                energies_out[i] = f_best
-                nfev_out[i] = nfev
-
-                if args.trace_every and (i + 1) % args.trace_every == 0:
-                    elapsed = time.time() - t1
-                    rate = (i + 1) / elapsed
-                    print(
-                        f"  [{i + 1}/{n}] nfev={nfev} energy={f_best:.4f} "
-                        f"(start={start_e[i]:.4f} delta={start_e[i]-f_best:.4f}) "
-                        f"({elapsed:.1f}s, {rate:.2f} poses/s)"
-                    )
+        # --- Batched minimization (one oracle call per tick) ---
+        traj_prefix = f"{args.out_prefix}.traj" if args.traj else None
+        dofs_out, energies_out, nfev_out = minfor_minimize_batched(
+            oracle,
+            ens,
+            dofs0,
+            maxfun=args.maxfun,
+            init_metric=args.init_metric,
+            trace_every=args.trace_every,
+            traj_prefix=traj_prefix,
+            traj_header=header,
+            report_step_complete=bool(args.report_step_complete),
+        )
 
         t2 = time.time()
     finally:

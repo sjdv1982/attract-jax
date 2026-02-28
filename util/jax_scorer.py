@@ -236,13 +236,22 @@ class JaxScoreOracle:
             [alpos.index(a) for a in lig_alphabet], dtype=np.int32
         )[lig_atomtypes_ff]
 
-        # Combine potential + electrostatic grids
+        self._nb_kernel = str(nb_kernel)
+        if self._nb_kernel not in ("jax", "fused"):
+            raise ValueError(f"Unsupported nb_kernel={self._nb_kernel!r}")
+        self._use_precomputed_grid_gradients = self._nb_kernel != "fused"
+
+        # Combine potential + electrostatic grids.
+        # For fused NB mode we only keep energy channels; JAX AD handles grid gradients.
         inner_all = np.concatenate(
             (grid.inner_potential_grid, grid.inner_elec_grid[None, ...]), axis=0
         )
         outer_all = np.concatenate(
             (grid.outer_potential_grid, grid.outer_elec_grid[None, ...]), axis=0
         )
+        if not self._use_precomputed_grid_gradients:
+            inner_all = inner_all[..., :1]
+            outer_all = outer_all[..., :1]
         elec_channel_index = inner_all.shape[0] - 1
 
         dgrid = {}
@@ -285,6 +294,7 @@ class JaxScoreOracle:
             lig_charge_scaled=jnp.array(lig_charge_scaled, dtype=np.float64),
             cdie=bool(cdie),
             padded_nb_size=padded_nb_size,
+            use_precomputed_grid_gradients=self._use_precomputed_grid_gradients,
         )
 
         # Store per-ensemble data
@@ -319,10 +329,6 @@ class JaxScoreOracle:
         self._n_lig_atoms = n_lig_atoms
         self._nens = int(rec_coords_ens.shape[0])
         self._nrec = int(rec_coords_ens.shape[1])
-        self._nb_kernel = str(nb_kernel)
-        if self._nb_kernel not in ("jax", "fused"):
-            raise ValueError(f"Unsupported nb_kernel={self._nb_kernel!r}")
-
         # --- Build value_and_grad function for analytical gradients ---
         # Uses main_ad (fully JIT-compilable, no Python control flow).
         kernel_ad = kernel_main.ad
