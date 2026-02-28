@@ -449,6 +449,13 @@ def build_kernel(
     plateaudissq = jnp.float64(grid.plateaudis**2)
     inv50sq = jnp.float64(1.0 / (50.0 * 50.0))
     inv50 = jnp.float64(1.0 / 50.0)
+    lig_charge_raw_np = np.asarray(lig_charge_raw, dtype=np.float64)
+    charged_idx_np = np.nonzero(np.abs(lig_charge_raw_np) > 1.0e-3)[0].astype(np.int32)
+    n_charged = int(charged_idx_np.shape[0])
+    charged_idx_j = jnp.array(charged_idx_np, dtype=np.int32)
+    charged_elec_channel_idx_j = jnp.full(
+        (n_charged,), np.int32(grid.elec_channel_index), dtype=np.int32
+    )
 
     grad_nonbon = jax.grad(nonbon)
     grad_elec = jax.grad(elec_dsq_cdie if cdie else elec_dsq_const)
@@ -569,10 +576,18 @@ def build_kernel(
         all_coors_lig, lig_vdw_channel_idx0, lig_charge_raw0, grid0
     ):
         vdw_eg = potential_atom_energrads(all_coors_lig, lig_vdw_channel_idx0, grid0)
-        elec_channel_idx = jnp.full_like(lig_vdw_channel_idx0, grid0.elec_channel_index)
-        elec_eg = potential_atom_energrads(all_coors_lig, elec_channel_idx, grid0)
-        qraw = jnp.where(jnp.abs(lig_charge_raw0) > 1.0e-3, lig_charge_raw0, 0.0)
-        return vdw_eg[:, :, 0] + qraw[None, :] * elec_eg[:, :, 0]
+        ans = vdw_eg[:, :, 0]
+        if n_charged > 0:
+            # Evaluate electrostatic interpolation only for charged ligand atoms.
+            all_coors_ch = all_coors_lig[:, charged_idx_j, :]
+            elec_eg_ch = potential_atom_energrads(
+                all_coors_ch, charged_elec_channel_idx_j, grid0
+            )
+            qraw_ch = lig_charge_raw0[charged_idx_j]
+            e_el = jnp.zeros_like(ans)
+            e_el = e_el.at[:, charged_idx_j].set(qraw_ch[None, :] * elec_eg_ch[:, :, 0])
+            ans = ans + e_el
+        return ans
 
     potential_atom_energies = jax.custom_jvp(potential_atom_energies)
 
@@ -581,11 +596,23 @@ def build_kernel(
     def potential_atom_energies_jvp(primals, tangents):
         all_coors_lig, lig_vdw_channel_idx0, lig_charge_raw0, grid0 = primals
         vdw_eg = potential_atom_energrads(all_coors_lig, lig_vdw_channel_idx0, grid0)
-        elec_channel_idx = jnp.full_like(lig_vdw_channel_idx0, grid0.elec_channel_index)
-        elec_eg = potential_atom_energrads(all_coors_lig, elec_channel_idx, grid0)
-        qraw = jnp.where(jnp.abs(lig_charge_raw0) > 1.0e-3, lig_charge_raw0, 0.0)
-        ans = vdw_eg[:, :, 0] + qraw[None, :] * elec_eg[:, :, 0]
-        atom_grad = -(vdw_eg[:, :, 1:4] + qraw[None, :, None] * elec_eg[:, :, 1:4])
+        ans = vdw_eg[:, :, 0]
+        atom_grad = -vdw_eg[:, :, 1:4]
+        if n_charged > 0:
+            all_coors_ch = all_coors_lig[:, charged_idx_j, :]
+            elec_eg_ch = potential_atom_energrads(
+                all_coors_ch, charged_elec_channel_idx_j, grid0
+            )
+            qraw_ch = lig_charge_raw0[charged_idx_j]
+            e_el = jnp.zeros_like(ans)
+            e_el = e_el.at[:, charged_idx_j].set(qraw_ch[None, :] * elec_eg_ch[:, :, 0])
+            ans = ans + e_el
+
+            g_el = jnp.zeros_like(atom_grad)
+            g_el = g_el.at[:, charged_idx_j, :].set(
+                qraw_ch[None, :, None] * elec_eg_ch[:, :, 1:4]
+            )
+            atom_grad = atom_grad - g_el
         tangent = (atom_grad * tangents[0]).sum(axis=2)
         return ans, tangent
 
