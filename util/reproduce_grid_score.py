@@ -1028,6 +1028,30 @@ def build_kernel(
         energies = pot_energies + nb_energies
         return energies.sum(), energies
 
+    @jit
+    def potential_ad(
+        dofs,
+        coor_rec,
+        rec_atomtypes,
+        rec_charge_scaled0,
+        coor_lig0,
+        lig_atomtypes0,
+        lig_vdw_channel_idx0,
+        lig_charge_raw0,
+        lig_charge_scaled0,
+        ff0,
+        grid0,
+        lig_pivot0,
+    ):
+        # Signature mirrors main_ad for easy reuse in jax_scorer.
+        del coor_rec, rec_atomtypes, rec_charge_scaled0, lig_atomtypes0, lig_charge_scaled0, ff0
+        mats = dofs_to_mats(dofs, lig_pivot0)
+        all_coors_lig = transform_ligand(mats, coor_lig0)
+        pot_e = potential_atom_energies(
+            all_coors_lig, lig_vdw_channel_idx0, lig_charge_raw0, grid0
+        ).sum(axis=1)
+        return pot_e.sum(), pot_e
+
     if padded_nb_size > 0:
         # Fully JIT-able energy function for use with jax.value_and_grad.
         # Unlike `main` (which uses Python control flow in neighbour_energy),
@@ -1178,6 +1202,7 @@ def build_kernel(
     else:
         main.ad = None
 
+    main.pot_ad = potential_ad
     return main
 
 

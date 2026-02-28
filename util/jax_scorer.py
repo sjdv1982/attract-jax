@@ -248,12 +248,17 @@ class JaxScoreOracle:
             if isinstance(value, np.ndarray) and value.shape != (3,):
                 value = jnp.array(value, dtype=value.dtype)
             dgrid[field] = value
+        # Handle zero-neighbour grids by inserting a 1-wide sentinel dimension.
+        # This keeps reshape/indexing code valid while nr_neighbours==0 ensures
+        # the NB contribution remains exactly zero.
+        if int(grid.neighbour_grid.shape[-1]) == 0:
+            ng_shape = tuple(int(x) for x in grid.neighbour_grid.shape[:3]) + (1,)
+            dgrid["neighbour_grid"] = jnp.full(ng_shape, 2**16 - 1, dtype=jnp.uint16)
         dgrid["inner_potential_grid_all"] = jnp.array(inner_all, dtype=np.float32)
         dgrid["outer_potential_grid_all"] = jnp.array(outer_all, dtype=np.float32)
         dgrid["elec_channel_index"] = np.int32(elec_channel_index)
-        dgrid["neighbour_grid_ravel"] = dgrid["neighbour_grid"].reshape(
-            -1, grid.neighbour_grid.shape[-1]
-        )
+        ng_width = int(dgrid["neighbour_grid"].shape[-1])
+        dgrid["neighbour_grid_ravel"] = dgrid["neighbour_grid"].reshape(-1, ng_width)
         GridJax = namedtuple("GridJax", tuple(dgrid.keys()))
         grid_j = GridJax(**dgrid)
 
@@ -322,6 +327,7 @@ class JaxScoreOracle:
         # --- Build value_and_grad function for analytical gradients ---
         # Uses main_ad (fully JIT-compilable, no Python control flow).
         kernel_ad = kernel_main.ad
+        kernel_pot_ad = kernel_main.pot_ad
         if kernel_ad is not None:
 
             def _single_energy(dof_1d, rec_coor, rec_charge_scaled):
@@ -345,20 +351,46 @@ class JaxScoreOracle:
 
             _vg_single = jax.value_and_grad(_single_energy)
             self._vg_single = jax.jit(_vg_single)
+
+            def _single_potential_energy(dof_1d, rec_coor, rec_charge_scaled):
+                dof_2d = dof_1d[None, :]
+                _, per_pose = kernel_pot_ad(
+                    dof_2d,
+                    rec_coor,
+                    self._rec_atomtypes_ff_j,
+                    rec_charge_scaled,
+                    self._coor_lig_j,
+                    self._lig_atomtypes_ff_j,
+                    self._lig_vdw_channel_idx_j,
+                    self._lig_charge_raw_j,
+                    self._lig_charge_scaled_j,
+                    self._ff,
+                    self._grid_j,
+                    self._lig_pivot_j,
+                )
+                return per_pose[0]
+
+            _pot_vg_single = jax.value_and_grad(_single_potential_energy)
+            self._pot_vg_single = jax.jit(_pot_vg_single)
             if self._nb_mode == "bucketed":
                 # Bucketed neighbour mode currently uses control flow that can
                 # become very memory-heavy when vmapped in reverse mode.
                 # Keep a JIT-compiled single-pose grad path and batch in Python.
                 self._vg_batch = None
+                self._pot_vg_batch = None
             else:
                 # vmap over (dof, rec_coor, rec_charge): each pose carries its own
                 # receptor data.  At large scale (165k poses) this avoids the
                 # per-ensemble Python dispatch overhead (np.where + scatter-back).
                 _vg_batch = jax.jit(jax.vmap(_vg_single, in_axes=(0, 0, 0)))
                 self._vg_batch = _vg_batch
+                _pot_vg_batch = jax.jit(jax.vmap(_pot_vg_single, in_axes=(0, 0, 0)))
+                self._pot_vg_batch = _pot_vg_batch
         else:
             self._vg_single = None
             self._vg_batch = None
+            self._pot_vg_single = None
+            self._pot_vg_batch = None
 
     def _vg_ensemble(self, ens0: int, dofs_j: jnp.ndarray):
         """Compute per-pose energies AND gradients for one ensemble.
@@ -525,6 +557,41 @@ class JaxScoreOracle:
                     gradients[start + j] = np.asarray(g_j)
             self._total_kernel_time += time.monotonic() - t0
             self._total_kernel_calls += 1
+
+        return energies, gradients
+
+    def score_potential_batch(self, ens, dofs):
+        """Score potential-grid contribution only (no NB correction)."""
+        n = len(dofs)
+        ens0 = np.asarray(ens, dtype=np.intp) - 1
+        energies = np.zeros(n, dtype=np.float64)
+        gradients = np.zeros((n, 6), dtype=np.float64)
+
+        chunk = self.energy_batch
+        for start in range(0, n, chunk):
+            end = min(start + chunk, n)
+            m = end - start
+            dofs_j = jnp.array(dofs[start:end], dtype=jnp.float64)
+            rc_j = jnp.array(self._rec_coor_ens_np[ens0[start:end]], dtype=jnp.float64)
+            rq_j = jnp.array(
+                self._rec_charge_ens_np[ens0[start:end]], dtype=jnp.float64
+            )
+            if self._pot_vg_batch is not None:
+                pad_n = _round_up_batch(m)
+                if m < pad_n:
+                    dofs_j = jnp.pad(dofs_j, ((0, pad_n - m), (0, 0)))
+                    rc_j = jnp.pad(rc_j, ((0, pad_n - m), (0, 0), (0, 0)))
+                    rq_j = jnp.pad(rq_j, ((0, pad_n - m), (0, 0)))
+                e_b, g_b = self._pot_vg_batch(dofs_j, rc_j, rq_j)
+                e_b.block_until_ready()
+                energies[start:end] = np.asarray(e_b[:m])
+                gradients[start:end] = np.asarray(g_b[:m])
+            else:
+                for j in range(m):
+                    e_j, g_j = self._pot_vg_single(dofs_j[j], rc_j[j], rq_j[j])
+                    e_j.block_until_ready()
+                    energies[start + j] = float(e_j)
+                    gradients[start + j] = np.asarray(g_j)
 
         return energies, gradients
 

@@ -160,6 +160,21 @@ def parse_score_output(text):
     return e, g
 
 
+def print_legacy_score(energies, gradients):
+    """Print score blocks compatible with legacy ATTRACT --score output.
+
+    gradients are expected as +dE/dx; legacy prints forces (-dE/dx).
+    """
+    for e, g in zip(np.asarray(energies), np.asarray(gradients)):
+        f = -np.asarray(g, dtype=np.float64)
+        print(f" Energy: {float(e): .16f}     ")
+        print(
+            f"{float(e):12.3f}{0.0:12.3f}{0.0:12.3f}"
+            f"{0.0:12.3f}{0.0:12.3f}{0.0:12.3f}"
+        )
+        print(" Gradients:" + "".join(f"{float(v):24.16E}" for v in f))
+
+
 # ---------------------------------------------------------------------------
 # Legacy ATTRACT --score oracle
 # ---------------------------------------------------------------------------
@@ -1104,7 +1119,12 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     ap.add_argument("input_dat", help="starting .dat file")
-    ap.add_argument("--out-prefix", required=True)
+    ap.add_argument("--out-prefix", default=None)
+    ap.add_argument(
+        "--score",
+        action="store_true",
+        help="score-only mode: print legacy-style energy/gradient blocks",
+    )
     ap.add_argument("--maxfun", type=int, default=150)
     ap.add_argument("--max-poses", type=int, default=0, help="0 = all")
     ap.add_argument(
@@ -1188,12 +1208,16 @@ def parse_args():
 def main():
     args = parse_args()
     t0 = time.time()
+    verbose = not args.score
+    if not args.score and not args.out_prefix:
+        raise ValueError("--out-prefix is required unless --score is used")
 
     if args.disable_jit and args.oracle == "jax":
         import jax
 
         jax.config.update("jax_disable_jit", True)
-        print("JAX JIT disabled (--disable-jit)")
+        if verbose:
+            print("JAX JIT disabled (--disable-jit)")
 
     test_dir = args.test_dir or str(Path(args.input_dat).resolve().parent)
 
@@ -1207,11 +1231,12 @@ def main():
         ens = ens[args.pose_offset :]
         dofs0 = dofs0[args.pose_offset :]
     n = len(dofs0)
-    print(
-        f"Poses: {n} (offset={args.pose_offset}), Method: {args.method}, "
-        f"maxfun: {args.maxfun}, oracle: {args.oracle}"
-    )
-    print(f"Ensemble ids: {np.unique(ens)}, centered_ligands: {centered_ligands}")
+    if verbose:
+        print(
+            f"Poses: {n} (offset={args.pose_offset}), Method: {args.method}, "
+            f"maxfun: {args.maxfun}, oracle: {args.oracle}"
+        )
+        print(f"Ensemble ids: {np.unique(ens)}, centered_ligands: {centered_ligands}")
 
     # --- Resolve ligand pivot ---
     if 2 in pivots:
@@ -1226,7 +1251,8 @@ def main():
                         (float(line[30:38]), float(line[38:46]), float(line[46:54]))
                     )
         lig_pivot = np.mean(coor, axis=0)
-    print(f"Ligand pivot: {lig_pivot}")
+    if verbose:
+        print(f"Ligand pivot: {lig_pivot}")
 
     # --- Convert centered → non-centered for JAX oracle only ---
     input_centered = bool(centered_ligands) if centered_ligands is not None else False
@@ -1234,9 +1260,10 @@ def main():
     if converted_for_oracle:
         dofs0 = dofs0.copy()
         dofs0[:, 3:6] -= lig_pivot[None, :]
-        print(
-            "Converted centered-ligand translations to non-centered (tx/ty/tz -= pivot)"
-        )
+        if verbose:
+            print(
+                "Converted centered-ligand translations to non-centered (tx/ty/tz -= pivot)"
+            )
 
     # --- Build oracle ---
     tmpdir_ctx = None
@@ -1266,11 +1293,12 @@ def main():
             nb_mode=args.nb_mode,
             nb_bucket_thresholds=args.nb_bucket_thresholds,
         )
-        print(
-            "JAX oracle initialized "
-            f"(energy_batch={args.energy_batch}, max_nb_cap={args.max_nb_cap}, "
-            f"nb_mode={args.nb_mode}, nb_bucket_thresholds={args.nb_bucket_thresholds})"
-        )
+        if verbose:
+            print(
+                "JAX oracle initialized "
+                f"(energy_batch={args.energy_batch}, max_nb_cap={args.max_nb_cap}, "
+                f"nb_mode={args.nb_mode}, nb_bucket_thresholds={args.nb_bucket_thresholds})"
+            )
     else:
         paths = resolve_attract_paths(test_dir)
         import tempfile as _tempfile
@@ -1291,8 +1319,12 @@ def main():
 
     try:
         # Score starting poses
-        print("Scoring starting poses...")
+        if verbose:
+            print("Scoring starting poses...")
         start_e, start_g = oracle.score_batch(ens, dofs0)
+        if args.score:
+            print_legacy_score(start_e, start_g)
+            return
         print(
             f"  Starting energies: min={start_e.min():.3f} mean={start_e.mean():.3f} "
             f"max={start_e.max():.3f}"
