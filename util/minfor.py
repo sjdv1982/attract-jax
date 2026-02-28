@@ -690,6 +690,7 @@ def minfor_minimize_batched(
     trace_every=0,
     traj_prefix=None,
     traj_header=None,
+    report_step_complete=False,
 ):
     """Batch-minimize all poses using VA13 with batched oracle calls.
 
@@ -1033,6 +1034,14 @@ def minfor_minimize_batched(
 
         _cum_python += time.time() - _t1
 
+        if report_step_complete:
+            n_active = int(active.sum())
+            elapsed = time.time() - t_batch
+            print(
+                f"  completed tick {tick}: {n_active}/{N} active "
+                f"(elapsed {elapsed:.1f}s)"
+            )
+
         # --- Trace ---
         if trace_every and tick % trace_every == 0:
             n_active = int(active.sum())
@@ -1172,6 +1181,12 @@ def parse_args():
         help="max poses per JAX kernel call (merged-ensemble: all ensembles in one call)",
     )
     ap.add_argument(
+        "--nb-kernel",
+        default="jax",
+        choices=["jax", "fused"],
+        help="NB backend for --oracle jax: 'jax' (pure JAX) or 'fused' (C++ fused NB)",
+    )
+    ap.add_argument(
         "--disable-jit",
         action="store_true",
         help="disable JAX JIT compilation (slower per-eval but no compilation time)",
@@ -1180,6 +1195,11 @@ def parse_args():
         "--traj",
         action="store_true",
         help="write trajectory .dat files (one per tick: {out-prefix}.traj.NNNN.dat)",
+    )
+    ap.add_argument(
+        "--report-step-complete",
+        action="store_true",
+        help="print a progress line whenever a batched minimization tick completes",
     )
     return ap.parse_args()
 
@@ -1268,11 +1288,12 @@ def main():
             epsilon=args.epsilon,
             cdie=bool(args.cdie),
             energy_batch=args.energy_batch,
+            nb_kernel=args.nb_kernel,
         )
         if verbose:
             print(
                 "JAX oracle initialized "
-                f"(energy_batch={args.energy_batch})"
+                f"(energy_batch={args.energy_batch}, nb_kernel={args.nb_kernel})"
             )
     else:
         paths = resolve_attract_paths(test_dir)
@@ -1320,6 +1341,7 @@ def main():
                 trace_every=args.trace_every,
                 traj_prefix=traj_prefix,
                 traj_header=header,
+                report_step_complete=bool(args.report_step_complete),
             )
         else:
             # --- Per-pose minimization ---

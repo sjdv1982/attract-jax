@@ -19,6 +19,8 @@ Interface
 """
 
 import os
+import ctypes
+import subprocess
 
 # Keep host memory bounded on CPU — set before importing jax.
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
@@ -57,6 +59,59 @@ FD_DELTA = np.array([1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6], dtype=np.float64)
 # Pre-defined batch sizes for JIT-shape caching.  Using a discrete set avoids
 # recompilation for every unique active-pose count while keeping padding low.
 _BATCH_SIZES = (8, 16, 32, 64, 128, 256, 512, 1024)
+
+
+class NbFusedStepData(ctypes.Structure):
+    _fields_ = [
+        ("nposes", ctypes.c_int32),
+        ("natoms", ctypes.c_int32),
+        ("dofs", ctypes.POINTER(ctypes.c_double)),
+        ("ens", ctypes.POINTER(ctypes.c_int16)),
+        ("lig_coords", ctypes.POINTER(ctypes.c_double)),
+        ("lig_pivot", ctypes.POINTER(ctypes.c_double)),
+        ("lig_type", ctypes.POINTER(ctypes.c_int16)),
+        ("lig_charge", ctypes.POINTER(ctypes.c_double)),
+    ]
+
+
+class NbFusedGridData(ctypes.Structure):
+    _fields_ = [
+        ("dim", ctypes.c_int32 * 3),
+        ("origin", ctypes.c_double * 3),
+        ("spacing", ctypes.c_double),
+        ("nr_neigh", ctypes.POINTER(ctypes.c_int32)),
+        ("nb_start", ctypes.POINTER(ctypes.c_int64)),
+    ]
+
+
+class NbGlobalData(ctypes.Structure):
+    _fields_ = [
+        ("nrec", ctypes.c_int32),
+        ("nens", ctypes.c_int32),
+        ("nb_concat_len", ctypes.c_int64),
+        ("nb_concat", ctypes.POINTER(ctypes.c_int32)),
+        ("rec_coord", ctypes.POINTER(ctypes.c_double)),
+        ("rec_type", ctypes.POINTER(ctypes.c_int16)),
+        ("rec_charge", ctypes.POINTER(ctypes.c_double)),
+        ("nrec_types", ctypes.c_int32),
+        ("nlig_types", ctypes.c_int32),
+        ("rc", ctypes.POINTER(ctypes.c_double)),
+        ("ac", ctypes.POINTER(ctypes.c_double)),
+        ("emin", ctypes.POINTER(ctypes.c_double)),
+        ("rmin2", ctypes.POINTER(ctypes.c_double)),
+        ("ivor", ctypes.POINTER(ctypes.c_int8)),
+        ("plateaudissq", ctypes.c_double),
+        ("potshape", ctypes.c_int32),
+        ("cdie", ctypes.c_int32),
+    ]
+
+
+class NbRunConfig(ctypes.Structure):
+    _fields_ = [("num_threads", ctypes.c_int32), ("kernel_variant", ctypes.c_int32)]
+
+
+def _as_ptr(a, ctype):
+    return a.ctypes.data_as(ctypes.POINTER(ctype))
 
 
 def _round_up_batch(n: int) -> int:
@@ -100,6 +155,7 @@ class JaxScoreOracle:
         epsilon: float = 15.0,
         cdie: bool = False,
         energy_batch: int = 256,
+        nb_kernel: str = "jax",
     ):
         self.energy_batch = int(max(1, energy_batch))
         self._call_count = 0
@@ -261,6 +317,11 @@ class JaxScoreOracle:
         self._lig_pivot_j = jnp.array(lig_pivot, dtype=jnp.float64)
         self._pad_poses = int(energy_batch)
         self._n_lig_atoms = n_lig_atoms
+        self._nens = int(rec_coords_ens.shape[0])
+        self._nrec = int(rec_coords_ens.shape[1])
+        self._nb_kernel = str(nb_kernel)
+        if self._nb_kernel not in ("jax", "fused"):
+            raise ValueError(f"Unsupported nb_kernel={self._nb_kernel!r}")
 
         # --- Build value_and_grad function for analytical gradients ---
         # Uses main_ad (fully JIT-compilable, no Python control flow).
@@ -321,6 +382,223 @@ class JaxScoreOracle:
             self._vg_batch = None
             self._pot_vg_single = None
             self._pot_vg_batch = None
+
+        if self._nb_kernel == "fused":
+            self._init_fused_nb_backend(
+                grid=grid,
+                rec_coords_ens=rec_coords_ens,
+                rec_charge_ens_scaled=rec_charge_ens_scaled,
+                rec_atomtypes_ff=rec_atomtypes_ff.astype(np.int16, copy=False),
+                lig_coords=lig_coords,
+                lig_atomtypes_ff=lig_atomtypes_ff.astype(np.int16, copy=False),
+                lig_charge_scaled=lig_charge_scaled,
+                rc=rc,
+                ac=ac,
+                emin=emin,
+                rmin2=rmin2,
+                ivor=ivor,
+                plateaudissq=float(grid.plateaudis) ** 2,
+                cdie=bool(cdie),
+            )
+
+    def _init_fused_nb_backend(
+        self,
+        grid,
+        rec_coords_ens,
+        rec_charge_ens_scaled,
+        rec_atomtypes_ff,
+        lig_coords,
+        lig_atomtypes_ff,
+        lig_charge_scaled,
+        rc,
+        ac,
+        emin,
+        rmin2,
+        ivor,
+        plateaudissq,
+        cdie,
+    ):
+        env_src = os.environ.get("NB_KERNEL_CPP")
+        src_candidates = []
+        if env_src:
+            src_candidates.append(Path(env_src))
+
+        repo_root = Path(__file__).resolve().parents[2]
+        src_candidates.extend(
+            [
+                repo_root
+                / "test"
+                / "first1000"
+                / "nb_kernel_harness"
+                / "src"
+                / "nb_kernel.cpp",
+                repo_root
+                / "test"
+                / "first10k"
+                / "nb_kernel_harness"
+                / "src"
+                / "nb_kernel.cpp",
+            ]
+        )
+        cwd = Path.cwd().resolve()
+        for base in [cwd, *cwd.parents]:
+            src_candidates.extend(
+                [
+                    base
+                    / "test"
+                    / "first1000"
+                    / "nb_kernel_harness"
+                    / "src"
+                    / "nb_kernel.cpp",
+                    base
+                    / "test"
+                    / "first10k"
+                    / "nb_kernel_harness"
+                    / "src"
+                    / "nb_kernel.cpp",
+                ]
+            )
+        src = next((p for p in src_candidates if p.exists()), None)
+        if src is None:
+            raise RuntimeError("Could not locate nb_kernel.cpp for fused NB backend")
+        hdr = src.with_name("nb_kernel.h")
+        so = Path(__file__).resolve().parent / "libnbkernel_fused.so"
+
+        needs = True
+        if so.exists():
+            t_so = so.stat().st_mtime
+            needs = src.stat().st_mtime > t_so or hdr.stat().st_mtime > t_so
+        if needs:
+            cmd = [
+                "g++",
+                "-O3",
+                "-DNDEBUG",
+                "-std=c++17",
+                "-march=native",
+                "-fPIC",
+                "-shared",
+                "-fopenmp",
+                str(src),
+                "-o",
+                str(so),
+            ]
+            subprocess.run(cmd, check=True)
+
+        lib = ctypes.CDLL(str(so))
+        fn_fused = lib.nb_kernel_run_fused
+        fn_fused.argtypes = [
+            ctypes.POINTER(NbFusedStepData),
+            ctypes.POINTER(NbFusedGridData),
+            ctypes.POINTER(NbGlobalData),
+            ctypes.POINTER(NbRunConfig),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+        ]
+        fn_fused.restype = ctypes.c_int
+
+        ng = np.asarray(grid.neighbour_grid, dtype=np.int32)
+        nr_neigh = np.asarray(grid.nr_neighbours, dtype=np.int32).reshape(-1)
+        nr_neigh = np.where(nr_neigh > 0, nr_neigh, 0).astype(np.int32, copy=False)
+        ng_flat = ng.reshape(-1, ng.shape[-1])
+        nb_start = np.zeros((nr_neigh.shape[0],), dtype=np.int64)
+        if nr_neigh.shape[0] > 1:
+            nb_start[1:] = np.cumsum(nr_neigh[:-1], dtype=np.int64)
+        total_nb = int(nb_start[-1] + nr_neigh[-1]) if nr_neigh.size else 0
+        nb_concat = np.empty((total_nb,), dtype=np.int32)
+        for i in range(nr_neigh.shape[0]):
+            k = int(nr_neigh[i])
+            if k > 0:
+                s = int(nb_start[i])
+                nb_concat[s : s + k] = ng_flat[i, :k]
+
+        self._fused = {
+            "lib": lib,
+            "fn": fn_fused,
+            "grid_nr_neigh": np.ascontiguousarray(nr_neigh, dtype=np.int32),
+            "grid_nb_start": np.ascontiguousarray(nb_start, dtype=np.int64),
+            "nb_concat": np.ascontiguousarray(nb_concat, dtype=np.int32),
+            "rec_coord": np.ascontiguousarray(rec_coords_ens, dtype=np.float64),
+            "rec_type": np.ascontiguousarray(rec_atomtypes_ff, dtype=np.int16),
+            "rec_charge": np.ascontiguousarray(rec_charge_ens_scaled, dtype=np.float64),
+            "rc": np.ascontiguousarray(rc, dtype=np.float64),
+            "ac": np.ascontiguousarray(ac, dtype=np.float64),
+            "emin": np.ascontiguousarray(emin, dtype=np.float64),
+            "rmin2": np.ascontiguousarray(rmin2, dtype=np.float64),
+            "ivor": np.ascontiguousarray(ivor, dtype=np.int8),
+            "lig_coord": np.ascontiguousarray(lig_coords, dtype=np.float64),
+            "lig_type": np.ascontiguousarray(lig_atomtypes_ff, dtype=np.int16),
+            "lig_charge": np.ascontiguousarray(lig_charge_scaled, dtype=np.float64),
+            "plateaudissq": float(plateaudissq),
+            "cdie": 1 if cdie else 0,
+            "potshape": 8,
+        }
+
+        dim = np.asarray(grid.dim, dtype=np.int32)
+        origin = np.asarray(grid.origin, dtype=np.float64)
+        self._fused_grid_struct = NbFusedGridData(
+            dim=(ctypes.c_int32 * 3)(int(dim[0]), int(dim[1]), int(dim[2])),
+            origin=(ctypes.c_double * 3)(
+                float(origin[0]), float(origin[1]), float(origin[2])
+            ),
+            spacing=ctypes.c_double(float(grid.gridspacing)),
+            nr_neigh=_as_ptr(self._fused["grid_nr_neigh"], ctypes.c_int32),
+            nb_start=_as_ptr(self._fused["grid_nb_start"], ctypes.c_int64),
+        )
+
+        self._fused_global_struct = NbGlobalData(
+            nrec=np.int32(self._nrec),
+            nens=np.int32(self._nens),
+            nb_concat_len=np.int64(self._fused["nb_concat"].shape[0]),
+            nb_concat=_as_ptr(self._fused["nb_concat"], ctypes.c_int32),
+            rec_coord=_as_ptr(self._fused["rec_coord"].reshape(-1), ctypes.c_double),
+            rec_type=_as_ptr(self._fused["rec_type"], ctypes.c_int16),
+            rec_charge=_as_ptr(self._fused["rec_charge"].reshape(-1), ctypes.c_double),
+            nrec_types=np.int32(self._fused["rc"].shape[0]),
+            nlig_types=np.int32(self._fused["rc"].shape[1]),
+            rc=_as_ptr(self._fused["rc"].reshape(-1), ctypes.c_double),
+            ac=_as_ptr(self._fused["ac"].reshape(-1), ctypes.c_double),
+            emin=_as_ptr(self._fused["emin"].reshape(-1), ctypes.c_double),
+            rmin2=_as_ptr(self._fused["rmin2"].reshape(-1), ctypes.c_double),
+            ivor=_as_ptr(self._fused["ivor"].reshape(-1), ctypes.c_int8),
+            plateaudissq=ctypes.c_double(self._fused["plateaudissq"]),
+            potshape=np.int32(self._fused["potshape"]),
+            cdie=np.int32(self._fused["cdie"]),
+        )
+        nthreads = int(os.environ.get("OMP_NUM_THREADS", "0")) or (os.cpu_count() or 1)
+        self._fused_cfg = NbRunConfig(num_threads=np.int32(nthreads), kernel_variant=np.int32(1))
+
+    def _score_nb_fused_batch(self, ens, dofs):
+        ens0 = np.ascontiguousarray(np.asarray(ens, dtype=np.int16) - 1, dtype=np.int16)
+        dofs64 = np.ascontiguousarray(np.asarray(dofs, dtype=np.float64), dtype=np.float64)
+        pivot = np.ascontiguousarray(np.asarray(self._lig_pivot_j), dtype=np.float64)
+        n = int(dofs64.shape[0])
+        out_e = np.zeros((n,), dtype=np.float64)
+        out_g = np.zeros((n, 6), dtype=np.float64)
+
+        step = NbFusedStepData(
+            nposes=np.int32(n),
+            natoms=np.int32(self._fused["lig_coord"].shape[0]),
+            dofs=_as_ptr(dofs64.reshape(-1), ctypes.c_double),
+            ens=_as_ptr(ens0, ctypes.c_int16),
+            lig_coords=_as_ptr(self._fused["lig_coord"].reshape(-1), ctypes.c_double),
+            lig_pivot=_as_ptr(pivot, ctypes.c_double),
+            lig_type=_as_ptr(self._fused["lig_type"], ctypes.c_int16),
+            lig_charge=_as_ptr(self._fused["lig_charge"], ctypes.c_double),
+        )
+        t0 = time.monotonic()
+        rc = self._fused["fn"](
+            ctypes.byref(step),
+            ctypes.byref(self._fused_grid_struct),
+            ctypes.byref(self._fused_global_struct),
+            ctypes.byref(self._fused_cfg),
+            _as_ptr(out_e, ctypes.c_double),
+            _as_ptr(out_g.reshape(-1), ctypes.c_double),
+        )
+        self._total_kernel_time += time.monotonic() - t0
+        self._total_kernel_calls += 1
+        if rc != 0:
+            raise RuntimeError(f"nb_kernel_run_fused failed with error code {rc}")
+        return out_e, out_g
 
     def _vg_ensemble(self, ens0: int, dofs_j: jnp.ndarray):
         """Compute per-pose energies AND gradients for one ensemble.
@@ -433,11 +711,7 @@ class JaxScoreOracle:
         return energies
 
     def score_batch(self, ens, dofs):
-        """Score a batch of poses with analytical gradients (jax.value_and_grad).
-
-        Merged-ensemble approach: per-pose receptor data is gathered from
-        stacked numpy arrays per chunk, so all ensembles are processed in
-        a single sequential loop without per-ensemble Python dispatch.
+        """Score a batch of poses using the selected NB backend.
 
         Parameters
         ----------
@@ -450,22 +724,23 @@ class JaxScoreOracle:
         gradients : (N, 6) float64
         """
         self._call_count += 1
-        n = len(dofs)
-        ens0 = np.asarray(ens, dtype=np.intp) - 1  # (N,) 0-based
+        if self._nb_kernel == "fused":
+            e_pot, g_pot = self.score_potential_batch(ens, dofs)
+            e_nb, g_nb = self._score_nb_fused_batch(ens, dofs)
+            return e_pot + e_nb, g_pot + g_nb
 
+        # Pure-JAX path (potential + NB in a single AD-evaluated kernel).
+        n = len(dofs)
+        ens0 = np.asarray(ens, dtype=np.intp) - 1
         energies = np.zeros(n, dtype=np.float64)
         gradients = np.zeros((n, 6), dtype=np.float64)
-
         chunk = self.energy_batch
         for start in range(0, n, chunk):
             end = min(start + chunk, n)
             m = end - start
             dofs_j = jnp.array(dofs[start:end], dtype=jnp.float64)
             rc_j = jnp.array(self._rec_coor_ens_np[ens0[start:end]], dtype=jnp.float64)
-            rq_j = jnp.array(
-                self._rec_charge_ens_np[ens0[start:end]], dtype=jnp.float64
-            )
-
+            rq_j = jnp.array(self._rec_charge_ens_np[ens0[start:end]], dtype=jnp.float64)
             t0 = time.monotonic()
             pad_n = _round_up_batch(m)
             if m < pad_n:
@@ -478,7 +753,6 @@ class JaxScoreOracle:
             gradients[start:end] = np.asarray(g_b[:m])
             self._total_kernel_time += time.monotonic() - t0
             self._total_kernel_calls += 1
-
         return energies, gradients
 
     def score_potential_batch(self, ens, dofs):
