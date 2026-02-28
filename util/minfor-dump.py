@@ -41,9 +41,6 @@ def parse_args():
     ap.add_argument("--epsilon", type=float, default=15.0)
     ap.add_argument("--cdie", action="store_true")
     ap.add_argument("--energy-batch", type=int, default=256)
-    ap.add_argument("--max-nb-cap", type=int, default=0)
-    ap.add_argument("--nb-mode", choices=["fixed", "bucketed"], default="fixed")
-    ap.add_argument("--nb-bucket-thresholds", default="8")
     return ap.parse_args()
 
 
@@ -89,7 +86,6 @@ def main():
         lig_pivot=lig_pivot,
         epsilon=args.epsilon,
         cdie=bool(args.cdie),
-        max_nb_cap=args.max_nb_cap,
     )
 
     rows = extract_nb_rows(ens, dofs, ctx)
@@ -105,9 +101,6 @@ def main():
         epsilon=args.epsilon,
         cdie=bool(args.cdie),
         energy_batch=args.energy_batch,
-        max_nb_cap=args.max_nb_cap,
-        nb_mode=args.nb_mode,
-        nb_bucket_thresholds=args.nb_bucket_thresholds,
     )
     pot_e, pot_g = oracle.score_potential_batch(ens, dofs)
     write_score_file(args.score_out, pot_e, pot_g)

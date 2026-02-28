@@ -1172,27 +1172,6 @@ def parse_args():
         help="max poses per JAX kernel call (merged-ensemble: all ensembles in one call)",
     )
     ap.add_argument(
-        "--max-nb-cap",
-        type=int,
-        default=0,
-        help="cap max_nr_neighbours for JAX oracle (0=no cap, e.g. 40 for speed)",
-    )
-    ap.add_argument(
-        "--nb-mode",
-        choices=["fixed", "bucketed"],
-        default="fixed",
-        help="JAX neighbour kernel mode",
-    )
-    ap.add_argument(
-        "--nb-bucket-thresholds",
-        default="8",
-        help=(
-            "bucket thresholds for --nb-mode bucketed. "
-            "Single integer = step size (default 8); "
-            "or comma-separated explicit thresholds, e.g. 8,16,24,32,64,96,128,180"
-        ),
-    )
-    ap.add_argument(
         "--disable-jit",
         action="store_true",
         help="disable JAX JIT compilation (slower per-eval but no compilation time)",
@@ -1289,15 +1268,11 @@ def main():
             epsilon=args.epsilon,
             cdie=bool(args.cdie),
             energy_batch=args.energy_batch,
-            max_nb_cap=args.max_nb_cap,
-            nb_mode=args.nb_mode,
-            nb_bucket_thresholds=args.nb_bucket_thresholds,
         )
         if verbose:
             print(
                 "JAX oracle initialized "
-                f"(energy_batch={args.energy_batch}, max_nb_cap={args.max_nb_cap}, "
-                f"nb_mode={args.nb_mode}, nb_bucket_thresholds={args.nb_bucket_thresholds})"
+                f"(energy_batch={args.energy_batch})"
             )
     else:
         paths = resolve_attract_paths(test_dir)

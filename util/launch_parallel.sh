@@ -44,7 +44,7 @@ for i in $(seq 0 $((NPROC - 1))); do
         --attract-par-npz "$PAR" \
         --receptor-ens-list "$REC_LIST" \
         --ligand-pdb "$LIG" \
-        --oracle jax --epsilon 15.0 --energy-batch 8 --max-nb-cap 40 \
+        --oracle jax --epsilon 15.0 --energy-batch 8 \
         --pose-offset "$OFFSET" --max-poses "$CHUNK" \
         --trace-every 20 \
         --out-prefix "$PREFIX" \

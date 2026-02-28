@@ -403,9 +403,6 @@ def parse_args():
     ap.add_argument("--epsilon", type=float, default=15.0)
     ap.add_argument("--cdie", action="store_true")
     ap.add_argument("--energy-batch", type=int, default=256)
-    ap.add_argument("--max-nb-cap", type=int, default=0)
-    ap.add_argument("--nb-mode", choices=["fixed", "bucketed"], default="fixed")
-    ap.add_argument("--nb-bucket-thresholds", default="8")
     ap.add_argument("--traj", action="store_true")
     return ap.parse_args()
 
@@ -450,7 +447,6 @@ def main():
         lig_pivot=lig_pivot,
         epsilon=args.epsilon,
         cdie=bool(args.cdie),
-        max_nb_cap=args.max_nb_cap,
     )
     pot_oracle = JaxScoreOracle(
         receptor_ens_list=ens_list_path,
@@ -461,9 +457,6 @@ def main():
         epsilon=args.epsilon,
         cdie=bool(args.cdie),
         energy_batch=args.energy_batch,
-        max_nb_cap=args.max_nb_cap,
-        nb_mode=args.nb_mode,
-        nb_bucket_thresholds=args.nb_bucket_thresholds,
     )
     dumper = StepDumper(
         args.dump_pattern, ctx, pot_oracle, input_centered=input_centered
@@ -480,9 +473,6 @@ def main():
             epsilon=args.epsilon,
             cdie=bool(args.cdie),
             energy_batch=args.energy_batch,
-            max_nb_cap=args.max_nb_cap,
-            nb_mode=args.nb_mode,
-            nb_bucket_thresholds=args.nb_bucket_thresholds,
         )
     else:
         import tempfile as _tempfile

@@ -48,7 +48,6 @@ def parse_args():
     ap.add_argument("--ligand-pdb", default=None)
     ap.add_argument("--epsilon", type=float, default=15.0)
     ap.add_argument("--cdie", action="store_true")
-    ap.add_argument("--max-nb-cap", type=int, default=0)
     ap.add_argument("--reference-pattern", default=None)
     ap.add_argument("--resume", action="store_true", help="reuse existing out score files")
     return ap.parse_args()
@@ -86,7 +85,6 @@ def main():
         lig_pivot=lig_pivot,
         epsilon=args.epsilon,
         cdie=bool(args.cdie),
-        max_nb_cap=args.max_nb_cap,
     )
 
     nposes = len(ens0)

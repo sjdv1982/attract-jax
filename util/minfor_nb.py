@@ -21,32 +21,6 @@ from reproduce_grid_score import (
 jax.config.update("jax_enable_x64", True)
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
-
-def _parse_nb_bucket_thresholds(spec, max_nb):
-    max_nb = int(max_nb)
-    if max_nb <= 0:
-        return ()
-    if spec is None:
-        vals = list(range(8, max_nb, 8))
-    elif isinstance(spec, (list, tuple, np.ndarray)):
-        vals = [int(v) for v in spec]
-    elif isinstance(spec, str):
-        s = spec.strip()
-        if not s:
-            vals = list(range(8, max_nb, 8))
-        elif "," in s:
-            vals = [int(x.strip()) for x in s.split(",") if x.strip()]
-        else:
-            step = int(s)
-            vals = list(range(step, max_nb, step))
-    else:
-        step = int(spec)
-        vals = list(range(step, max_nb, step))
-    vals = sorted({int(v) for v in vals if 1 <= int(v) < max_nb})
-    vals.append(max_nb)
-    return tuple(vals)
-
-
 def load_context(
     receptor_ens_list,
     ligand_pdb,
@@ -55,7 +29,6 @@ def load_context(
     lig_pivot,
     epsilon=15.0,
     cdie=False,
-    max_nb_cap=0,
 ):
     with open(receptor_ens_list) as f:
         rec_files = [line.strip() for line in f if line.strip()]
@@ -115,14 +88,8 @@ def load_context(
     valid = nb_flat < 2**16 - 1
     nb_flat[valid] = rec_mapping[nb_flat[valid]]
 
-    max_nb_effective = int(grid.max_nr_neighbours)
-    if int(max_nb_cap) > 0:
-        max_nb_effective = min(max_nb_effective, int(max_nb_cap))
-
     nr_neigh = np.asarray(grid.nr_neighbours, dtype=np.int32).reshape(-1)
     nr_neigh = np.where(nr_neigh > 0, nr_neigh, 0)
-    if max_nb_effective > 0:
-        nr_neigh = np.minimum(nr_neigh, max_nb_effective)
     nb_ravel = np.asarray(grid.neighbour_grid.reshape(-1, grid.neighbour_grid.shape[-1]), dtype=np.int32)
 
     nb_start = np.zeros(len(nr_neigh), dtype=np.int64)
@@ -151,7 +118,6 @@ def load_context(
         "nb_concat": nb_concat,
         "plateaudissq": float(grid.plateaudis) ** 2,
         "cdie": bool(cdie),
-        "bucket_thresholds": _parse_nb_bucket_thresholds("8", max_nb_effective),
     }
 
 
