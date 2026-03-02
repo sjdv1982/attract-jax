@@ -4,7 +4,7 @@
 
 ### 1.1 The Problem
 
-The current NB kernel (`nb_kernel.cpp`) hardcodes the ATTRACT force field: 8/6 Lennard-Jones
+The current NB kernel (`nb_kernel.cpp` inside `attract-jax/native/`) hardcodes the ATTRACT force field: 8/6 Lennard-Jones
 with distance-dependent dielectric (rdie), Euler angle rotation, and always computes gradients.
 This makes it impossible to support alternative force fields, rotation parameterizations, or
 energy-only evaluation without duplicating the entire 400-line pose loop.
@@ -87,6 +87,7 @@ in energy-only mode. For rotation vectors, the Rodrigues formula derivatives inv
 significantly more work than the rotation matrix itself, so this is not trivial savings.
 
 Initial implementations:
+
 - `euler_rot.h` — the existing ATTRACT Euler convention (phi, ssi, rot).
 - `rotvec_rot.h` — rotation vector via Rodrigues formula, with Taylor expansion near θ=0.
 
@@ -120,6 +121,7 @@ a few extra multiplies on top. Separating them would either duplicate the expens
 require passing intermediates through an awkward interface.
 
 **Concrete initial force fields:**
+
 - `nonbon8/` — 8/6 LJ with rdie (distance-dependent dielectric). This is the classic
   ATTRACT potential.
 - `nonbon12/` — 12/6 LJ with cdie (constant dielectric). Standard molecular mechanics.
@@ -215,6 +217,7 @@ A Python script `codegen_ff.py` with two modes:
 **Init mode:** `python codegen_ff.py init <name> <directory>`
 
 Creates the directory and generates:
+
 - `lj.h` — skeleton with the `lj_energy` signature, parameter documentation, and a TODO body.
 - `elec.h` — skeleton with the `elec_energy` signature.
 - `ff.yaml` — default configuration declaring supported rotation schemes and noting that
@@ -228,6 +231,7 @@ will unlock gradient-capable kernel variants, and likewise for `elec_grad.h`.
 **Codegen mode:** `python codegen_ff.py codegen <name> <directory>`
 
 Reads `ff.yaml`, inspects which `.h` files exist, and generates:
+
 - A single `.cpp` file that `#include`s the pose loop template, the relevant rotation policy
   headers, and the force field `.h` files. It instantiates the template for each valid
   combination and emits `extern "C"` wrapper functions.
@@ -251,6 +255,7 @@ nb_kernel_nonbon12.so   — same set of symbols
 
 One `.so` per force field. Python loads the `.so` by name and probes for available symbols
 using `ctypes`. This means:
+
 - The build produces a clean, self-contained artifact per force field.
 - Python discovers capabilities at runtime — no hardcoded function lists.
 - Adding a new force field requires zero changes to existing build rules.
@@ -501,6 +506,7 @@ This is the fastest path for precomputing stored-gradient grids.
 ### 3.8 Merging the Paths
 
 Stages 3 and 4 are complementary, not competing:
+
 - Potential grids (Stage 3) give O(1) per-atom lookup but require precomputation time and
   memory.
 - NB kernel (Stage 4) gives exact pairwise evaluation with gradients, at O(k) per atom.
@@ -721,6 +727,7 @@ potshape: 8               # LJ repulsive exponent (8 or 12)
 ```
 
 This metadata is consumed by:
+
 - The Python framework (to configure neighbor list construction and plateau correction).
 - The C codegen script (to configure which kernel features to enable).
 - The validation harness (to set up test conditions).
@@ -846,40 +853,50 @@ framework, and validation harness are never modified.
 ## 6. Implementation Order
 
 ### Phase 1: Refactor the C++ kernel
+
 Extract the current `nb_kernel.cpp` into the template architecture: `pose_loop.h`,
 `euler_rot.h`, `nonbon8/lj.h`, `nonbon8/elec.h`, etc. Validate that the refactored kernel
 produces identical results to the current one.
 
 ### Phase 2: Add energy-only support
+
 Implement the `ComputeGrad=false` path in the pose loop template. Add energy-only wrappers.
 Validate against the grad version (energies must match).
 
 ### Phase 3: Add rotation vector support
+
 Implement `rotvec_rot.h`. Validate by comparing rotvec gradients against finite-difference
 derivatives of the energy.
 
 ### Phase 4: Add nonbon12
+
 Implement `nonbon12/lj.h` and `nonbon12/elec.h` (12/6 LJ with cdie). Validate against
 a Python reference.
 
 ### Phase 5: Codegen script
+
 Implement `codegen_ff.py` with init and codegen modes.
 
 ### Phase 6: Build system
+
 Implement Makefile rules for scanning force field directories, invoking codegen, and
 building `.so` files.
 
 ### Phase 7: Python neighbor list grid component
+
 Generalize the existing KD-tree prototype from `test-calc-grid-energy.py` into a reusable
 component supporting multiple atom types.
 
 ### Phase 8: Python progressive evaluation pipeline
+
 Implement the Python framework that orchestrates naive mode, neighbor list grid, potential
 grid, and kernel evaluation. Implement auto-detection of kernel `.so` availability.
 
 ### Phase 9: Validation harness
+
 Implement the test generation and cross-stage validation framework.
 
 ### Phase 10: Potential grid precomputation
+
 Generalize the existing potential grid prototype into a reusable component. Integrate with
 kernel auto-detection for acceleration.

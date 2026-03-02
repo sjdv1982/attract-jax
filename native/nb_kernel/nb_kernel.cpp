@@ -33,7 +33,6 @@ inline void nonbon_eval(
     double dx,
     double dy,
     double dz,
-    int potshape,
     double &energy,
     double &gx,
     double &gy,
@@ -41,14 +40,8 @@ inline void nonbon_eval(
   const double alen = welwel * ac;
   const double rlen = welwel * rc;
   const double rr23 = rr2 * rr2 * rr2;
-
-  double rrd = rr2;
-  double shapedelta = 2.0;
-  if (potshape == 12) {
-    rrd = rr23;
-    shapedelta = 6.0;
-  }
-
+  const double rrd = rr2;  // nonbon8 hardcoded
+  const double shapedelta = 2.0;
   const double rep = rlen * rrd;
   const double vlj = (rep - alen) * rr23;
 
@@ -69,7 +62,6 @@ inline void nonbon_eval(
 }
 
 inline void elec_eval(
-    int cdie,
     double charge,
     double rr2,
     double dx,
@@ -79,12 +71,7 @@ inline void elec_eval(
     double &gx,
     double &gy,
     double &gz) {
-  double dd;
-  if (cdie) {
-    dd = std::sqrt(rr2) - 1.0 / 50.0;
-  } else {
-    dd = rr2 - (1.0 / 50.0) * (1.0 / 50.0);
-  }
+  double dd = rr2 - (1.0 / 50.0) * (1.0 / 50.0);  // rdie hardcoded
   if (dd < 0.0) {
     dd = 0.0;
   }
@@ -98,17 +85,10 @@ inline void elec_eval(
     return;
   }
 
-  if (cdie) {
-    const double et2 = charge * std::sqrt(rr2);
-    gx = et2 * dx;
-    gy = et2 * dy;
-    gz = et2 * dz;
-  } else {
-    const double et2 = charge * rr2;
-    gx = 2.0 * et2 * dx;
-    gy = 2.0 * et2 * dy;
-    gz = 2.0 * et2 * dz;
-  }
+  const double et2 = charge * rr2;
+  gx = 2.0 * et2 * dx;
+  gy = 2.0 * et2 * dy;
+  gz = 2.0 * et2 * dz;
 }
 
 inline void euler_rot_torque(
@@ -319,7 +299,7 @@ inline void run_pose_loop_fused(const NbFusedStepData *step,
         double e0, gx0, gy0, gz0;
         nonbon_eval(1.0, global->rc[tindex], global->ac[tindex], global->emin[tindex],
                     global->rmin2[tindex], static_cast<int>(global->ivor[tindex]),
-                    dsq, rr2, sdx, sdy, sdz, global->potshape, e0, gx0, gy0, gz0);
+                    dsq, rr2, sdx, sdy, sdz, e0, gx0, gy0, gz0);
 
         const double ratio = std::sqrt(dsq * plateaudissqinv);
         const double pdx = sdx * ratio;
@@ -329,8 +309,7 @@ inline void run_pose_loop_fused(const NbFusedStepData *step,
         double ep, gxp, gyp, gzp;
         nonbon_eval(1.0, global->rc[tindex], global->ac[tindex], global->emin[tindex],
                     global->rmin2[tindex], static_cast<int>(global->ivor[tindex]),
-                    plateaudissq, plateaudissqinv, pdx, pdy, pdz, global->potshape,
-                    ep, gxp, gyp, gzp);
+                    plateaudissq, plateaudissqinv, pdx, pdy, pdz, ep, gxp, gyp, gzp);
 
         double gx = gx0 - gxp;
         double gy = gy0 - gyp;
@@ -340,10 +319,10 @@ inline void run_pose_loop_fused(const NbFusedStepData *step,
         const double charge = lig_charge * global->rec_charge[rec_base + rec_idx];
         if (std::fabs(charge) > 1.0e-3) {
           double ee0, egx0, egy0, egz0;
-          elec_eval(global->cdie, charge, rr2, sdx, sdy, sdz, ee0, egx0, egy0, egz0);
+          elec_eval(charge, rr2, sdx, sdy, sdz, ee0, egx0, egy0, egz0);
 
           double eep, egxp, egyp, egzp;
-          elec_eval(global->cdie, charge, plateaudissqinv, pdx, pdy, pdz, eep, egxp,
+          elec_eval(charge, plateaudissqinv, pdx, pdy, pdz, eep, egxp,
                     egyp, egzp);
 
           e_pair += (ee0 - eep);

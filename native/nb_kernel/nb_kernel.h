@@ -45,8 +45,6 @@ typedef struct {
   const int8_t *ivor;               // nrec_types*nlig_types
 
   double plateaudissq;
-  int32_t potshape;                 // 8 or 12
-  int32_t cdie;                     // 0 const dielectric, 1 distance-dependent
 } NbGlobalData;
 
 typedef struct {

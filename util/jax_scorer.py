@@ -101,8 +101,6 @@ class NbGlobalData(ctypes.Structure):
         ("rmin2", ctypes.POINTER(ctypes.c_double)),
         ("ivor", ctypes.POINTER(ctypes.c_int8)),
         ("plateaudissq", ctypes.c_double),
-        ("potshape", ctypes.c_int32),
-        ("cdie", ctypes.c_int32),
     ]
 
 
@@ -139,8 +137,6 @@ class JaxScoreOracle:
         Ligand pivot point.
     epsilon : float
         Dielectric constant (default 15.0).
-    cdie : bool
-        Use distance-dependent dielectric (default False).
     energy_batch : int
         Max poses per JAX kernel call (controls peak memory).
     """
@@ -158,6 +154,7 @@ class JaxScoreOracle:
         nb_kernel: str = "jax",
         autodiff_potentials: bool = False,
     ):
+        _ = cdie  # Milestone 1: nonbon8 + rdie fixed, keep arg for compatibility.
         self.energy_batch = int(max(1, energy_batch))
         self._call_count = 0
         self._total_kernel_calls = 0
@@ -295,7 +292,7 @@ class JaxScoreOracle:
             lig_vdw_channel_idx=jnp.array(lig_vdw_channel_idx, dtype=np.int32),
             lig_charge_raw=jnp.array(lig_charge_raw, dtype=np.float64),
             lig_charge_scaled=jnp.array(lig_charge_scaled, dtype=np.float64),
-            cdie=bool(cdie),
+            cdie=False,
             padded_nb_size=padded_nb_size,
             use_precomputed_grid_gradients=self._use_precomputed_grid_gradients,
         )
@@ -407,7 +404,6 @@ class JaxScoreOracle:
                 rmin2=rmin2,
                 ivor=ivor,
                 plateaudissq=float(grid.plateaudis) ** 2,
-                cdie=bool(cdie),
             )
 
     def _init_fused_nb_backend(
@@ -425,7 +421,6 @@ class JaxScoreOracle:
         rmin2,
         ivor,
         plateaudissq,
-        cdie,
     ):
         env_src = os.environ.get("NB_KERNEL_CPP")
         src_candidates = []
@@ -543,8 +538,6 @@ class JaxScoreOracle:
             "lig_type": np.ascontiguousarray(lig_atomtypes_ff, dtype=np.int16),
             "lig_charge": np.ascontiguousarray(lig_charge_scaled, dtype=np.float64),
             "plateaudissq": float(plateaudissq),
-            "cdie": 1 if cdie else 0,
-            "potshape": 8,
         }
 
         dim = np.asarray(grid.dim, dtype=np.int32)
@@ -575,8 +568,6 @@ class JaxScoreOracle:
             rmin2=_as_ptr(self._fused["rmin2"].reshape(-1), ctypes.c_double),
             ivor=_as_ptr(self._fused["ivor"].reshape(-1), ctypes.c_int8),
             plateaudissq=ctypes.c_double(self._fused["plateaudissq"]),
-            potshape=np.int32(self._fused["potshape"]),
-            cdie=np.int32(self._fused["cdie"]),
         )
         nthreads = int(os.environ.get("OMP_NUM_THREADS", "0")) or (os.cpu_count() or 1)
         self._fused_cfg = NbRunConfig(num_threads=np.int32(nthreads), kernel_variant=np.int32(1))

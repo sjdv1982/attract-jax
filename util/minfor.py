@@ -962,7 +962,6 @@ def parse_args():
         default=15.0,
         help="JAX-only dielectric constant",
     )
-    ap.add_argument("--cdie", action="store_true", help="distance-dependent dielectric")
     ap.add_argument(
         "--energy-batch",
         type=int,
@@ -1016,7 +1015,6 @@ def parse_args():
             "--attract-par-npz",
             "--receptor-ens-list",
             "--epsilon",
-            "--cdie",
             "--energy-batch",
             "--nb-kernel",
             "--autodiff-potentials",
@@ -1116,7 +1114,6 @@ def main():
             attract_par_npz=par_npz,
             lig_pivot=lig_pivot,
             epsilon=args.epsilon,
-            cdie=bool(args.cdie),
             energy_batch=args.energy_batch,
             nb_kernel=args.nb_kernel,
             autodiff_potentials=bool(args.autodiff_potentials),
