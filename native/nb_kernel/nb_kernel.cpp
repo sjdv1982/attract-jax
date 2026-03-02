@@ -9,7 +9,6 @@
  *   - Nonbon8FF: FFPolicy struct delegating to nonbon8::lj_energy/elec_energy etc.
  *   - nb_kernel_euler_grad:   energy+gradient, Euler rotation, nonbon8 FF
  *   - nb_kernel_euler_energy: energy-only,     Euler rotation, nonbon8 FF
- *   - nb_kernel_run_fused:    backward-compatible alias → nb_kernel_euler_grad
  */
 #include "nb_kernel.h"
 
@@ -212,21 +211,4 @@ extern "C" int nb_kernel_euler_energy(
       step, grid, global, out_energy, nullptr);
   (void)out_grad;
   return 0;
-}
-
-/**
- * nb_kernel_run_fused — backward-compatible entry point.
- * Delegates to nb_kernel_euler_grad (energy + gradient).
- * Retained so that existing Python callers (jax_scorer.py) continue to work
- * unchanged through Milestone 2 while new code can call nb_kernel_euler_grad.
- */
-extern "C" int nb_kernel_run_fused(
-    const NbFusedStepData *step,
-    const NbFusedGridData *grid,
-    const NbGlobalData *global,
-    const NbRunConfig *cfg,
-    double *out_energy,
-    double *out_grad)
-{
-  return nb_kernel_euler_grad(step, grid, global, cfg, out_energy, out_grad);
 }

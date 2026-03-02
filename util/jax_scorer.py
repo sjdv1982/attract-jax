@@ -235,14 +235,14 @@ class JaxScoreOracle:
         )[lig_atomtypes_ff]
 
         self._nb_kernel = str(nb_kernel)
-        if self._nb_kernel not in ("jax", "fused"):
+        if self._nb_kernel not in ("jax", "nonbon8"):
             raise ValueError(f"Unsupported nb_kernel={self._nb_kernel!r}")
         # Default behavior: use stored grid gradients via custom JVP.
         # Optional behavior: AD through energy-only potentials.
         self._use_precomputed_grid_gradients = not bool(autodiff_potentials)
 
         # Combine potential + electrostatic grids.
-        # For fused NB mode we only keep energy channels; JAX AD handles grid gradients.
+        # For nonbon8 mode we only keep energy channels; JAX AD handles grid gradients.
         inner_all = np.concatenate(
             (grid.inner_potential_grid, grid.inner_elec_grid[None, ...]), axis=0
         )
@@ -389,8 +389,8 @@ class JaxScoreOracle:
             self._pot_vg_single = None
             self._pot_vg_batch = None
 
-        if self._nb_kernel == "fused":
-            self._init_fused_nb_backend(
+        if self._nb_kernel == "nonbon8":
+            self._init_nonbon8_backend(
                 grid=grid,
                 rec_coords_ens=rec_coords_ens,
                 rec_charge_ens_scaled=rec_charge_ens_scaled,
@@ -406,7 +406,7 @@ class JaxScoreOracle:
                 plateaudissq=float(grid.plateaudis) ** 2,
             )
 
-    def _init_fused_nb_backend(
+    def _init_nonbon8_backend(
         self,
         grid,
         rec_coords_ens,
@@ -465,9 +465,9 @@ class JaxScoreOracle:
             )
         src = next((p for p in src_candidates if p.exists()), None)
         if src is None:
-            raise RuntimeError("Could not locate nb_kernel.cpp for fused NB backend")
+            raise RuntimeError("Could not locate nb_kernel.cpp for nonbon8 NB backend")
         hdr = src.with_name("nb_kernel.h")
-        so = Path(__file__).resolve().parent / "libnbkernel_fused.so"
+        so = Path(__file__).resolve().parent / "libnbkernel_nonbon8.so"
 
         needs = True
         if so.exists():
@@ -494,15 +494,8 @@ class JaxScoreOracle:
             subprocess.run(cmd, check=True)
 
         lib = ctypes.CDLL(str(so))
-        # Milestone 2: probe for codegen-equivalent symbols first.
-        # nb_kernel_euler_grad is the canonical name emitted by the new template
-        # architecture; nb_kernel_run_fused is the backward-compatible alias.
-        # Both have identical signatures so the rest of this function is unchanged.
-        try:
-            fn_fused = lib.nb_kernel_euler_grad
-        except AttributeError:
-            fn_fused = lib.nb_kernel_run_fused
-        fn_fused.argtypes = [
+        fn_nb = lib.nb_kernel_euler_grad
+        fn_nb.argtypes = [
             ctypes.POINTER(NbFusedStepData),
             ctypes.POINTER(NbFusedGridData),
             ctypes.POINTER(NbGlobalData),
@@ -510,7 +503,7 @@ class JaxScoreOracle:
             ctypes.POINTER(ctypes.c_double),
             ctypes.POINTER(ctypes.c_double),
         ]
-        fn_fused.restype = ctypes.c_int
+        fn_nb.restype = ctypes.c_int
 
         ng = np.asarray(grid.neighbour_grid, dtype=np.int32)
         nr_neigh = np.asarray(grid.nr_neighbours, dtype=np.int32).reshape(-1)
@@ -527,9 +520,9 @@ class JaxScoreOracle:
                 s = int(nb_start[i])
                 nb_concat[s : s + k] = ng_flat[i, :k]
 
-        self._fused = {
+        self._nb = {
             "lib": lib,
-            "fn": fn_fused,
+            "fn": fn_nb,
             "grid_nr_neigh": np.ascontiguousarray(nr_neigh, dtype=np.int32),
             "grid_nb_start": np.ascontiguousarray(nb_start, dtype=np.int64),
             "nb_concat": np.ascontiguousarray(nb_concat, dtype=np.int32),
@@ -549,39 +542,39 @@ class JaxScoreOracle:
 
         dim = np.asarray(grid.dim, dtype=np.int32)
         origin = np.asarray(grid.origin, dtype=np.float64)
-        self._fused_grid_struct = NbFusedGridData(
+        self._nb_grid_struct = NbFusedGridData(
             dim=(ctypes.c_int32 * 3)(int(dim[0]), int(dim[1]), int(dim[2])),
             origin=(ctypes.c_double * 3)(
                 float(origin[0]), float(origin[1]), float(origin[2])
             ),
             spacing=ctypes.c_double(float(grid.gridspacing)),
-            nr_neigh=_as_ptr(self._fused["grid_nr_neigh"], ctypes.c_int32),
-            nb_start=_as_ptr(self._fused["grid_nb_start"], ctypes.c_int64),
+            nr_neigh=_as_ptr(self._nb["grid_nr_neigh"], ctypes.c_int32),
+            nb_start=_as_ptr(self._nb["grid_nb_start"], ctypes.c_int64),
         )
 
-        self._fused_global_struct = NbGlobalData(
+        self._nb_global_struct = NbGlobalData(
             nrec=np.int32(self._nrec),
             nens=np.int32(self._nens),
-            nb_concat_len=np.int64(self._fused["nb_concat"].shape[0]),
-            nb_concat=_as_ptr(self._fused["nb_concat"], ctypes.c_int32),
-            rec_coord=_as_ptr(self._fused["rec_coord"].reshape(-1), ctypes.c_double),
-            rec_type=_as_ptr(self._fused["rec_type"], ctypes.c_int16),
-            rec_charge=_as_ptr(self._fused["rec_charge"].reshape(-1), ctypes.c_double),
-            nrec_types=np.int32(self._fused["rc"].shape[0]),
-            nlig_types=np.int32(self._fused["rc"].shape[1]),
-            rc=_as_ptr(self._fused["rc"].reshape(-1), ctypes.c_double),
-            ac=_as_ptr(self._fused["ac"].reshape(-1), ctypes.c_double),
-            emin=_as_ptr(self._fused["emin"].reshape(-1), ctypes.c_double),
-            rmin2=_as_ptr(self._fused["rmin2"].reshape(-1), ctypes.c_double),
-            ivor=_as_ptr(self._fused["ivor"].reshape(-1), ctypes.c_int8),
-            plateaudissq=ctypes.c_double(self._fused["plateaudissq"]),
+            nb_concat_len=np.int64(self._nb["nb_concat"].shape[0]),
+            nb_concat=_as_ptr(self._nb["nb_concat"], ctypes.c_int32),
+            rec_coord=_as_ptr(self._nb["rec_coord"].reshape(-1), ctypes.c_double),
+            rec_type=_as_ptr(self._nb["rec_type"], ctypes.c_int16),
+            rec_charge=_as_ptr(self._nb["rec_charge"].reshape(-1), ctypes.c_double),
+            nrec_types=np.int32(self._nb["rc"].shape[0]),
+            nlig_types=np.int32(self._nb["rc"].shape[1]),
+            rc=_as_ptr(self._nb["rc"].reshape(-1), ctypes.c_double),
+            ac=_as_ptr(self._nb["ac"].reshape(-1), ctypes.c_double),
+            emin=_as_ptr(self._nb["emin"].reshape(-1), ctypes.c_double),
+            rmin2=_as_ptr(self._nb["rmin2"].reshape(-1), ctypes.c_double),
+            ivor=_as_ptr(self._nb["ivor"].reshape(-1), ctypes.c_int8),
+            plateaudissq=ctypes.c_double(self._nb["plateaudissq"]),
         )
         nthreads = int(os.environ.get("OMP_NUM_THREADS", "0")) or (os.cpu_count() or 1)
-        self._fused_cfg = NbRunConfig(
+        self._nb_cfg = NbRunConfig(
             num_threads=np.int32(nthreads), kernel_variant=np.int32(1)
         )
 
-    def _score_nb_fused_batch(self, ens, dofs):
+    def _score_nb_nonbon8_batch(self, ens, dofs):
         ens0 = np.ascontiguousarray(np.asarray(ens, dtype=np.int16) - 1, dtype=np.int16)
         dofs64 = np.ascontiguousarray(
             np.asarray(dofs, dtype=np.float64), dtype=np.float64
@@ -593,27 +586,27 @@ class JaxScoreOracle:
 
         step = NbFusedStepData(
             nposes=np.int32(n),
-            natoms=np.int32(self._fused["lig_coord"].shape[0]),
+            natoms=np.int32(self._nb["lig_coord"].shape[0]),
             dofs=_as_ptr(dofs64.reshape(-1), ctypes.c_double),
             ens=_as_ptr(ens0, ctypes.c_int16),
-            lig_coords=_as_ptr(self._fused["lig_coord"].reshape(-1), ctypes.c_double),
+            lig_coords=_as_ptr(self._nb["lig_coord"].reshape(-1), ctypes.c_double),
             lig_pivot=_as_ptr(pivot, ctypes.c_double),
-            lig_type=_as_ptr(self._fused["lig_type"], ctypes.c_int16),
-            lig_charge=_as_ptr(self._fused["lig_charge"], ctypes.c_double),
+            lig_type=_as_ptr(self._nb["lig_type"], ctypes.c_int16),
+            lig_charge=_as_ptr(self._nb["lig_charge"], ctypes.c_double),
         )
         t0 = time.monotonic()
-        rc = self._fused["fn"](
+        rc = self._nb["fn"](
             ctypes.byref(step),
-            ctypes.byref(self._fused_grid_struct),
-            ctypes.byref(self._fused_global_struct),
-            ctypes.byref(self._fused_cfg),
+            ctypes.byref(self._nb_grid_struct),
+            ctypes.byref(self._nb_global_struct),
+            ctypes.byref(self._nb_cfg),
             _as_ptr(out_e, ctypes.c_double),
             _as_ptr(out_g.reshape(-1), ctypes.c_double),
         )
         self._total_kernel_time += time.monotonic() - t0
         self._total_kernel_calls += 1
         if rc != 0:
-            raise RuntimeError(f"nb_kernel_run_fused failed with error code {rc}")
+            raise RuntimeError(f"nb_kernel_euler_grad failed with error code {rc}")
         return out_e, out_g
 
     def _vg_ensemble(self, ens0: int, dofs_j: jnp.ndarray):
@@ -740,9 +733,9 @@ class JaxScoreOracle:
         gradients : (N, 6) float64
         """
         self._call_count += 1
-        if self._nb_kernel == "fused":
+        if self._nb_kernel == "nonbon8":
             e_pot, g_pot = self.score_potential_batch(ens, dofs)
-            e_nb, g_nb = self._score_nb_fused_batch(ens, dofs)
+            e_nb, g_nb = self._score_nb_nonbon8_batch(ens, dofs)
             return e_pot + e_nb, g_pot + g_nb
 
         # Pure-JAX path (potential + NB in a single AD-evaluated kernel).

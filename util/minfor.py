@@ -10,7 +10,7 @@ minfor (Harwell VA13 variable-metric method):
 - Step extrapolation up to 9x current step
 - DFP Hessian update
 
-Primary path uses ATTRACT-JAX (optionally with fused C++ NB kernel). The
+Primary path uses ATTRACT-JAX (optionally with nonbon8 C++ NB kernel). The
 compiled ATTRACT binary ($ATTRACTDIR) in --score mode remains available as a
 fallback oracle.
 """
@@ -186,9 +186,12 @@ class LegacyScoreOracle:
         self,
         attract_bin,
         attract_par,
+        shm_grid_bin,
+        shm_clean_bin,
         receptor_pdb,
         ligand_pdb,
         ens_list,
+        grid,
         grid_header,
         header,
         tmpdir,
@@ -196,14 +199,29 @@ class LegacyScoreOracle:
     ):
         self.attract_bin = os.path.abspath(attract_bin)
         self.attract_par = os.path.abspath(attract_par)
+        self.shm_grid_bin = os.path.abspath(shm_grid_bin)
+        self.shm_clean_bin = os.path.abspath(shm_clean_bin)
         self.receptor_pdb = os.path.abspath(receptor_pdb)
         self.ligand_pdb = os.path.abspath(ligand_pdb)
         self.ens_list = os.path.abspath(ens_list)
+        self.grid = os.path.abspath(grid)
         self.grid_header = os.path.abspath(grid_header)
         self.header = header
         self.tmpdir = os.path.abspath(tmpdir)
         self.cwd = os.path.abspath(cwd)
         self._call_count = 0
+        # Load grid into shared memory.
+        subprocess.run([self.shm_clean_bin], check=False)
+        subprocess.run([self.shm_grid_bin, self.grid, self.grid_header], check=True)
+
+    def close(self):
+        subprocess.run([self.shm_clean_bin], check=False)
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _run_score(self, dat_path, expected_n):
         cmd = [
@@ -888,9 +906,12 @@ def resolve_attract_paths(test_dir, ligand_pdb=None):
     return {
         "attract_bin": attract_bin,
         "attract_par": attract_par,
+        "shm_grid_bin": os.path.join(attractdir, "shm-grid"),
+        "shm_clean_bin": os.path.join(attractdir, "shm-clean"),
         "receptor_pdb": os.path.join(test_dir, "partner1-ensemble", "model-1r.pdb"),
         "ligand_pdb": ligand_pdb_path,
         "ens_list": os.path.join(test_dir, "partner1-ensemble.list"),
+        "grid": os.path.join(test_dir, "receptorgrid.grid"),
         "grid_header": os.path.join(test_dir, "receptorgrid.gridheader"),
     }
 
@@ -902,7 +923,7 @@ def parse_args():
     ap = argparse.ArgumentParser(
         description=(
             "Batched VA13/DFP minimizer. Primary path: ATTRACT-JAX "
-            "(default, fused NB by default). Legacy ATTRACT --score oracle "
+            "(default, nonbon8 NB by default). Legacy ATTRACT --score oracle "
             "is retained as fallback."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -973,10 +994,10 @@ def parse_args():
     )
     ap.add_argument(
         "--nb-kernel",
-        default="fused",
-        choices=["jax", "fused"],
+        default="nonbon8",
+        choices=["jax", "nonbon8"],
         help=(
-            "JAX-only NB backend: 'fused' (C++ fused NB, default) or "
+            "JAX-only NB backend: 'nonbon8' (C++ nonbon8 NB kernel, default) or "
             "'jax' (pure JAX)"
         ),
     )
@@ -1099,6 +1120,7 @@ def main():
 
     # --- Build oracle ---
     tmpdir_ctx = None
+    oracle = None
     if args.oracle == "jax":
         from jax_scorer import JaxScoreOracle
 
@@ -1133,9 +1155,12 @@ def main():
         oracle = LegacyScoreOracle(
             attract_bin=paths["attract_bin"],
             attract_par=paths["attract_par"],
+            shm_grid_bin=paths["shm_grid_bin"],
+            shm_clean_bin=paths["shm_clean_bin"],
             receptor_pdb=paths["receptor_pdb"],
             ligand_pdb=paths["ligand_pdb"],
             ens_list=paths["ens_list"],
+            grid=paths["grid"],
             grid_header=paths["grid_header"],
             header=header,
             tmpdir=tmpdir,
@@ -1176,6 +1201,8 @@ def main():
     finally:
         if tmpdir_ctx is not None:
             tmpdir_ctx.__exit__(None, None, None)
+        if oracle is not None and hasattr(oracle, "close"):
+            oracle.close()
 
     # --- Convert back to centered if we converted for JAX input ---
     if converted_for_oracle:
