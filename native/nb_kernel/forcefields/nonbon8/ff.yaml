@@ -1,0 +1,26 @@
+# nonbon8 force field metadata
+# Used by the Python framework and C codegen script.
+name: nonbon8
+description: "ATTRACT 8/6 Lennard-Jones with rdie (distance-dependent dielectric)"
+
+# Squared distance cutoff for neighbour list construction (Å^2).
+# Value matches the legacy ATTRACT plateaudis default derived from the .grid file.
+cutoff_sq: auto # read from grid file at runtime
+
+# Plateau correction is applied in the pose loop.
+plateau: true
+
+# Dielectric model: rdie (distance-dependent).  cdie=false is hardcoded.
+cdie: false
+
+# Repulsive LJ exponent.
+potshape: 8
+
+# Rotation schemes supported by this force field.
+# euler_rot.h is always available; rotvec_rot.h is added in a later milestone.
+supported_rotations:
+  - euler
+
+# Gradient support: lj_grad.h and elec_grad.h are present.
+has_lj_grad: true
+has_elec_grad: true

@@ -494,7 +494,14 @@ class JaxScoreOracle:
             subprocess.run(cmd, check=True)
 
         lib = ctypes.CDLL(str(so))
-        fn_fused = lib.nb_kernel_run_fused
+        # Milestone 2: probe for codegen-equivalent symbols first.
+        # nb_kernel_euler_grad is the canonical name emitted by the new template
+        # architecture; nb_kernel_run_fused is the backward-compatible alias.
+        # Both have identical signatures so the rest of this function is unchanged.
+        try:
+            fn_fused = lib.nb_kernel_euler_grad
+        except AttributeError:
+            fn_fused = lib.nb_kernel_run_fused
         fn_fused.argtypes = [
             ctypes.POINTER(NbFusedStepData),
             ctypes.POINTER(NbFusedGridData),
@@ -570,11 +577,15 @@ class JaxScoreOracle:
             plateaudissq=ctypes.c_double(self._fused["plateaudissq"]),
         )
         nthreads = int(os.environ.get("OMP_NUM_THREADS", "0")) or (os.cpu_count() or 1)
-        self._fused_cfg = NbRunConfig(num_threads=np.int32(nthreads), kernel_variant=np.int32(1))
+        self._fused_cfg = NbRunConfig(
+            num_threads=np.int32(nthreads), kernel_variant=np.int32(1)
+        )
 
     def _score_nb_fused_batch(self, ens, dofs):
         ens0 = np.ascontiguousarray(np.asarray(ens, dtype=np.int16) - 1, dtype=np.int16)
-        dofs64 = np.ascontiguousarray(np.asarray(dofs, dtype=np.float64), dtype=np.float64)
+        dofs64 = np.ascontiguousarray(
+            np.asarray(dofs, dtype=np.float64), dtype=np.float64
+        )
         pivot = np.ascontiguousarray(np.asarray(self._lig_pivot_j), dtype=np.float64)
         n = int(dofs64.shape[0])
         out_e = np.zeros((n,), dtype=np.float64)
@@ -745,7 +756,9 @@ class JaxScoreOracle:
             m = end - start
             dofs_j = jnp.array(dofs[start:end], dtype=jnp.float64)
             rc_j = jnp.array(self._rec_coor_ens_np[ens0[start:end]], dtype=jnp.float64)
-            rq_j = jnp.array(self._rec_charge_ens_np[ens0[start:end]], dtype=jnp.float64)
+            rq_j = jnp.array(
+                self._rec_charge_ens_np[ens0[start:end]], dtype=jnp.float64
+            )
             t0 = time.monotonic()
             pad_n = _round_up_batch(m)
             if m < pad_n:

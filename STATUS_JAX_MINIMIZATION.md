@@ -1,4 +1,4 @@
-# JAX Minimization — Current Status (2026-02-28)
+# JAX Minimization — Current Status (2026-03-02)
 
 ## Objective
 
@@ -44,6 +44,42 @@ Current measured conclusion:
 - Full-set post-excision performance remains inconclusive in this snapshot: available post-excision full-run log is partial (through tick 25) and was executed under different load conditions.
 - Pure-JAX NB remains a research path; production scoring/minimization should use `--nb-kernel fused`.
 - Full production-scale minimization on `165528` poses completes successfully with step-complete progress reporting enabled.
+
+## 2026-03-02 Four-Case Script Rerun (Measured)
+
+Rerun root:
+
+- `/tmp/status_case_runs_retry_20260302_163727/`
+- Consolidated validation: `/tmp/status_case_runs_retry_20260302_163727/validation_summary.json`
+
+Case timings (`minfor.py` wall timings captured by the per-case scripts):
+
+| Case | Pregrad | Autodiff | STATUS reference | Check |
+|---|---:|---:|---:|---|
+| `first1000` concat score (`tmp_active_concat.dat`) | `54.229 s` | `51.792 s` | `39.26 s` (pregrad style) | Slower than STATUS baseline (`+38.1%`) |
+| `first10k` concat score (`tmp_active_concat.dat`) | `426.294 s` | `426.722 s` | `323.10 s` (pregrad style) | Slower than STATUS baseline (`+31.9%`) |
+| `first1000` minimization (`systsearch-ens1-first1000.dat`) | `86.333 s` | `69.857 s` | `93.8 s` (pregrad style) | Pregrad faster than STATUS baseline (`-8.0%`) |
+| `first10k` minimization (`systsearch-ens1-first10000.dat`) | `378.791 s` | `402.703 s` | `414.0 s` pregrad, `333.8 s` autodiff | Pregrad faster (`-8.5%`), autodiff slower than isolated `333.8 s` record (`+20.6%`) |
+
+Energy/gradient verification from `.score` outputs:
+
+- `first1000` legacy vs rerun pregrad score (`106003` poses): energy `max_abs=1828.3125`, gradient `max_abs=6621184.0`; median absolute deltas are near zero (`energy 2.84e-14`, `grad 4.24e-08`).
+- `first1000` rerun pregrad vs rerun autodiff score: energy identical (`max_abs=0.0`), gradients differ (`max_abs=35.1103`, `mean_abs=0.7077`), consistent with prior grid-gradient excision behavior.
+- `first10k` rerun pregrad vs rerun autodiff score (`1051136` poses): energy identical (`max_abs=0.0`), gradients differ (`max_abs=36.6500`, `mean_abs=0.7798`).
+- Existing `first10k` reference pregrad score file at `test/first10k/score_jax_fused_first10k_concat_pregridexcise_style.score` is currently empty (`0` bytes), so this specific direct file-vs-file score comparison was skipped.
+
+Minimization energy-array verification against on-disk references:
+
+- `first1000` pregrad rerun vs `test/first1000/minfor_jax_fused_first1000.energy.npy`: `max_abs=10.6788`, `mean_abs=0.1082`, `median_abs=1.91e-06`.
+- `first10k` pregrad rerun vs `test/first10k/minfor_jax_fused_first10k.energy.npy`: `max_abs=13.5494`, `mean_abs=0.1555`, `median_abs=1.91e-06`.
+- `first10k` autodiff rerun vs `test/minfor_jax_fused_first10k_after_gridexcise.energy.npy`: `max_abs=18.4129`, `mean_abs=0.2014`, `median_abs=5.72e-06`.
+
+LRMSD verification:
+
+- `first10k` autodiff rerun LRMSD vs STATUS artifact `test/minfor_jax_fused_first10k_after_gridexcise.lrmsd`: `max_abs=25.119`, `mean_abs=0.2577`, `median_abs=0.0` (large overlap, with outlier tail differences).
+- `first10k` rerun summaries:
+  - pregrad: best `14.413`, median `63.5435`, p10 `43.5241`
+  - autodiff: best `11.017`, median `64.1995`, p10 `43.8858`
 
 ## Architecture Status
 

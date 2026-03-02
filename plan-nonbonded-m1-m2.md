@@ -103,29 +103,61 @@ This roadmap delivers two immediate milestones already agreed (cdie removal and 
 
 ### Test Cases and Scenarios
 
-1. Scoring references (energy+gradient) already on disk:
+1. Canonical rerun scripts (one script per case, each takes `OUT_DIR`):
+- `/home/sjoerd/attract-namespace/test/first1000/test_first1000_concat_score.sh`
+- `/home/sjoerd/attract-namespace/test/first10k/test_first10k_concat_score.sh`
+- `/home/sjoerd/attract-namespace/test/first1000/test_first1000_minimization.sh`
+- `/home/sjoerd/attract-namespace/test/first10k/test_first10k_minimization.sh`
+
+2. Inputs used by the four scripts:
+- `/home/sjoerd/attract-namespace/test/first1000/tmp_active_concat.dat`
+- `/home/sjoerd/attract-namespace/test/first10k/tmp_active_concat.dat`
+- `/home/sjoerd/attract-namespace/test/systsearch-ens1-first1000.dat`
+- `/home/sjoerd/attract-namespace/test/systsearch-ens1-first10000.dat`
+- `/home/sjoerd/attract-namespace/test/receptorgrid.grid`
+- `/home/sjoerd/attract-namespace/test/partner1-ensemble.list`
+- `/home/sjoerd/attract-namespace/test/ligandr.pdb`
+- `/home/sjoerd/data/work/attract-jax/attract-par.npz`
+
+3. Score references for energy/gradient checks:
+- `/home/sjoerd/attract-namespace/test/first1000/score_legacy_first1000_concat_after_gridexcise.score`
+- `/home/sjoerd/attract-namespace/test/first1000/score_jax_fused_first1000_concat_pregridexcise_style.score`
 - `/home/sjoerd/attract-namespace/test/first1000/first1000_target_nb.*.energy.npy`
 - `/home/sjoerd/attract-namespace/test/first1000/first1000_target_nb.*.grad.npy`
 - `/home/sjoerd/attract-namespace/test/first10k/first1000_target_nb.*.energy.npy`
 - `/home/sjoerd/attract-namespace/test/first10k/first1000_target_nb.*.grad.npy`
 
-2. Minimization references on disk (energy/pose/runtime artifacts):
+4. Minimization references on disk (JAX/legacy):
 - `/home/sjoerd/attract-namespace/test/first1000/minfor_jax_fused_first1000.*`
 - `/home/sjoerd/attract-namespace/test/first1000/minfor_legacy_first1000.*`
 - `/home/sjoerd/attract-namespace/test/first10k/minfor_jax_fused_first10k.*`
 - `/home/sjoerd/attract-namespace/test/first10k/minfor_legacy_first10k.*`
+- `/home/sjoerd/attract-namespace/test/minfor_jax_fused_first10k_after_gridexcise.*`
 
-3. Milestone 1-2 scoring gate:
+5. LRMSD reference inputs:
+- `/home/sjoerd/attract-namespace/test/ligand-heavy.pdb`
+- `/home/sjoerd/attract-namespace/test/refe-rmsd-2.pdb`
+- `/home/sjoerd/attract-namespace/test/partner1-ensemble-aa-rmsd.list`
+- `/home/sjoerd/attract-namespace/test/partner1-ensemble/model-1-heavy.pdb`
+
+6. Latest full four-case rerun artifacts (2026-03-02):
+- `/tmp/status_case_runs_retry_20260302_163727/1_first1000_concat/`
+- `/tmp/status_case_runs_retry_20260302_163727/2_first10k_concat/`
+- `/tmp/status_case_runs_retry_20260302_163727/3_first1000_min_rerun/`
+- `/tmp/status_case_runs_retry_20260302_163727/4_first10k_min_rerun/`
+- `/tmp/status_case_runs_retry_20260302_163727/validation_summary.json`
+
+7. Milestone 1-2 scoring gate:
 - Use strict existing harness/score parity behavior (no relaxed threshold).
 
-4. Milestone 1-2 minimization gate:
+8. Milestone 1-2 minimization gate:
 - No pose-by-pose correspondence requirement.
 - Require similar runtime and similar energy/LRMSD distributions (existing decision).
 
-5. Milestone 5-6 gate:
+9. Milestone 5-6 gate:
 - Concat scoring only, first1000 + first10k, harness-strict closeness.
 
-6. Milestone 7 gate:
+10. Milestone 7 gate:
 - No tests required yet.
 
 ---
@@ -139,4 +171,4 @@ This roadmap delivers two immediate milestones already agreed (cdie removal and 
 5. Rotvec is deferred; not part of this roadmap segment.
 6. Follow-up after Milestone 2 starts with codegen implementation.
 7. nonbon12 milestone lands without test obligations for now.
-8. Plan file target remains `/home/sjoerd/attract-namespace/plan-nonbonded-m1-m2.md` unless renamed later.
+8. Plan file target remains `/home/sjoerd/attract-namespace/attract-jax/plan-nonbonded-m1-m2.md` unless renamed later.
