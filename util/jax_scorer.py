@@ -435,6 +435,7 @@ class JaxScoreOracle:
         repo_root = Path(__file__).resolve().parents[2]
         src_candidates.extend(
             [
+                repo_root / "native" / "nb_kernel" / "nb_kernel.cpp",
                 repo_root
                 / "test"
                 / "first1000"
@@ -478,19 +479,23 @@ class JaxScoreOracle:
             t_so = so.stat().st_mtime
             needs = src.stat().st_mtime > t_so or hdr.stat().st_mtime > t_so
         if needs:
-            cmd = [
-                "g++",
-                "-O3",
-                "-DNDEBUG",
-                "-std=c++17",
-                "-march=native",
-                "-fPIC",
-                "-shared",
-                "-fopenmp",
-                str(src),
-                "-o",
-                str(so),
-            ]
+            mk = src.parent / "Makefile"
+            if mk.exists():
+                cmd = ["make", "-C", str(src.parent), f"TARGET={so}"]
+            else:
+                cmd = [
+                    "g++",
+                    "-O3",
+                    "-DNDEBUG",
+                    "-std=c++17",
+                    "-march=native",
+                    "-fPIC",
+                    "-shared",
+                    "-fopenmp",
+                    str(src),
+                    "-o",
+                    str(so),
+                ]
             subprocess.run(cmd, check=True)
 
         lib = ctypes.CDLL(str(so))
