@@ -7,6 +7,7 @@ This roadmap delivers two immediate milestones already agreed (cdie removal and 
 2. Major Section 2 MVP architectural rewrite (manual codegen-equivalent boilerplate), with minimal Python forcefield module wiring.
 3. Implement `codegen` flow end-to-end using a temporary `dummy` forcefield and validate build/discovery.
 4. Validate capability-based codegen emission for grad+energy and energy-only wrappers.
+4a. Add plateau mode support to `pose_loop.h` (clamp vs. correction), validate existing scores are reproduced.
 5. Move to in-house grid generation (replace dependency on external `.grid`) and validate via concat scoring.
 6. Validate in-house grid generation on pure JAX (no C kernel) via concat scoring.
 7. Add `nonbon12 + cdie` implementation (no test requirement yet, per decision).
@@ -36,6 +37,12 @@ This roadmap delivers two immediate milestones already agreed (cdie removal and 
   - `lj_grad.h` + `elec_grad.h` present -> grad+energy wrappers.
   - either gradient header missing -> energy-only wrappers.
 - Confirm Python symbol probing/dispatch correctly selects available wrapper families.
+
+4a. Milestone 4a:
+- Add plateau mode as a template parameter to `pose_loop.h`: `correction` (current behavior: `E(d) - E(plateaudis)`) and `clamp` (grid precomputation: `E(max(d, plateaudis))`).
+- Same split for gradients.
+- Codegen emits wrappers for both modes.
+- Validate that existing concat scoring (first1000 + first10k) is reproduced exactly with `correction` mode — no regression.
 
 5. Milestone 5:
 - Add in-house grid generation interface and remove runtime requirement for external `.grid` files in that path.
@@ -88,6 +95,23 @@ This roadmap delivers two immediate milestones already agreed (cdie removal and 
 - Validate generated symbols are callable and selected correctly by Python.
 - Regression check: where both variants are available, energy-only scoring equals the energy component of grad+energy within strict tolerance.
 
+4a. Milestone 4a: Plateau mode support in `pose_loop.h`
+- Currently `pose_loop.h` hardcodes the NB correction plateau behavior: `E(d) - E(plateaudis)`.
+  Grid precomputation needs the opposite: `E(max(d, plateaudis))` (clamp mode).
+- Add a template parameter (or compile-time flag) to `pose_loop.h` selecting between:
+  - `correction` mode (existing behavior): compute `E(d_actual) - E(plateaudis)` and
+    `G(d_actual) - G(plateaudis)`. Used at runtime for NB correction.
+  - `clamp` mode (new): compute `E(max(d_actual, plateaudis))` and
+    `G(max(d_actual, plateaudis))`. Used for grid precomputation.
+- Codegen (`codegen_ff.py`) must emit wrapper symbols for both modes.
+- The same plateau mode split applies to both LJ and electrostatic terms, and to both
+  energy and gradient paths.
+- **Validation gate:** Run existing concat scoring (first1000 + first10k) with `correction`
+  mode. Scores must be identical to current references — zero regression.
+- The `clamp` mode is not yet validated end-to-end (that happens in M5 when grids are
+  generated in-house). M4a only proves that the mode parameterization compiles, links,
+  and does not break existing behavior.
+
 5. Milestone 5: In-house grid generation (replace external `.grid` dependency)
 - Implement internal grid generation pipeline.
 - Keep existing external-grid path optionally for transition, but target path uses in-house grid artifacts.
@@ -118,19 +142,37 @@ def score_pairs(coords_i, neighbor_data, ff_params, ff_module, backend="jax"):
 
 Both the grid generator (computing potential grid values at voxels) and the runtime NB
 correction (computing NB energy for ligand atoms against their neighbors) call through this
-dispatch. The only difference is how the inputs are prepared:
+dispatch. The differences are:
 - Grid precomputation: `coords_i` = voxel centers, identity rotation, one "pose" per voxel.
 - NB correction: `coords_i` = transformed ligand atom positions, from the pose DOFs.
+- **Plateau distance handling differs between the two uses** (see below).
 
-**C kernel strategy — voxel-as-pose (no kernel restructuring):**
+**Plateau distance correction — grid vs. NB correction:**
+The grid and the NB correction together must produce the correct total energy `E(d_actual)`.
+They split the work using the plateau distance `plateaudis`:
+- **Grid precomputation** stores the energy (and gradients) evaluated with distances clamped
+  *at* plateau distance: `d = max(d_actual, plateaudis)`. This gives a smooth potential that
+  avoids singularities at short range.
+- **Runtime NB correction** computes the difference `E(d_actual) - E(plateaudis)` for each
+  nearby atom pair, adding the missing short-range contribution back. For pairs where
+  `d_actual >= plateaudis`, this correction is zero.
+- The same split applies to gradients: the grid stores gradients at `d = max(d_actual,
+  plateaudis)`, and the NB correction adds the gradient difference.
+- This means `score_pairs()` needs a mode parameter (e.g. `plateau_mode="clamp"|"correction"`)
+  or the grid and NB correction paths must call different energy functions. The dispatch
+  cannot treat them as identical computations with different inputs — the plateau handling
+  is fundamentally different.
+
+**C kernel strategy — voxel-as-pose (no kernel restructuring beyond M4a):**
 The C kernel's only entry point remains `pose_loop.h`. For grid precomputation, each voxel is
 wrapped as a pseudo-pose: rotation = identity, translation = voxel center. The pose loop's
-existing neighbor iteration, parameter loading, and OpenMP parallelism apply unchanged. This
-is a clean hack — `pose_loop.h` is never modified, and there are only two consumers of the
-NB kernel (NB correction and grid precomputation), both served by pose_loop.
+existing neighbor iteration, parameter loading, and OpenMP parallelism apply unchanged.
+There are only two consumers of the NB kernel (NB correction and grid precomputation), both
+served by pose_loop. The plateau mode template parameter added in M4a selects between
+`correction` (runtime NB) and `clamp` (grid precomputation).
 
-The dispatch abstraction lives entirely on the Python side. It does NOT require restructuring
-the C kernel or adding new C entry points.
+The dispatch abstraction lives entirely on the Python side. No new C entry points are needed
+beyond the two wrapper variants (correction + clamp) emitted by codegen in M4a.
 
 **What already exists — DO NOT reimplement:**
 - `util/reproduce_grid_score.py`: contains `read_grid_with_electro()` (grid binary parser,
@@ -169,6 +211,43 @@ the C kernel or adding new C entry points.
   interior voxels using KD-tree pre-filter + energy lower-bound check. This is a post-
   processing optimization, not grid generation. It may be integrated later but is not required
   for M5.
+
+**Critical: voxel corner vs. center conventions (from `make-grid.cpp` / `grid_calculate.cpp`):**
+
+The potential grid and the neighbour grid use **different spatial conventions**. Getting this
+wrong will produce silently incorrect results. The reference implementation is in
+`attract/bin/make-grid.cpp` → `grid_calculate.cpp`.
+
+*Potential grid — values at voxel CORNERS:*
+- Voxel `(i, j, k)` stores the potential at position `ori + (i, j, k) * gridspacing`.
+  There is no half-voxel offset.
+- At scoring time, a ligand atom at continuous position `p` is mapped to fractional voxel
+  coordinates `v = (p - ori) / gridspacing`, and the potential is trilinearly interpolated
+  between the 8 surrounding corner values using `floor(v)` and `ceil(v)` with fractional
+  weights `w = v - floor(v)`.
+- The same convention applies to the gradient channels (gx, gy, gz) stored alongside energy.
+- Reference: `grid_calculate.cpp` uses `diszyx` (no 0.5 offset) for `_calc_potential()`.
+  Scoring: `grid.cpp` `trilin()` uses `floor/ceil` with fractional weights.
+  Python: `reproduce_grid_score.py` `interpolate_grid()` — identical trilinear interpolation.
+
+*Neighbour grid — lists at voxel CENTERS (half-voxel shifted):*
+- The neighbour list for voxel `(i, j, k)` contains receptor atoms within `neighbourdis` of
+  position `ori + (i+0.5, j+0.5, k+0.5) * gridspacing` — the **center** of the voxel, not
+  the corner.
+- At scoring time, the neighbour list is looked up by **nearest-integer rounding**:
+  `floor(v + 0.5)`, which selects the voxel whose center is closest to the ligand atom.
+  There is no interpolation — a single voxel's neighbour list is used.
+- Reference: `grid_calculate.cpp` uses `disjzyx` (shifted by `+0.5*gridspacing` in all axes)
+  for `_calc_neighbours()`. Scoring: `grid.cpp` uses `floor(ax + 0.5)`.
+  Python: `reproduce_grid_score.py` `generate_ind_innergrid()` uses `floor(vox + 0.5)`.
+
+*Outer (big) grid:*
+- Same corner convention for potentials, but at double the spacing.
+- Voxel coordinates: `vox_outer = (vox_inner + gridextension) / 2.0`.
+
+**The in-house grid generator MUST reproduce these exact conventions.** If potential values
+are accidentally computed at voxel centers, or neighbours are built from voxel corners,
+the resulting scores will be wrong by O(gridspacing) in position — enough to fail validation.
 
 **What the in-house grid generator must produce:**
 The `Grid` named tuple fields (see `read_grid_with_electro` return type):
