@@ -39,9 +39,12 @@ This roadmap delivers two immediate milestones already agreed (cdie removal and 
 
 5. Milestone 5:
 - Add in-house grid generation interface and remove runtime requirement for external `.grid` files in that path.
+- Add Python NB dispatch abstraction: a `score_pairs()` function that routes to either JAX (`vmap(ff_module.lj_energy)` etc.) or C kernel (voxel-as-pose via `pose_loop.h`), selected by backend flag.
+- Grid precomputation and NB correction both call through this dispatch — the only difference is input preparation.
 
 6. Milestone 6:
 - Ensure pure JAX path supports in-house grids without C kernel dependency.
+- Validate that the NB dispatch with `backend="jax"` produces identical results to `backend="kernel"` on the same inputs.
 
 7. Milestone 7:
 - Add second FF implementation: nonbon12 + cdie (feature present, no validation gate yet).
@@ -90,9 +93,150 @@ This roadmap delivers two immediate milestones already agreed (cdie removal and 
 - Keep existing external-grid path optionally for transition, but target path uses in-house grid artifacts.
 - Required validation: concat scoring on first1000 + first10k must be **harness-strict** close to current references.
 
+#### Milestone 5 implementation detail
+
+**What to build:** Two things:
+
+**(A) In-house grid generator.** A Python module that generates grid data (potential grids +
+neighbour grids) from receptor ensemble coordinates + force field parameters, replacing the
+legacy ATTRACT `make-grid` C binary. The output must be a data structure compatible with what
+`read_grid_with_electro()` in `util/reproduce_grid_score.py` currently returns (the `Grid`
+named tuple), so that everything downstream — `JaxScoreOracle`, `build_kernel`, the test
+harnesses — works without modification.
+
+**(B) Python NB dispatch abstraction.** A function that presents a uniform interface for
+pairwise NB evaluation and routes to either JAX or the C kernel:
+
+```python
+def score_pairs(coords_i, neighbor_data, ff_params, ff_module, backend="jax"):
+    """Evaluate pairwise NB energy (and optionally gradients) over neighbor lists.
+
+    backend="jax":    vmap(ff_module.lj_energy) + vmap(ff_module.elec_energy)
+    backend="kernel": wrap inputs as pseudo-poses, call pose_loop via ctypes
+    """
+```
+
+Both the grid generator (computing potential grid values at voxels) and the runtime NB
+correction (computing NB energy for ligand atoms against their neighbors) call through this
+dispatch. The only difference is how the inputs are prepared:
+- Grid precomputation: `coords_i` = voxel centers, identity rotation, one "pose" per voxel.
+- NB correction: `coords_i` = transformed ligand atom positions, from the pose DOFs.
+
+**C kernel strategy — voxel-as-pose (no kernel restructuring):**
+The C kernel's only entry point remains `pose_loop.h`. For grid precomputation, each voxel is
+wrapped as a pseudo-pose: rotation = identity, translation = voxel center. The pose loop's
+existing neighbor iteration, parameter loading, and OpenMP parallelism apply unchanged. This
+is a clean hack — `pose_loop.h` is never modified, and there are only two consumers of the
+NB kernel (NB correction and grid precomputation), both served by pose_loop.
+
+The dispatch abstraction lives entirely on the Python side. It does NOT require restructuring
+the C kernel or adding new C entry points.
+
+**What already exists — DO NOT reimplement:**
+- `util/reproduce_grid_score.py`: contains `read_grid_with_electro()` (grid binary parser,
+  returns `Grid` named tuple), `build_kernel()` (returns JAX scoring callable with `.ad` and
+  `.pot_ad` variants), `nonbon()` / `elec_dsq_*()` (JAX pairwise energy functions),
+  `potential_atom_energies()` (trilinear grid interpolation with custom_jvp).
+  **Do not rewrite any of these.** The new grid generator produces a `Grid`-compatible object;
+  existing code consumes it unchanged.
+- `util/jax_scorer.py`: `JaxScoreOracle` — the scoring oracle used by `minfor.py`. Already
+  supports `nb_kernel="jax"` (pure JAX) and `nb_kernel="nonbon8"` (C kernel). Already accepts
+  a `grid_file` path. The change for M5 is to also accept a pre-built `Grid` object (or a
+  new path type pointing to in-house grid output), not to rewrite the oracle.
+- `util/minfor.py`: the CLI entry point. Already has `--grid`, `--oracle jax`,
+  `--nb-kernel nonbon8`, `--attract-par-npz`, `--autodiff-potentials`. **Do not rewrite the
+  CLI or the scoring pipeline.** The only CLI change is to support an alternative to `--grid`
+  that invokes in-house grid generation (e.g. `--generate-grid` with receptor PDB inputs, or
+  auto-generation when `--grid` is not passed).
+- `native/nb_kernel/forcefields/nonbon8/`: Python reference functions (`lj.py`, `elec.py`,
+  `params.py`) and C headers. The in-house grid generator should use the Python energy
+  functions from the force field module (Section 5 of the high-level plan), not hardcode
+  the physics.
+- Test shell scripts: `test/first1000/test_first1000_concat_score.sh` and
+  `test/first10k/test_first10k_concat_score.sh` — these run `minfor.py --score --oracle jax
+  --nb-kernel nonbon8` and compare output against reference `.score` files. **Do not rewrite
+  these scripts.** Validation means: run the existing test scripts (possibly with a modified
+  `--grid` argument pointing to in-house output) and confirm the scores match references.
+
+**Early prototype for reference (not production-ready):**
+- `test-calc-grid-energy.py` (lines 94-103): builds a `cKDTree` from receptor coordinates,
+  queries grid voxel centers, and computes LJ potentials. Single atom type only, no
+  electrostatics, no ensemble support. Use as conceptual reference for the KD-tree approach,
+  but do not try to extend this script — write a clean module.
+
+**Grid culling scripts (optional, not part of M5 core):**
+- `playground/precompute_interior_voxels.py`: patches an existing `.grid` binary to zero out
+  interior voxels using KD-tree pre-filter + energy lower-bound check. This is a post-
+  processing optimization, not grid generation. It may be integrated later but is not required
+  for M5.
+
+**What the in-house grid generator must produce:**
+The `Grid` named tuple fields (see `read_grid_with_electro` return type):
+- `inner_potential_grid`: shape `(nr_vdw_channels, dx, dy, dz, 4)` — energy + 3 gradient
+  components per atom type per voxel.
+- `outer_potential_grid`: same shape, for the outer (coarser) grid region.
+- `inner_elec_grid` / `outer_elec_grid`: electrostatic potential grids.
+- `neighbour_grid`: shape `(dx, dy, dz, max_nr_neighbours)` — receptor atom indices (uint16).
+- `nr_neighbours`: shape `(dx, dy, dz)` — count of neighbours per voxel.
+- `max_nr_neighbours`, `alphabet_atomtypes`, `plateaudis`, `gridspacing`, `dim`, `dim2`,
+  `origin`: scalar/array metadata.
+
+The downstream code indexes into these arrays by position. As long as the shapes and semantics
+match, the source (legacy binary vs. in-house Python) is irrelevant.
+
 6. Milestone 6: In-house grid generation without C kernel (pure JAX)
 - Run same in-house grid pipeline but force NB backend to JAX-only.
 - Required validation: concat scoring only (first1000 + first10k), harness-strict thresholds.
+
+#### Milestone 6 implementation detail
+
+**What M6 actually means:** M5 builds two things: the grid generator and the NB dispatch
+abstraction (`score_pairs()` with `backend="jax"|"kernel"`). M6 confirms that the entire
+pipeline works when `backend="jax"` everywhere — both grid precomputation and runtime scoring.
+This is mostly a validation milestone, not a major implementation milestone.
+
+**What already exists — DO NOT reimplement:**
+- `JaxScoreOracle` with `nb_kernel="jax"`: this path already works. It uses `main_ad` from
+  `build_kernel()` which evaluates both potential grid lookup and NB correction in pure JAX,
+  with gradients via `jax.value_and_grad` + `jax.vmap`. No C code is involved.
+- `util/minfor_nb.py`: pure JAX NB evaluation functions (`build_nb_grad_fn`,
+  `_single_nb_energy`, `nb_energy_vectorized`). These are already used by the `nb_kernel="jax"`
+  path. **Do not rewrite them.**
+- The existing test scripts already support `--nb-kernel jax` (just change the CLI flag from
+  `nonbon8` to `jax` in the invocation — or add a parallel test invocation).
+- The `score_pairs()` dispatch built in M5 — M6 just calls it with `backend="jax"`.
+
+**What to validate for M6:**
+
+1. **Grid precomputation with `backend="jax"`:** The M5 grid generator calls `score_pairs()`
+   to evaluate pairwise energies at each voxel. When `backend="jax"`, this uses
+   `vmap(ff_module.lj_energy)` etc. Confirm the resulting grid is numerically identical
+   (within tolerance) to the grid produced with `backend="kernel"`.
+2. **Runtime scoring with `--nb-kernel jax`:** Run the concat scoring test scripts with
+   `--nb-kernel jax` and the in-house grid from step 1. Confirm scores match references
+   within harness-strict tolerance.
+3. **Cross-backend consistency:** `score_pairs(..., backend="jax")` and
+   `score_pairs(..., backend="kernel")` must agree within strict tolerance on the same inputs.
+   This is a unit-level check on the dispatch itself, independent of the full scoring pipeline.
+
+**What to build for M6:**
+- A variant of the concat scoring test scripts (or a flag/mode in the existing ones) that
+  runs with `--nb-kernel jax` instead of `--nb-kernel nonbon8`.
+- A unit test for `score_pairs()` cross-backend consistency (same inputs, both backends,
+  compare outputs).
+
+**What M6 is NOT:**
+- It is NOT a rewrite of the JAX scoring pipeline.
+- It is NOT a new grid format or new grid generator.
+- It is NOT a new test harness. The existing `test_first1000_concat_score.sh` /
+  `test_first10k_concat_score.sh` scripts are the validation mechanism — either modified to
+  also run the `--nb-kernel jax` variant, or accompanied by a thin wrapper that does so.
+
+**Key risk for agents:** An agent reading "In-house grid generation without C kernel (pure JAX)"
+may interpret this as "implement a pure-JAX grid generation + scoring system from scratch."
+This is wrong. The pure JAX scoring path already exists (`nb_kernel="jax"`). The in-house grid
+generator and NB dispatch are built in M5. M6 is the *intersection*: confirm everything works
+together with `backend="jax"`, and that the two backends agree.
 
 7. Milestone 7: nonbon12 + cdie implementation
 - Add forcefield implementation and integration points.
