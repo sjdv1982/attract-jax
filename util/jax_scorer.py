@@ -21,6 +21,7 @@ Interface
 import os
 import ctypes
 import subprocess
+import sys
 
 # Keep host memory bounded on CPU — set before importing jax.
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
@@ -153,12 +154,14 @@ class JaxScoreOracle:
         energy_batch: int = 256,
         nb_kernel: str = "jax",
         autodiff_potentials: bool = False,
+        energy_only: bool = False,
     ):
         _ = cdie  # Milestone 1: nonbon8 + rdie fixed, keep arg for compatibility.
         self.energy_batch = int(max(1, energy_batch))
         self._call_count = 0
         self._total_kernel_calls = 0
         self._total_kernel_time = 0.0
+        self._energy_only = bool(energy_only)
 
         # --- Load receptor ensemble ---
         with open(receptor_ens_list) as f:
@@ -333,6 +336,7 @@ class JaxScoreOracle:
         # Uses main_ad (fully JIT-compilable, no Python control flow).
         kernel_ad = kernel_main.ad
         kernel_pot_ad = kernel_main.pot_ad
+        self._kernel_pot_ad = kernel_pot_ad
         if kernel_ad is not None:
 
             def _single_energy(dof_1d, rec_coor, rec_charge_scaled):
@@ -377,17 +381,22 @@ class JaxScoreOracle:
 
             _pot_vg_single = jax.value_and_grad(_single_potential_energy)
             self._pot_vg_single = jax.jit(_pot_vg_single)
+            self._pot_e_single = jax.jit(_single_potential_energy)
             # vmap over (dof, rec_coor, rec_charge): each pose carries its own
             # receptor data. At large scale this avoids per-ensemble Python dispatch.
             _vg_batch = jax.jit(jax.vmap(_vg_single, in_axes=(0, 0, 0)))
             self._vg_batch = _vg_batch
             _pot_vg_batch = jax.jit(jax.vmap(_pot_vg_single, in_axes=(0, 0, 0)))
             self._pot_vg_batch = _pot_vg_batch
+            _pot_e_batch = jax.jit(jax.vmap(self._pot_e_single, in_axes=(0, 0, 0)))
+            self._pot_e_batch = _pot_e_batch
         else:
             self._vg_single = None
             self._vg_batch = None
             self._pot_vg_single = None
             self._pot_vg_batch = None
+            self._pot_e_single = None
+            self._pot_e_batch = None
 
         if self._nb_kernel == "nonbon8":
             self._init_nonbon8_backend(
@@ -422,80 +431,38 @@ class JaxScoreOracle:
         ivor,
         plateaudissq,
     ):
-        env_src = os.environ.get("NB_KERNEL_CPP")
-        src_candidates = []
-        if env_src:
-            src_candidates.append(Path(env_src))
+        repo_root = Path(__file__).resolve().parents[1]
+        kernel_root = repo_root / "native" / "nb_kernel"
+        if not kernel_root.exists():
+            raise RuntimeError(f"Missing kernel root: {kernel_root}")
 
-        repo_root = Path(__file__).resolve().parents[2]
-        src_candidates.extend(
-            [
-                repo_root / "native" / "nb_kernel" / "nb_kernel.cpp",
-                repo_root
-                / "test"
-                / "first1000"
-                / "nb_kernel_harness"
-                / "src"
-                / "nb_kernel.cpp",
-                repo_root
-                / "test"
-                / "first10k"
-                / "nb_kernel_harness"
-                / "src"
-                / "nb_kernel.cpp",
+        if str(kernel_root) not in sys.path:
+            sys.path.insert(0, str(kernel_root))
+        from forcefields import bind_kernel_dispatch, find_kernel_so, load_forcefield
+
+        ff_module = load_forcefield("forcefields.nonbon8")
+        lib = find_kernel_so(ff_module)
+        so = kernel_root / "nb_kernel_nonbon8.so"
+        if lib is None:
+            if not so.exists():
+                subprocess.run(
+                    ["make", "-C", str(kernel_root), "nb_kernel_nonbon8.so"],
+                    check=True,
+                )
+            lib = ctypes.CDLL(str(so))
+
+        dispatch, fn_nb_grad, fn_nb_energy = bind_kernel_dispatch(lib, rotation="euler")
+        if fn_nb_grad is not None:
+            fn_nb_grad.argtypes = [
+                ctypes.POINTER(NbFusedStepData),
+                ctypes.POINTER(NbFusedGridData),
+                ctypes.POINTER(NbGlobalData),
+                ctypes.POINTER(NbRunConfig),
+                ctypes.POINTER(ctypes.c_double),
+                ctypes.POINTER(ctypes.c_double),
             ]
-        )
-        cwd = Path.cwd().resolve()
-        for base in [cwd, *cwd.parents]:
-            src_candidates.extend(
-                [
-                    base
-                    / "test"
-                    / "first1000"
-                    / "nb_kernel_harness"
-                    / "src"
-                    / "nb_kernel.cpp",
-                    base
-                    / "test"
-                    / "first10k"
-                    / "nb_kernel_harness"
-                    / "src"
-                    / "nb_kernel.cpp",
-                ]
-            )
-        src = next((p for p in src_candidates if p.exists()), None)
-        if src is None:
-            raise RuntimeError("Could not locate nb_kernel.cpp for nonbon8 NB backend")
-        hdr = src.with_name("nb_kernel.h")
-        so = Path(__file__).resolve().parent / "libnbkernel_nonbon8.so"
-
-        needs = True
-        if so.exists():
-            t_so = so.stat().st_mtime
-            needs = src.stat().st_mtime > t_so or hdr.stat().st_mtime > t_so
-        if needs:
-            mk = src.parent / "Makefile"
-            if mk.exists():
-                cmd = ["make", "-C", str(src.parent), f"TARGET={so}"]
-            else:
-                cmd = [
-                    "g++",
-                    "-O3",
-                    "-DNDEBUG",
-                    "-std=c++17",
-                    "-march=native",
-                    "-fPIC",
-                    "-shared",
-                    "-fopenmp",
-                    str(src),
-                    "-o",
-                    str(so),
-                ]
-            subprocess.run(cmd, check=True)
-
-        lib = ctypes.CDLL(str(so))
-        fn_nb = lib.nb_kernel_euler_grad
-        fn_nb.argtypes = [
+            fn_nb_grad.restype = ctypes.c_int
+        fn_nb_energy.argtypes = [
             ctypes.POINTER(NbFusedStepData),
             ctypes.POINTER(NbFusedGridData),
             ctypes.POINTER(NbGlobalData),
@@ -503,7 +470,7 @@ class JaxScoreOracle:
             ctypes.POINTER(ctypes.c_double),
             ctypes.POINTER(ctypes.c_double),
         ]
-        fn_nb.restype = ctypes.c_int
+        fn_nb_energy.restype = ctypes.c_int
 
         ng = np.asarray(grid.neighbour_grid, dtype=np.int32)
         nr_neigh = np.asarray(grid.nr_neighbours, dtype=np.int32).reshape(-1)
@@ -522,7 +489,9 @@ class JaxScoreOracle:
 
         self._nb = {
             "lib": lib,
-            "fn": fn_nb,
+            "dispatch": dispatch,
+            "fn_grad": fn_nb_grad,
+            "fn_energy": fn_nb_energy,
             "grid_nr_neigh": np.ascontiguousarray(nr_neigh, dtype=np.int32),
             "grid_nb_start": np.ascontiguousarray(nb_start, dtype=np.int64),
             "nb_concat": np.ascontiguousarray(nb_concat, dtype=np.int32),
@@ -574,16 +543,9 @@ class JaxScoreOracle:
             num_threads=np.int32(nthreads), kernel_variant=np.int32(1)
         )
 
-    def _score_nb_nonbon8_batch(self, ens, dofs):
-        ens0 = np.ascontiguousarray(np.asarray(ens, dtype=np.int16) - 1, dtype=np.int16)
-        dofs64 = np.ascontiguousarray(
-            np.asarray(dofs, dtype=np.float64), dtype=np.float64
-        )
+    def _run_nb_energy_kernel(self, ens0: np.ndarray, dofs64: np.ndarray, out_e: np.ndarray):
         pivot = np.ascontiguousarray(np.asarray(self._lig_pivot_j), dtype=np.float64)
         n = int(dofs64.shape[0])
-        out_e = np.zeros((n,), dtype=np.float64)
-        out_g = np.zeros((n, 6), dtype=np.float64)
-
         step = NbFusedStepData(
             nposes=np.int32(n),
             natoms=np.int32(self._nb["lig_coord"].shape[0]),
@@ -595,18 +557,75 @@ class JaxScoreOracle:
             lig_charge=_as_ptr(self._nb["lig_charge"], ctypes.c_double),
         )
         t0 = time.monotonic()
-        rc = self._nb["fn"](
+        rc = self._nb["fn_energy"](
             ctypes.byref(step),
             ctypes.byref(self._nb_grid_struct),
             ctypes.byref(self._nb_global_struct),
             ctypes.byref(self._nb_cfg),
             _as_ptr(out_e, ctypes.c_double),
-            _as_ptr(out_g.reshape(-1), ctypes.c_double),
+            None,
         )
         self._total_kernel_time += time.monotonic() - t0
         self._total_kernel_calls += 1
         if rc != 0:
-            raise RuntimeError(f"nb_kernel_euler_grad failed with error code {rc}")
+            raise RuntimeError(f"nb_kernel_euler_energy failed with error code {rc}")
+
+    def _score_nb_nonbon8_batch(self, ens, dofs, compute_grad: bool = True):
+        ens0 = np.ascontiguousarray(np.asarray(ens, dtype=np.int16) - 1, dtype=np.int16)
+        dofs64 = np.ascontiguousarray(
+            np.asarray(dofs, dtype=np.float64), dtype=np.float64
+        )
+        n = int(dofs64.shape[0])
+        out_e = np.zeros((n,), dtype=np.float64)
+        out_g = np.zeros((n, 6), dtype=np.float64)
+
+        if not compute_grad:
+            self._run_nb_energy_kernel(ens0, dofs64, out_e)
+            return out_e, out_g
+
+        pivot = np.ascontiguousarray(np.asarray(self._lig_pivot_j), dtype=np.float64)
+        step = NbFusedStepData(
+            nposes=np.int32(n),
+            natoms=np.int32(self._nb["lig_coord"].shape[0]),
+            dofs=_as_ptr(dofs64.reshape(-1), ctypes.c_double),
+            ens=_as_ptr(ens0, ctypes.c_int16),
+            lig_coords=_as_ptr(self._nb["lig_coord"].reshape(-1), ctypes.c_double),
+            lig_pivot=_as_ptr(pivot, ctypes.c_double),
+            lig_type=_as_ptr(self._nb["lig_type"], ctypes.c_int16),
+            lig_charge=_as_ptr(self._nb["lig_charge"], ctypes.c_double),
+        )
+        family = self._nb["dispatch"].family
+
+        if family == "grad_energy":
+            t0 = time.monotonic()
+            rc = self._nb["fn_grad"](
+                ctypes.byref(step),
+                ctypes.byref(self._nb_grid_struct),
+                ctypes.byref(self._nb_global_struct),
+                ctypes.byref(self._nb_cfg),
+                _as_ptr(out_e, ctypes.c_double),
+                _as_ptr(out_g.reshape(-1), ctypes.c_double),
+            )
+            self._total_kernel_time += time.monotonic() - t0
+            self._total_kernel_calls += 1
+            if rc != 0:
+                raise RuntimeError(f"nb_kernel_euler_grad failed with error code {rc}")
+            return out_e, out_g
+
+        # Energy-only kernel fallback: approximate NB gradients by central FD.
+        self._run_nb_energy_kernel(ens0, dofs64, out_e)
+        for d in range(6):
+            dofs_plus = dofs64.copy()
+            dofs_minus = dofs64.copy()
+            dofs_plus[:, d] += FD_DELTA[d]
+            dofs_minus[:, d] -= FD_DELTA[d]
+
+            e_plus = np.zeros((n,), dtype=np.float64)
+            e_minus = np.zeros((n,), dtype=np.float64)
+            self._run_nb_energy_kernel(ens0, dofs_plus, e_plus)
+            self._run_nb_energy_kernel(ens0, dofs_minus, e_minus)
+            out_g[:, d] = (e_plus - e_minus) / (2.0 * FD_DELTA[d])
+
         return out_e, out_g
 
     def _vg_ensemble(self, ens0: int, dofs_j: jnp.ndarray):
@@ -733,6 +752,17 @@ class JaxScoreOracle:
         gradients : (N, 6) float64
         """
         self._call_count += 1
+        if self._energy_only:
+            if self._nb_kernel == "nonbon8":
+                e_pot = self.score_potential_energy_batch(ens, dofs)
+                e_nb, _ = self._score_nb_nonbon8_batch(ens, dofs, compute_grad=False)
+                gradients = np.zeros((len(dofs), 6), dtype=np.float64)
+                return e_pot + e_nb, gradients
+
+            energies = self._energy_batch_raw(np.asarray(ens), np.asarray(dofs))
+            gradients = np.zeros((len(dofs), 6), dtype=np.float64)
+            return energies, gradients
+
         if self._nb_kernel == "nonbon8":
             e_pot, g_pot = self.score_potential_batch(ens, dofs)
             e_nb, g_nb = self._score_nb_nonbon8_batch(ens, dofs)
@@ -765,6 +795,48 @@ class JaxScoreOracle:
             self._total_kernel_time += time.monotonic() - t0
             self._total_kernel_calls += 1
         return energies, gradients
+
+    def score_potential_energy_batch(self, ens, dofs):
+        """Score potential-grid contribution only (energy-only)."""
+        n = len(dofs)
+        ens0 = np.asarray(ens, dtype=np.intp) - 1
+        energies = np.zeros(n, dtype=np.float64)
+
+        chunk = self.energy_batch
+        for start in range(0, n, chunk):
+            end = min(start + chunk, n)
+            m = end - start
+            dofs_j = jnp.array(dofs[start:end], dtype=jnp.float64)
+            rc_j = jnp.array(self._rec_coor_ens_np[ens0[start:end]], dtype=jnp.float64)
+            rq_j = jnp.array(
+                self._rec_charge_ens_np[ens0[start:end]], dtype=jnp.float64
+            )
+            pad_n = _round_up_batch(m)
+            if m < pad_n:
+                dofs_j = jnp.pad(dofs_j, ((0, pad_n - m), (0, 0)))
+                rc_j = jnp.pad(rc_j, ((0, pad_n - m), (0, 0), (0, 0)))
+                rq_j = jnp.pad(rq_j, ((0, pad_n - m), (0, 0)))
+            t0 = time.monotonic()
+            _, e_b = self._kernel_pot_ad(
+                dofs_j,
+                rc_j,
+                self._rec_atomtypes_ff_j,
+                rq_j,
+                self._coor_lig_j,
+                self._lig_atomtypes_ff_j,
+                self._lig_vdw_channel_idx_j,
+                self._lig_charge_raw_j,
+                self._lig_charge_scaled_j,
+                self._ff,
+                self._grid_j,
+                self._lig_pivot_j,
+            )
+            e_b.block_until_ready()
+            self._total_kernel_time += time.monotonic() - t0
+            self._total_kernel_calls += 1
+            energies[start:end] = np.asarray(e_b[:m])
+
+        return energies
 
     def score_potential_batch(self, ens, dofs):
         """Score potential-grid contribution only (no NB correction)."""

@@ -17,7 +17,7 @@
 
 ## Current Facts (Measured)
 
-All measurements in this table are from 2026-02-28.
+Measurements in this table are from 2026-02-28, 2026-03-01, and 2026-03-02.
 
 | Path | Dataset | Metric | Result | Legacy Delta | Status (Measured/Expected) |
 |---|---|---|---|---|---|
@@ -27,21 +27,33 @@ All measurements in this table are from 2026-02-28.
 | Production path (`minfor.py --score --oracle jax --nb-kernel fused`) | `first1000` active-only concat, normal grid (`106003` poses) | Adjusted wall time | `29.07 s` (`39.26 - 10.19`) | `-3.2%` faster than matched legacy run | Measured |
 | Legacy reference (`attract --score`) | `first10k` active-only concat, normal grid (`1051136` poses) | Adjusted wall time | `335.78 s` (`336.06 - 0.28`) | Baseline | Measured |
 | Production path (`minfor.py --score --oracle jax --nb-kernel fused`) | `first10k` active-only concat, normal grid (`1051136` poses) | Adjusted wall time | `311.50 s` (`323.10 - 11.60`) | `-7.2%` faster than matched legacy run | Measured |
+| Production path (`minfor.py --score --oracle jax --nb-kernel fused`, torque-matrix rotational reduction) | `first10k` active-only concat, normal grid (`1051136` poses) | Adjusted wall time | `308.82 s` (`318.19 - 9.37`) | `-8.0%` faster than matched legacy run, `-0.86%` vs prior fused score baseline (`311.50 s`) | Measured |
 | Legacy minimization (`minfor.py`, legacy oracle) | `first1000` (`systsearch-ens1-first1000.dat`) | Total wall time | `85.6 s` | Baseline | Measured |
 | Production minimization (`minfor.py --oracle jax --nb-kernel fused`) | `first1000` (`systsearch-ens1-first1000.dat`) | Total wall time | `93.8 s` | `+9.6%` slower than matched legacy run | Measured |
 | Legacy minimization (`minfor.py`, legacy oracle) | `first10k` (`systsearch-ens1-first10000.dat`) | Total wall time | `457.0 s` | Baseline | Measured |
 | Production minimization (`minfor.py --oracle jax --nb-kernel fused`) | `first10k` (`systsearch-ens1-first10000.dat`) | Total wall time | `414.0 s` | `-9.4%` faster than matched legacy run | Measured |
-| Production minimization (post grid-gradient excision, `minfor.py --oracle jax --nb-kernel fused --autodiff-potentials`) | `first10k` (`systsearch-ens1-first10000.dat`) | Minimizer wall time / total wall time | `324.5 s` / `333.8 s` | `-21.6%` vs prior fused (`414.0 s`) and `-27.0%` vs legacy (`457.0 s`) | Measured |
+| Production minimization (post grid-gradient excision, `minfor.py --oracle jax --nb-kernel fused --autodiff-potentials`) | `first10k` (`systsearch-ens1-first10000.dat`) | Minimizer wall time / total wall time | `324.5 s` / `333.8 s` | `-21.6%` vs prior fused (`414.0 s`) and `-27.0%` vs legacy (`457.0 s`) | Measured (suspected outlier; reproducibility pending) |
+| Production minimization (`--autodiff-potentials`, torque-matrix rotational reduction in fused NB) | `first10k` (`systsearch-ens1-first10000.dat`) | Minimizer wall time / total wall time | `401.4 s` / `412.2 s` | close to prior fused baseline (`414.0 s`), much slower than the isolated `333.8 s` record | Measured |
 | Fused score correctness gate (pre vs post grid-gradient excision) | `first1000` active-only concat (`106003` poses) | Energy/gradient agreement | Energy identical (`max_abs=0.0`), gradients close but not bitwise-identical (`max_abs=35.11` at ~`1e9` scale) | Confirms no energy regression from excision | Measured |
 | Production minimization (`minfor.py --oracle jax --nb-kernel fused --report-step-complete`) | full `systsearch-ens1.dat` (`165528` poses) | Total wall time | `5723.6 s` | no matched full-set legacy run recorded in this snapshot | Measured |
 | Production minimization (post grid-gradient excision, streaming run) | full `systsearch-ens1.dat` (`165528` poses) | Early-run checkpoint only | up to tick `25` (`1421.1 s`) recorded | not comparable to final wall time; run not completed in this log | Measured (partial) |
+| Production minimization (`--autodiff-potentials`, run 1) | full `systsearch-ens1.dat` (`165528` poses) | Minimizer wall time / total wall time | `6259.0 s` / `6319.3 s` | `+5.2%` slower than latest stored-gradient run (`5958.7 s` total wall) | Measured |
+| Production minimization (`--autodiff-potentials`, run 2) | full `systsearch-ens1.dat` (`165528` poses) | Minimizer wall time / total wall time | `6240.5 s` / `6300.1 s` | `+5.7%` slower than latest stored-gradient run (`5958.7 s` total wall) | Measured |
+| Production minimization (default stored gradients + custom JVP, run 1) | full `systsearch-ens1.dat` (`165528` poses) | Minimizer wall time / total wall time | `5901.3 s` / `5958.7 s` | fastest among the 2026-03-01 full-run trio | Measured |
+| RMSD analysis (`--autodiff-potentials`, run 1) | full `systsearch-ens1.dat` top-1000-by-energy | best-10 LRMSD summary | best LRMSD `1.948`, median LRMSD(top1000) `51.292` | top-10 LRMSD list with ranks recorded | Measured |
+| RMSD analysis (`--autodiff-potentials`, run 2) | full `systsearch-ens1.dat` top-1000-by-energy | best-10 LRMSD summary | best LRMSD `1.948`, median LRMSD(top1000) `51.292` | identical to run 1 on this metric | Measured |
+| RMSD analysis (default stored gradients + custom JVP, run 1) | full `systsearch-ens1.dat` top-1000-by-energy | best-10 LRMSD summary | best LRMSD `3.151`, median LRMSD(top1000) `50.824` | better median, weaker best-hit than autodiff runs | Measured |
+| LRMSD stability check (first10k, torque-matrix vs prior post-excision run) | `systsearch-ens1-first10000.dat` (`10000` poses) | per-pose LRMSD delta (`torque - prior`) | mean `+0.012`, median `0.000`, mean abs `0.258`, unchanged `5511/10000` poses | no material LRMSD distribution shift | Measured |
 
 Current measured conclusion:
 
 - Potential-grid path remains near parity (`~7-9%` slower than legacy on zero-NB benchmarks).
-- Production fused-NB path is faster than legacy on measured `first10k` minimization with `--autodiff-potentials` (`324.5 s` minimizer wall time, `333.8 s` total wall).
+- Production fused-NB score path remains faster than legacy on measured `first10k` active-concat scoring (`308.82 s` adjusted vs legacy `335.78 s`).
 - Grid-gradient excision (`--autodiff-potentials`) preserved fused energy outputs on `first1000` pre-vs-post comparison (`max_abs=0.0`), while gradients changed (not bitwise-identical).
-- Full-set post-excision performance remains inconclusive in this snapshot: available post-excision full-run log is partial (through tick 25) and was executed under different load conditions.
+- Full-set controlled reruns (2026-03-01) show stored gradients + custom JVP is faster than autodiff on wall time for this workload (`5958.7 s` vs `~6300 s`).
+- Full-set RMSD trade-off (top-1000-by-energy): autodiff found a lower best LRMSD hit (`1.948`) while stored-gradient mode had a slightly better median LRMSD (`50.824` vs `51.292`).
+- First10k minimization rerun on 2026-03-02 with torque-matrix rotational reduction (`401.4 s` minimizer / `412.2 s` total) is consistent with the historical fused baseline (`414.0 s`) and does not reproduce the isolated `333.8 s` record.
+- The 2026-02-28 `333.8 s` first10k post-excision result is treated as a suspected outlier until reproduced under the same controlled benchmark protocol.
 - Pure-JAX NB remains a research path; production scoring/minimization should use `--nb-kernel fused`.
 - Full production-scale minimization on `165528` poses completes successfully with step-complete progress reporting enabled.
 
@@ -81,6 +93,40 @@ LRMSD verification:
   - pregrad: best `14.413`, median `63.5435`, p10 `43.5241`
   - autodiff: best `11.017`, median `64.1995`, p10 `43.8858`
 
+## Energy-Only Score Output Update (2026-03-04)
+
+Objective of this update:
+
+- Add `--energy-only` support in `minfor.py` for `--score` mode.
+- Ensure both subsystems run in energy-only mode under this flag:
+  - JAX potential-grid path: no potential-gradient AD path.
+  - NB kernel path: energy wrapper (`nb_kernel_euler_energy`) only.
+- Keep score output in legacy-style energy blocks without `Gradients:` lines.
+
+Final measured timings (`conda run -n jax python util/minfor.py ... --score --energy-only --oracle jax --nb-kernel nonbon8`):
+
+| Case | Poses | Wall time |
+|---|---:|---:|
+| `first1000` concat (`test/first1000/tmp_active_concat.dat`) | `106003` | `50.455 s` |
+| `first10k` concat (`test/first10k/tmp_active_concat.dat`) | `1051136` | `362.386 s` |
+
+Energy comparison against stored gradient-block references (roundoff-scale differences accepted):
+
+| Case | Stored reference | Energy lines | `max_abs` | `mean_abs` | `Gradients:` present in new output |
+|---|---|---:|---:|---:|---|
+| `first1000` concat | `/tmp/status_case_runs_retry_20260302_163727/1_first1000_concat/score_jax_fused_first1000_concat_pregridexcise_style.score` | `106003` | `0.0625` | `1.373e-06` | `no` |
+| `first10k` concat | `/tmp/status_case_runs_retry_20260302_163727/2_first10k_concat/score_jax_fused_first10k_concat_pregridexcise_style.score` | `1051136` | `64.0` | `9.433e-05` | `no` |
+
+Observed speedup versus the intermediate run where NB still used grad wrappers (`2026-03-04`):
+
+- `first1000`: `98.950 s -> 50.455 s` (`~1.96x` faster).
+- `first10k`: `383.840 s -> 362.386 s` (`~5.6%` faster).
+
+Artifacts:
+
+- Final run outputs/timings: `/tmp/m4_energy_only_v5_20260304_124319/`
+- Final comparison JSON: `/tmp/m4_energy_only_v5_20260304_124319/energy_compare.json`
+
 ## Architecture Status
 
 ### Research Path (JAX-only)
@@ -106,6 +152,43 @@ Status:
   - optional: `--autodiff-potentials` (AD path, no stored grid gradients)
 - End-to-end score and minimization benchmarks on `first1000` and `first10k` have been executed.
 - Legacy-comparable criterion (`+/-10%`) is met on the measured `first10k` runs in this snapshot.
+- Full-set repeatability check has been run for both modes (two autodiff runs, one stored-gradient run).
+
+### Full-Set RMSD Detail (2026-03-01)
+
+Top-1000-by-energy, best 10 LRMSD values and their energy ranks:
+
+`--autodiff-potentials` run 1 and run 2 (identical):
+
+1. LRMSD `1.948` at energy-rank `47`
+2. LRMSD `2.857` at energy-rank `28`
+3. LRMSD `3.118` at energy-rank `14`
+4. LRMSD `3.155` at energy-rank `13`
+5. LRMSD `6.824` at energy-rank `679`
+6. LRMSD `7.147` at energy-rank `559`
+7. LRMSD `17.912` at energy-rank `368`
+8. LRMSD `17.943` at energy-rank `367`
+9. LRMSD `18.559` at energy-rank `199`
+10. LRMSD `18.565` at energy-rank `200`
+
+Default stored-gradients run:
+
+1. LRMSD `3.151` at energy-rank `23`
+2. LRMSD `3.182` at energy-rank `7`
+3. LRMSD `5.653` at energy-rank `49`
+4. LRMSD `5.734` at energy-rank `405`
+5. LRMSD `6.891` at energy-rank `771`
+6. LRMSD `11.112` at energy-rank `225`
+7. LRMSD `14.004` at energy-rank `507`
+8. LRMSD `15.259` at energy-rank `82`
+9. LRMSD `16.665` at energy-rank `295`
+10. LRMSD `17.331` at energy-rank `538`
+
+Artifacts:
+
+- `test/minfor_jax_fused_full_systsearch_autodiff1.{log,time,dat,energy.npy,lrmsd,top1000_best10_lrmsd.json}`
+- `test/minfor_jax_fused_full_systsearch_autodiff2.{log,time,dat,energy.npy,lrmsd,top1000_best10_lrmsd.json}`
+- `test/minfor_jax_fused_full_systsearch_pregrad1.{log,time,dat,energy.npy,lrmsd,top1000_best10_lrmsd.json}`
 
 ## What Is Obsolete
 

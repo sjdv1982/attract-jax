@@ -571,11 +571,14 @@ def build_kernel(
         )
 
     if use_precomputed_grid_gradients:
+
         @jit
         def potential_atom_energies(
             all_coors_lig, lig_vdw_channel_idx0, lig_charge_raw0, grid0
         ):
-            vdw_eg = potential_atom_energrads(all_coors_lig, lig_vdw_channel_idx0, grid0)
+            vdw_eg = potential_atom_energrads(
+                all_coors_lig, lig_vdw_channel_idx0, grid0
+            )
             ans = vdw_eg[:, :, 0]
             if n_charged > 0:
                 # Evaluate electrostatic interpolation only for charged ligand atoms.
@@ -597,7 +600,9 @@ def build_kernel(
         @jit
         def potential_atom_energies_jvp(primals, tangents):
             all_coors_lig, lig_vdw_channel_idx0, lig_charge_raw0, grid0 = primals
-            vdw_eg = potential_atom_energrads(all_coors_lig, lig_vdw_channel_idx0, grid0)
+            vdw_eg = potential_atom_energrads(
+                all_coors_lig, lig_vdw_channel_idx0, grid0
+            )
             ans = vdw_eg[:, :, 0]
             atom_grad = -vdw_eg[:, :, 1:4]
             if n_charged > 0:
@@ -619,14 +624,16 @@ def build_kernel(
                 atom_grad = atom_grad - g_el
             tangent = (atom_grad * tangents[0]).sum(axis=2)
             return ans, tangent
+
     else:
+
         @jit
         def potential_atom_energies(
             all_coors_lig, lig_vdw_channel_idx0, lig_charge_raw0, grid0
         ):
-            vdw_e = potential_atom_energrads(all_coors_lig, lig_vdw_channel_idx0, grid0)[
-                :, :, 0
-            ]
+            vdw_e = potential_atom_energrads(
+                all_coors_lig, lig_vdw_channel_idx0, grid0
+            )[:, :, 0]
             ans = vdw_e
             if n_charged > 0:
                 all_coors_ch = all_coors_lig[:, charged_idx_j, :]
@@ -1082,7 +1089,14 @@ def build_kernel(
         lig_pivot0,
     ):
         # Signature mirrors main_ad for easy reuse in jax_scorer.
-        del coor_rec, rec_atomtypes, rec_charge_scaled0, lig_atomtypes0, lig_charge_scaled0, ff0
+        del (
+            coor_rec,
+            rec_atomtypes,
+            rec_charge_scaled0,
+            lig_atomtypes0,
+            lig_charge_scaled0,
+            ff0,
+        )
         mats = dofs_to_mats(dofs, lig_pivot0)
         all_coors_lig = transform_ligand(mats, coor_lig0)
         pot_e = potential_atom_energies(

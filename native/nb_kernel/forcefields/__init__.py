@@ -19,7 +19,9 @@ Discovery helpers (Section 5.6 of PLAN_NONBONDED_FORCEFIELD.md):
 import ctypes
 import importlib
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional, Tuple
 
 # Required attributes for a valid force field module.
 _REQUIRED_ATTRS = ("lj_energy", "elec_energy", "load_params")
@@ -29,6 +31,15 @@ KNOWN_KERNEL_SYMBOLS = (
     "nb_kernel_euler_grad",
     "nb_kernel_euler_energy",
 )
+
+
+@dataclass(frozen=True)
+class KernelDispatch:
+    """Selected wrapper family for one rotation scheme."""
+
+    family: str
+    grad_symbol: Optional[str]
+    energy_symbol: str
 
 
 def load_forcefield(ff_spec: str):
@@ -116,3 +127,40 @@ def probe_kernel_symbols(lib: "ctypes.CDLL") -> set:
         except AttributeError:
             pass
     return available
+
+
+def select_kernel_dispatch(available_symbols: set, rotation: str = "euler") -> KernelDispatch:
+    """Pick grad+energy or energy-only wrapper family from available symbols."""
+    grad_sym = f"nb_kernel_{rotation}_grad"
+    energy_sym = f"nb_kernel_{rotation}_energy"
+
+    has_grad = grad_sym in available_symbols
+    has_energy = energy_sym in available_symbols
+
+    if has_grad and has_energy:
+        return KernelDispatch(
+            family="grad_energy",
+            grad_symbol=grad_sym,
+            energy_symbol=energy_sym,
+        )
+    if has_energy:
+        return KernelDispatch(
+            family="energy_only",
+            grad_symbol=None,
+            energy_symbol=energy_sym,
+        )
+    raise RuntimeError(
+        f"No callable wrappers for rotation '{rotation}'. "
+        f"Expected '{energy_sym}' (and optionally '{grad_sym}')."
+    )
+
+
+def bind_kernel_dispatch(
+    lib: "ctypes.CDLL", rotation: str = "euler"
+) -> Tuple[KernelDispatch, Optional[object], object]:
+    """Probe and bind C wrapper functions from a loaded kernel library."""
+    available = probe_kernel_symbols(lib)
+    dispatch = select_kernel_dispatch(available, rotation=rotation)
+    grad_fn = getattr(lib, dispatch.grad_symbol) if dispatch.grad_symbol else None
+    energy_fn = getattr(lib, dispatch.energy_symbol)
+    return dispatch, grad_fn, energy_fn

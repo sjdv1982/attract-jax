@@ -163,7 +163,7 @@ def parse_score_output(text):
     return e, g
 
 
-def print_legacy_score(energies, gradients):
+def print_legacy_score(energies, gradients, include_gradients=True):
     """Print score blocks compatible with legacy ATTRACT --score output.
 
     gradients are expected as +dE/dx; legacy prints forces (-dE/dx).
@@ -175,7 +175,8 @@ def print_legacy_score(energies, gradients):
             f"{float(e):12.3f}{0.0:12.3f}{0.0:12.3f}"
             f"{0.0:12.3f}{0.0:12.3f}{0.0:12.3f}"
         )
-        print(" Gradients:" + "".join(f"{float(v):24.16E}" for v in f))
+        if include_gradients:
+            print(" Gradients:" + "".join(f"{float(v):24.16E}" for v in f))
 
 
 # ---------------------------------------------------------------------------
@@ -935,6 +936,11 @@ def parse_args():
         action="store_true",
         help="score-only mode: print legacy-style energy/gradient blocks",
     )
+    ap.add_argument(
+        "--energy-only",
+        action="store_true",
+        help="with --score: print energy-only legacy-style blocks (omit Gradients lines)",
+    )
     ap.add_argument("--maxfun", type=int, default=150)
     ap.add_argument("--max-poses", type=int, default=0, help="0 = all")
     ap.add_argument(
@@ -1054,6 +1060,8 @@ def parse_args():
             ap.error("--attract-par-npz is required for --oracle jax")
         if args.energy_batch <= 0:
             ap.error("--energy-batch must be >= 1")
+    if args.energy_only and not args.score:
+        ap.error("--energy-only is only valid together with --score")
 
     return args
 
@@ -1139,12 +1147,14 @@ def main():
             energy_batch=args.energy_batch,
             nb_kernel=args.nb_kernel,
             autodiff_potentials=bool(args.autodiff_potentials),
+            energy_only=bool(args.energy_only),
         )
         if verbose:
             print(
                 "JAX oracle initialized "
                 f"(energy_batch={args.energy_batch}, nb_kernel={args.nb_kernel}, "
-                f"autodiff_potentials={bool(args.autodiff_potentials)})"
+                f"autodiff_potentials={bool(args.autodiff_potentials)}, "
+                f"energy_only={bool(args.energy_only)})"
             )
     else:
         paths = resolve_attract_paths(test_dir, ligand_pdb=ligand_pdb_path)
@@ -1173,7 +1183,11 @@ def main():
             print("Scoring starting poses...")
         start_e, start_g = oracle.score_batch(ens, dofs0)
         if args.score:
-            print_legacy_score(start_e, start_g)
+            print_legacy_score(
+                start_e,
+                start_g,
+                include_gradients=(not bool(args.energy_only)),
+            )
             return
         print(
             f"  Starting energies: min={start_e.min():.3f} mean={start_e.mean():.3f} "

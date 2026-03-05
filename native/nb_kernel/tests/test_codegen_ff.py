@@ -23,6 +23,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 # ---------------------------------------------------------------------------
 # JAX availability guard (some discovery tests load nonbon8 which imports jax)
 # ---------------------------------------------------------------------------
@@ -51,6 +53,60 @@ PYTHON = sys.executable
 
 
 # ---------------------------------------------------------------------------
+# ctypes structures for direct wrapper-call validation
+# ---------------------------------------------------------------------------
+class NbFusedStepData(ctypes.Structure):
+    _fields_ = [
+        ("nposes", ctypes.c_int32),
+        ("natoms", ctypes.c_int32),
+        ("dofs", ctypes.POINTER(ctypes.c_double)),
+        ("ens", ctypes.POINTER(ctypes.c_int16)),
+        ("lig_coords", ctypes.POINTER(ctypes.c_double)),
+        ("lig_pivot", ctypes.POINTER(ctypes.c_double)),
+        ("lig_type", ctypes.POINTER(ctypes.c_int16)),
+        ("lig_charge", ctypes.POINTER(ctypes.c_double)),
+    ]
+
+
+class NbFusedGridData(ctypes.Structure):
+    _fields_ = [
+        ("dim", ctypes.c_int32 * 3),
+        ("origin", ctypes.c_double * 3),
+        ("spacing", ctypes.c_double),
+        ("nr_neigh", ctypes.POINTER(ctypes.c_int32)),
+        ("nb_start", ctypes.POINTER(ctypes.c_int64)),
+    ]
+
+
+class NbGlobalData(ctypes.Structure):
+    _fields_ = [
+        ("nrec", ctypes.c_int32),
+        ("nens", ctypes.c_int32),
+        ("nb_concat_len", ctypes.c_int64),
+        ("nb_concat", ctypes.POINTER(ctypes.c_int32)),
+        ("rec_coord", ctypes.POINTER(ctypes.c_double)),
+        ("rec_type", ctypes.POINTER(ctypes.c_int16)),
+        ("rec_charge", ctypes.POINTER(ctypes.c_double)),
+        ("nrec_types", ctypes.c_int32),
+        ("nlig_types", ctypes.c_int32),
+        ("rc", ctypes.POINTER(ctypes.c_double)),
+        ("ac", ctypes.POINTER(ctypes.c_double)),
+        ("emin", ctypes.POINTER(ctypes.c_double)),
+        ("rmin2", ctypes.POINTER(ctypes.c_double)),
+        ("ivor", ctypes.POINTER(ctypes.c_int8)),
+        ("plateaudissq", ctypes.c_double),
+    ]
+
+
+class NbRunConfig(ctypes.Structure):
+    _fields_ = [("num_threads", ctypes.c_int32), ("kernel_variant", ctypes.c_int32)]
+
+
+def _as_ptr(arr, ctype):
+    return arr.ctypes.data_as(ctypes.POINTER(ctype))
+
+
+# ---------------------------------------------------------------------------
 # Helper: run codegen_ff.py as subprocess
 # ---------------------------------------------------------------------------
 def run_codegen(mode: str, name: str, directory: str) -> subprocess.CompletedProcess:
@@ -65,19 +121,24 @@ def run_codegen(mode: str, name: str, directory: str) -> subprocess.CompletedPro
 # ---------------------------------------------------------------------------
 # Helper: copy nonbon8 physics .h files to dummy/ with namespace substitution
 # ---------------------------------------------------------------------------
-def _copy_nonbon8_headers_to_dummy(dst_dir: Path) -> None:
-    """Copy nonbon8 .h files into dst_dir, substituting namespace nonbon8 → dummy."""
+def _copy_nonbon8_headers_with_namespace(dst_dir: Path, namespace: str) -> None:
+    """Copy nonbon8 .h files into dst_dir, substituting namespace to *namespace*."""
+    ns_upper = namespace.upper()
     for fname in ("lj.h", "elec.h", "lj_grad.h", "elec_grad.h"):
         src = NONBON8_DIR / fname
         if not src.exists():
             continue
         text = src.read_text()
-        # Rename both the namespace declaration and calls within it
-        text = text.replace("namespace nonbon8", "namespace dummy")
-        text = text.replace("nonbon8::", "dummy::")
+        # Rename both the namespace declaration and calls within it.
+        text = text.replace("namespace nonbon8", f"namespace {namespace}")
+        text = text.replace("nonbon8::", f"{namespace}::")
         # Update include guards
-        text = text.replace("NONBON8_", "DUMMY_")
+        text = text.replace("NONBON8_", f"{ns_upper}_")
         (dst_dir / fname).write_text(text)
+
+
+def _copy_nonbon8_headers_to_dummy(dst_dir: Path) -> None:
+    _copy_nonbon8_headers_with_namespace(dst_dir, namespace="dummy")
 
 
 # ===========================================================================
@@ -364,6 +425,48 @@ class TestCodegenEnergyOnly(unittest.TestCase):
 
 
 # ===========================================================================
+# Test suite 3b: either missing grad header => energy-only wrappers
+# ===========================================================================
+class TestCodegenPartialGradHeaders(unittest.TestCase):
+    """Either missing gradient header must disable grad wrappers."""
+
+    def _run_partial_case(self, case_name: str, keep_lj_grad: bool, keep_elec_grad: bool):
+        tmpdir = Path(tempfile.mkdtemp(prefix=f"test_codegen_partial_{case_name}_"))
+        ff_dir = tmpdir / case_name
+        try:
+            run_codegen("init", case_name, str(ff_dir))
+            # Copy energy headers (always required).
+            shutil.copy(NONBON8_DIR / "lj.h", ff_dir / "lj.h")
+            shutil.copy(NONBON8_DIR / "elec.h", ff_dir / "elec.h")
+            if keep_lj_grad:
+                shutil.copy(NONBON8_DIR / "lj_grad.h", ff_dir / "lj_grad.h")
+            if keep_elec_grad:
+                shutil.copy(NONBON8_DIR / "elec_grad.h", ff_dir / "elec_grad.h")
+
+            result = run_codegen("codegen", case_name, str(ff_dir))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            cpp_text = (ff_dir / f"nb_kernel_{case_name}.cpp").read_text()
+            self.assertIn("nb_kernel_euler_energy", cpp_text)
+            self.assertNotIn("nb_kernel_euler_grad", cpp_text)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_missing_lj_grad_header_disables_grad_wrapper(self):
+        self._run_partial_case(
+            case_name="missing_lj_grad",
+            keep_lj_grad=False,
+            keep_elec_grad=True,
+        )
+
+    def test_missing_elec_grad_header_disables_grad_wrapper(self):
+        self._run_partial_case(
+            case_name="missing_elec_grad",
+            keep_lj_grad=True,
+            keep_elec_grad=False,
+        )
+
+
+# ===========================================================================
 # Test suite 4: nonbon8 codegen — struct shape matches hand-written boilerplate
 # ===========================================================================
 class TestCodegenNonbon8Shape(unittest.TestCase):
@@ -570,6 +673,177 @@ class TestFFDiscovery(unittest.TestCase):
         syms = self.probe_kernel_symbols(lib)
         self.assertIn("nb_kernel_euler_grad", syms)
         self.assertIn("nb_kernel_euler_energy", syms)
+
+
+# ===========================================================================
+# Test suite 6b: capability-based dispatch + wrapper consistency
+# ===========================================================================
+class TestKernelDispatchAndParity(unittest.TestCase):
+    """Milestone 4: select wrapper family and validate grad-vs-energy consistency."""
+
+    @classmethod
+    def setUpClass(cls):
+        if str(KERNEL_ROOT) not in sys.path:
+            sys.path.insert(0, str(KERNEL_ROOT))
+        from forcefields import bind_kernel_dispatch, probe_kernel_symbols
+
+        cls.bind_kernel_dispatch = staticmethod(bind_kernel_dispatch)
+        cls.probe_kernel_symbols = staticmethod(probe_kernel_symbols)
+
+        # Build a grad-capable library (nonbon8).
+        subprocess.run(
+            ["make", "nb_kernel_nonbon8.so"],
+            capture_output=True,
+            text=True,
+            cwd=str(KERNEL_ROOT),
+            check=True,
+        )
+        cls.nonbon8_so = KERNEL_ROOT / "nb_kernel_nonbon8.so"
+        cls.nonbon8_lib = ctypes.CDLL(str(cls.nonbon8_so))
+
+        # Build an energy-only FF to validate dispatch downgrade.
+        cls.energyonly_name = "energyonly_dispatch"
+        cls.energyonly_dir = FF_DIR / cls.energyonly_name
+        if cls.energyonly_dir.exists():
+            shutil.rmtree(cls.energyonly_dir)
+        run_codegen("init", cls.energyonly_name, str(cls.energyonly_dir))
+        _copy_nonbon8_headers_with_namespace(
+            cls.energyonly_dir, namespace=cls.energyonly_name
+        )
+        # Intentionally do not copy *_grad.h files.
+        for grad_h in ("lj_grad.h", "elec_grad.h"):
+            p = cls.energyonly_dir / grad_h
+            if p.exists():
+                p.unlink()
+        subprocess.run(
+            ["make", f"nb_kernel_{cls.energyonly_name}.so"],
+            capture_output=True,
+            text=True,
+            cwd=str(KERNEL_ROOT),
+            check=True,
+        )
+        cls.energyonly_so = KERNEL_ROOT / f"nb_kernel_{cls.energyonly_name}.so"
+        cls.energyonly_lib = ctypes.CDLL(str(cls.energyonly_so))
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "energyonly_so") and cls.energyonly_so.exists():
+            cls.energyonly_so.unlink()
+        if hasattr(cls, "energyonly_dir") and cls.energyonly_dir.exists():
+            shutil.rmtree(cls.energyonly_dir, ignore_errors=True)
+
+    def test_dispatch_selects_grad_energy_when_both_symbols_exist(self):
+        dispatch, grad_fn, energy_fn = self.bind_kernel_dispatch(self.nonbon8_lib)
+        self.assertEqual(dispatch.family, "grad_energy")
+        self.assertEqual(dispatch.grad_symbol, "nb_kernel_euler_grad")
+        self.assertEqual(dispatch.energy_symbol, "nb_kernel_euler_energy")
+        self.assertIsNotNone(grad_fn)
+        self.assertIsNotNone(energy_fn)
+
+    def test_dispatch_selects_energy_only_when_grad_symbol_missing(self):
+        dispatch, grad_fn, energy_fn = self.bind_kernel_dispatch(self.energyonly_lib)
+        self.assertEqual(dispatch.family, "energy_only")
+        self.assertIsNone(dispatch.grad_symbol)
+        self.assertEqual(dispatch.energy_symbol, "nb_kernel_euler_energy")
+        self.assertIsNone(grad_fn)
+        self.assertIsNotNone(energy_fn)
+
+    def test_energy_wrapper_matches_grad_energy_component(self):
+        """For grad-capable kernels, energy-only output must equal grad path energy."""
+        lib = self.nonbon8_lib
+        fn_grad = lib.nb_kernel_euler_grad
+        fn_energy = lib.nb_kernel_euler_energy
+        for fn in (fn_grad, fn_energy):
+            fn.argtypes = [
+                ctypes.POINTER(NbFusedStepData),
+                ctypes.POINTER(NbFusedGridData),
+                ctypes.POINTER(NbGlobalData),
+                ctypes.POINTER(NbRunConfig),
+                ctypes.POINTER(ctypes.c_double),
+                ctypes.POINTER(ctypes.c_double),
+            ]
+            fn.restype = ctypes.c_int
+
+        dofs = np.zeros((1, 6), dtype=np.float64)
+        ens = np.array([0], dtype=np.int16)
+        lig_coords = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+        lig_pivot = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+        lig_type = np.array([0], dtype=np.int16)
+        lig_charge = np.array([0.0], dtype=np.float64)
+
+        dim = (ctypes.c_int32 * 3)(1, 1, 1)
+        origin = (ctypes.c_double * 3)(0.0, 0.0, 0.0)
+        nr_neigh = np.array([1], dtype=np.int32)
+        nb_start = np.array([0], dtype=np.int64)
+        nb_concat = np.array([0], dtype=np.int32)
+        rec_coord = np.array([2.0, 0.0, 0.0], dtype=np.float64)
+        rec_type = np.array([0], dtype=np.int16)
+        rec_charge = np.array([0.0], dtype=np.float64)
+        rc = np.array([1.0], dtype=np.float64)
+        ac = np.array([1.0], dtype=np.float64)
+        emin = np.array([-27.0 / 256.0], dtype=np.float64)
+        rmin2 = np.array([4.0 / 3.0], dtype=np.float64)
+        ivor = np.array([1], dtype=np.int8)
+
+        step = NbFusedStepData(
+            nposes=np.int32(1),
+            natoms=np.int32(1),
+            dofs=_as_ptr(dofs.reshape(-1), ctypes.c_double),
+            ens=_as_ptr(ens, ctypes.c_int16),
+            lig_coords=_as_ptr(lig_coords, ctypes.c_double),
+            lig_pivot=_as_ptr(lig_pivot, ctypes.c_double),
+            lig_type=_as_ptr(lig_type, ctypes.c_int16),
+            lig_charge=_as_ptr(lig_charge, ctypes.c_double),
+        )
+        grid = NbFusedGridData(
+            dim=dim,
+            origin=origin,
+            spacing=ctypes.c_double(1.0),
+            nr_neigh=_as_ptr(nr_neigh, ctypes.c_int32),
+            nb_start=_as_ptr(nb_start, ctypes.c_int64),
+        )
+        global_data = NbGlobalData(
+            nrec=np.int32(1),
+            nens=np.int32(1),
+            nb_concat_len=np.int64(1),
+            nb_concat=_as_ptr(nb_concat, ctypes.c_int32),
+            rec_coord=_as_ptr(rec_coord, ctypes.c_double),
+            rec_type=_as_ptr(rec_type, ctypes.c_int16),
+            rec_charge=_as_ptr(rec_charge, ctypes.c_double),
+            nrec_types=np.int32(1),
+            nlig_types=np.int32(1),
+            rc=_as_ptr(rc, ctypes.c_double),
+            ac=_as_ptr(ac, ctypes.c_double),
+            emin=_as_ptr(emin, ctypes.c_double),
+            rmin2=_as_ptr(rmin2, ctypes.c_double),
+            ivor=_as_ptr(ivor, ctypes.c_int8),
+            plateaudissq=ctypes.c_double(9.0),
+        )
+        cfg = NbRunConfig(num_threads=np.int32(1), kernel_variant=np.int32(1))
+
+        e_grad = np.zeros((1,), dtype=np.float64)
+        g_grad = np.zeros((1, 6), dtype=np.float64)
+        e_energy = np.zeros((1,), dtype=np.float64)
+
+        rc_grad = fn_grad(
+            ctypes.byref(step),
+            ctypes.byref(grid),
+            ctypes.byref(global_data),
+            ctypes.byref(cfg),
+            _as_ptr(e_grad, ctypes.c_double),
+            _as_ptr(g_grad.reshape(-1), ctypes.c_double),
+        )
+        rc_energy = fn_energy(
+            ctypes.byref(step),
+            ctypes.byref(grid),
+            ctypes.byref(global_data),
+            ctypes.byref(cfg),
+            _as_ptr(e_energy, ctypes.c_double),
+            None,
+        )
+        self.assertEqual(rc_grad, 0)
+        self.assertEqual(rc_energy, 0)
+        np.testing.assert_allclose(e_energy, e_grad, rtol=0.0, atol=1e-12)
 
 
 # ===========================================================================
