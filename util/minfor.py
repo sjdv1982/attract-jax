@@ -971,17 +971,23 @@ def parse_args():
     ap.add_argument(
         "--grid",
         default=None,
-        help="path to .grid file (required for --oracle jax unless --generate-grid is used)",
+        help=(
+            "path to precomputed .grid or .npz file to use as the NB potential grid. "
+            "If omitted, the grid is generated just-in-time from the receptor "
+            "(requires --receptor-ens-list and --attract-par-npz). "
+            "With --generate-grid: output path for the freshly generated .npz."
+        ),
     )
     ap.add_argument(
         "--generate-grid",
         action="store_true",
         default=False,
         help=(
-            "JAX-only: generate the NB potential grid in-house from the receptor PDB "
-            "(uses generate_grid() instead of a precomputed .grid file). "
-            "Requires --receptor-ens-list, --attract-par-npz. "
-            "Mutually exclusive with --grid."
+            "JAX-only: generate the NB potential grid in-house and write it to "
+            "--grid <output.npz>, then exit.  Requires --grid, "
+            "--receptor-ens-list, --attract-par-npz.  "
+            "Without --generate-grid, omitting --grid causes the grid to be "
+            "generated just-in-time and used directly (not saved)."
         ),
     )
     ap.add_argument("--attract-par-npz", default=None, help="path to attract-par.npz")
@@ -1073,8 +1079,6 @@ def parse_args():
                 "--generate-grid requires --grid <output.npz> "
                 "(the .npz path to write the generated grid to)"
             )
-        if not args.grid and not args.generate_grid:
-            ap.error("--grid or --generate-grid is required for --oracle jax")
         if not args.attract_par_npz:
             ap.error("--attract-par-npz is required for --oracle jax")
         if args.energy_batch <= 0:
@@ -1157,11 +1161,10 @@ def main():
         grid_path = args.grid
         par_npz = args.attract_par_npz
 
-        # Optionally generate the grid in-house from the receptor.
+        # Build the grid object when no precomputed file is provided, or when
+        # --generate-grid is given (generate + write + exit).
         grid_object = None
-        if args.generate_grid:
-            # --generate-grid: generate the grid, optionally write it, and exit.
-            # --grid is the *output* path (required, validated above).
+        if args.generate_grid or not grid_path:
             import math as _math
             import sys as _sys
 
@@ -1210,16 +1213,17 @@ def main():
                 backend="kernel",
                 lig_atomtypes=_lig_atomtypes,
             )
-            # Write the grid to the output .npz and exit.
-            from reproduce_grid_score import write_grid_npz as _write_npz
+            if args.generate_grid:
+                # --generate-grid: write to --grid <path> and exit.
+                from reproduce_grid_score import write_grid_npz as _write_npz
 
-            _write_npz(grid_object, args.grid)
-            if verbose:
-                print(f"Grid written to {args.grid}")
-            import sys as _sys_exit
+                _write_npz(grid_object, args.grid)
+                if verbose:
+                    print(f"Grid written to {args.grid}")
+                import sys as _sys_exit
 
-            _sys_exit.exit(0)
-            grid_path = None  # unreachable; kept for static analysers
+                _sys_exit.exit(0)
+            grid_path = None  # use grid_object in JaxScoreOracle
 
         # Dispatch --grid on extension: .npz → read_grid_npz, else legacy binary.
         if grid_path is not None and grid_path.endswith(".npz"):

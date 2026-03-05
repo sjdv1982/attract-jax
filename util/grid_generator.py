@@ -22,13 +22,20 @@ Correction neighbour grid (inner dims)
     Indices of receptor atoms within ``neighbourdis`` of each voxel *centre*
     Used at scoring time for the NB-correction soft-core path.
 
-Sign conventions (matching legacy grid format)
-----------------------------------------------
+Sign conventions (gradient convention — matches ``read_grid_with_electro()``)
+-----------------------------------------------------------------------------
 Channel 0: raw potential energy E (kcal/mol)
-Channels 1-3: -(dE/dx), -(dE/dy), -(dE/dz)  (i.e. the force direction)
+Channels 1-3: +(dE/dx), +(dE/dy), +(dE/dz)  — gradient direction
+              — OR zero when ``return_gradients=False``
 
-The C kernel grad path stores ``out_grad[6*p + 3:6] = (-dE/dtx, -dE/dty, -dE/dtz)``
-which already has the correct sign; those values are copied directly into channels 1-3.
+Note: the raw binary ``.grid`` file uses the *force* convention (-(dE/dx)) and its
+reader (``read_grid_with_electro()``) negates channels 1–3 after loading.  This
+generator applies the same negation so the resulting ``Grid`` namedtuple uses the
+same gradient convention expected by all JAX scorers.
+
+When ``generate_grid(return_gradients=False)`` is used (e.g. for a force field that
+has no Python gradient implementation), channels 1-3 are stored as zero.  Scoring
+must then use ``--autodiff-potentials`` so that JAX autodiffs through channel 0.
 """
 
 import math
@@ -108,6 +115,7 @@ def _compute_potential_grid(
     query_atomtype_idx: int,
     query_charge: float,
     ff_params,
+    ff_module,  # force-field module; None only allowed for backend="kernel"
     origin: np.ndarray,  # (3,) for kernel lookup
     gridspacing: float,
     dim: np.ndarray,  # (3,) for kernel lookup
@@ -117,8 +125,14 @@ def _compute_potential_grid(
     nb_concat: np.ndarray,  # (total,)
     backend: str,
     lib,
+    return_gradients: bool = True,
 ) -> np.ndarray:
-    """Evaluate potential + gradients at ``corners`` and return (dx,dy,dz,4) float32."""
+    """Evaluate potential (and optionally gradients) at ``corners``.
+
+    Returns (dx, dy, dz, 4) float32.  When ``return_gradients=False``,
+    channels 1–3 are stored as zero (energy-only grid, suitable for
+    autodiff scoring).
+    """
     from score_pairs import score_pairs  # noqa: PLC0415
 
     N = len(corners)
@@ -133,7 +147,7 @@ def _compute_potential_grid(
         query_atomtype_idx=query_atomtype_idx,
         query_charge=query_charge,
         ff_params=ff_params,
-        ff_module=None,
+        ff_module=ff_module,
         nr_neigh=nr_neigh,
         nb_start=nb_start,
         nb_concat=nb_concat,
@@ -143,19 +157,19 @@ def _compute_potential_grid(
         plateaudis_sq=plateaudis_sq,
         plateau_mode="clamp",
         backend=backend,
-        return_gradients=True,
+        return_gradients=return_gradients,
         lib=lib,
     )
-    # energies: (N,) float64;  grads: (N, 3) float64
-    # score_pairs (kernel backend) returns +dE/d_i (positive gradient).
-    # Store gradient convention: channels store +(dE/d_i).
-    # Channel layout: [E, +(dE/dx), +(dE/dy), +(dE/dz)]
-    voxels = (
-        np.stack([energies, grads[:, 0], grads[:, 1], grads[:, 2]], axis=-1)
-        .reshape(dx, dy, dz, 4)
-        .astype(np.float32)
-    )
-    return voxels
+    # Channel layout: [E, +(dE/dx), +(dE/dy), +(dE/dz)]  — gradient convention.
+    # score_pairs_kernel already returns +dE/dx (the pose loop negates lj_grad's
+    # force-direction output before writing to out_grad, so what comes back is the
+    # gradient, same convention as the Grid loaded by read_grid_with_electro).
+    # When return_gradients=False, grads is None and channels 1-3 are zero.
+    voxels = np.zeros((N, 4), dtype=np.float64)
+    voxels[:, 0] = energies
+    if return_gradients and grads is not None:
+        voxels[:, 1:4] = grads
+    return voxels.reshape(dx, dy, dz, 4).astype(np.float32)
 
 
 def generate_grid(
@@ -172,6 +186,7 @@ def generate_grid(
     backend: str = "kernel",
     lib=None,
     lig_atomtypes: Optional[np.ndarray] = None,
+    return_gradients: bool = True,
 ):
     """Generate a nonbonded potential grid from receptor coordinates.
 
@@ -194,7 +209,15 @@ def generate_grid(
         Expected shape (MAXATOMTYPES, MAXATOMTYPES) with 1-based atomtype k
         at row/col index k-1.
     ff_module : module or None
-        Force-field module (only used for JAX backend; may be None for kernel).
+        Force-field module.  Required for ``backend="jax"``; may be None
+        for ``backend="kernel"``.
+    return_gradients : bool
+        If True (default), compute and store gradient channels 1–3 in the
+        grid (``+dE/d_i``).  Requires ``ff_module.lj_grad`` /
+        ``ff_module.elec_grad`` when ``backend="jax"``.
+        If False, channels 1–3 are stored as zero.  Use this when the
+        force field has no Python gradient implementation and only autodiff
+        scoring (``--autodiff-potentials``) is needed.
     ffelec : float
         Electrostatics scaling factor √(332.054 / ε).
     gridspacing : float
@@ -373,6 +396,7 @@ def generate_grid(
             query_atomtype_idx=int(alpha_t) - 1,
             query_charge=0.0,
             ff_params=ff_params,
+            ff_module=ff_module,
             origin=origin,
             gridspacing=gs,
             dim=dim,
@@ -382,6 +406,7 @@ def generate_grid(
             nb_concat=lj_nc_inner,
             backend=backend,
             lib=lib,
+            return_gradients=return_gradients,
         )
 
     # ------------------------------------------------------------------
@@ -399,6 +424,7 @@ def generate_grid(
             query_atomtype_idx=0,  # LJ=0 for all types; any index works
             query_charge=1.0,
             ff_params=ff_params_zero_lj,
+            ff_module=ff_module,
             origin=origin,
             gridspacing=gs,
             dim=dim,
@@ -408,6 +434,7 @@ def generate_grid(
             nb_concat=elec_nc_inner,
             backend=backend,
             lib=lib,
+            return_gradients=return_gradients,
         )
 
     # ------------------------------------------------------------------
@@ -427,6 +454,7 @@ def generate_grid(
             query_atomtype_idx=int(alpha_t) - 1,
             query_charge=0.0,
             ff_params=ff_params,
+            ff_module=ff_module,
             origin=origin_outer,
             gridspacing=outer_gs,
             dim=dim_outer,
@@ -436,6 +464,7 @@ def generate_grid(
             nb_concat=lj_nc_outer,
             backend=backend,
             lib=lib,
+            return_gradients=return_gradients,
         )
 
     # ------------------------------------------------------------------
@@ -453,6 +482,7 @@ def generate_grid(
             query_atomtype_idx=0,
             query_charge=1.0,
             ff_params=ff_params_zero_lj,
+            ff_module=ff_module,
             origin=origin_outer,
             gridspacing=outer_gs,
             dim=dim_outer,
@@ -462,6 +492,7 @@ def generate_grid(
             nb_concat=elec_nc_outer,
             backend=backend,
             lib=lib,
+            return_gradients=return_gradients,
         )
 
     # ------------------------------------------------------------------

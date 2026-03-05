@@ -18,7 +18,9 @@
  * Outputs
  * -------
  * energy : pairwise electrostatic energy contribution (kcal/mol)
- * gx, gy, gz : dE/d(lig_xyz) components
+ * gx, gy, gz : force components −dE/d(lig_xyz)  (force direction = negative
+ *              gradient).  The pose loop negates these before writing to
+ *              out_grad, yielding the gradient convention +dE/dx.
  *
  * Gradient derivation:
  *   E = charge * (rr2 - 1/2500)          [when rr2 > 1/2500, else 0]

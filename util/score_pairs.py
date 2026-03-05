@@ -281,9 +281,27 @@ def score_pairs_jax(
     offsets_j = jnp.arange(max_K, dtype=jnp.int32)
     M = int(rec_coords.shape[0])
 
+    if ff_module is None:
+        raise ValueError(
+            "score_pairs_jax: ff_module is required for the JAX backend. "
+            "Pass the force-field module (e.g. nonbon8) or use backend='kernel'."
+        )
+
+    if return_gradients:
+        if not getattr(ff_module, "lj_grad", None) or not getattr(
+            ff_module, "elec_grad", None
+        ):
+            missing = [
+                n for n in ("lj_grad", "elec_grad") if not getattr(ff_module, n, None)
+            ]
+            raise AttributeError(
+                f"score_pairs_jax: return_gradients=True requires {missing} in "
+                f"ff_module ({ff_module.__name__ if hasattr(ff_module, '__name__') else ff_module}). "
+                "Implement these functions or use autodiff potentials (--autodiff-potentials)."
+            )
+
     pdsq_f = float(plateaudis_sq)
     prr2_f = 1.0 / pdsq_f
-    inv50sq = (1.0 / 50.0) ** 2
 
     @jax.jit
     def _batch_energy(qc_batch, nr_batch, nb_start_batch):
@@ -318,24 +336,18 @@ def score_pairs_jax(
         emin_v = emin_j[rt, qt]
         rmin2_v = rmin2_j[rt, qt]
         iv = ivor_j[rt, qt]
-        rr23 = rr2 * rr2 * rr2
-        rep = rlen * rr2
-        vlj = (rep - alen) * rr23
-        e_lj = jnp.where(dsq_eff < rmin2_v, vlj + (iv - 1.0) * emin_v, iv * vlj)
+
+        e_lj = ff_module.lj_energy(rlen, alen, emin_v, rmin2_v, iv, dsq_eff, rr2)
         if plateau_mode == "correction":
-            vlj_p = (rlen * prr2_f - alen) * (prr2_f**3)
-            e_lj_p = jnp.where(
-                pdsq_f < rmin2_v, vlj_p + (iv - 1.0) * emin_v, iv * vlj_p
+            e_lj = e_lj - ff_module.lj_energy(
+                rlen, alen, emin_v, rmin2_v, iv, pdsq_f, prr2_f
             )
-            e_lj = e_lj - e_lj_p
 
         # Electrostatics
         charge = rec_ch_j[safe_rec] * qch  # (B, K)
-        dd = jnp.where(rr2 > inv50sq, rr2 - inv50sq, 0.0)
-        e_elec = charge * dd
+        e_elec = ff_module.elec_energy(charge, rr2)
         if plateau_mode == "correction":
-            dd_p = jnp.where(prr2_f > inv50sq, prr2_f - inv50sq, 0.0)
-            e_elec = e_elec - charge * dd_p
+            e_elec = e_elec - ff_module.elec_energy(charge, prr2_f)
 
         e_pair = jnp.where(valid, e_lj + e_elec, 0.0)
         return e_pair.sum(axis=-1)  # (B,)
@@ -352,7 +364,7 @@ def score_pairs_jax(
         Returns
         -------
         energies : (B,)
-        grads    : (B, 3)  — same sign convention as the kernel: -(dE/dq)
+        grads    : (B, 3)  — gradient convention: +(dE/dq)
         """
         B = qc_batch.shape[0]
         flat_nb = nb_start_batch[:, None] + offsets_j[None, :]  # (B, K)
@@ -400,39 +412,42 @@ def score_pairs_jax(
         rmin2_v = rmin2_j[rt, qt]
         iv = ivor_j[rt, qt]
 
-        rr23 = eval_rr2 * eval_rr2 * eval_rr2
-        rep = rlen * eval_rr2
-        vlj = (rep - alen) * rr23
-        e_lj = jnp.where(eval_dsq_safe < rmin2_v, vlj + (iv - 1.0) * emin_v, iv * vlj)
-        # LJ gradient: fb * eval_d[xyz]
-        fb_inner = 6.0 * vlj + 2.0 * (rep * rr23)
-        fb = jnp.where(eval_dsq_safe < rmin2_v, fb_inner, iv * fb_inner)
-        g_lj = fb[..., None] * eval_d  # (B, K, 3)
+        # LJ energy + gradient via ff_module (routes through force-field implementation).
+        e_lj, gx_lj, gy_lj, gz_lj = ff_module.lj_grad(
+            rlen,
+            alen,
+            emin_v,
+            rmin2_v,
+            iv,
+            eval_dsq_safe,
+            eval_rr2,
+            eval_d[..., 0],
+            eval_d[..., 1],
+            eval_d[..., 2],
+        )
+        g_lj = jnp.stack([gx_lj, gy_lj, gz_lj], axis=-1)  # (B, K, 3)
 
         if plateau_mode == "correction":
             # Subtract energy at plateau distance (constant w.r.t. query → zero gradient).
-            vlj_p = (rlen * prr2_f - alen) * (prr2_f**3)
-            e_lj_p = jnp.where(
-                pdsq_f < rmin2_v, vlj_p + (iv - 1.0) * emin_v, iv * vlj_p
+            e_lj = e_lj - ff_module.lj_energy(
+                rlen, alen, emin_v, rmin2_v, iv, pdsq_f, prr2_f
             )
-            e_lj = e_lj - e_lj_p
             # g_lj is unchanged: gradient of the correction component is zero.
 
-        # Electrostatics
+        # Electrostatics: energy + gradient via ff_module.
         charge = rec_ch_j[safe_rec] * qch
-        inv50sq = (1.0 / 50.0) ** 2
-        dd = jnp.where(eval_rr2 > inv50sq, eval_rr2 - inv50sq, 0.0)
-        e_elec = charge * dd
-        # Elec gradient: 2 * charge * eval_rr2 * eval_d
-        g_elec = (2.0 * charge * eval_rr2)[
-            ..., None
-        ] * eval_d  # (B, K, 3); zero when dd<=0
-        g_elec = jnp.where((dd > 0.0)[..., None], g_elec, 0.0)
+        e_elec, gx_el, gy_el, gz_el = ff_module.elec_grad(
+            charge,
+            eval_rr2,
+            eval_d[..., 0],
+            eval_d[..., 1],
+            eval_d[..., 2],
+        )
+        g_elec = jnp.stack([gx_el, gy_el, gz_el], axis=-1)  # (B, K, 3)
 
         if plateau_mode == "correction":
             # Subtract elec energy at plateau distance (constant → zero gradient).
-            dd_p = jnp.where(prr2_f > inv50sq, prr2_f - inv50sq, 0.0)
-            e_elec = e_elec - charge * dd_p
+            e_elec = e_elec - ff_module.elec_energy(charge, prr2_f)
             # g_elec is unchanged.
 
         mask3 = valid[..., None]
@@ -440,7 +455,8 @@ def score_pairs_jax(
         g_pair = jnp.where(mask3, g_lj + g_elec, 0.0)  # (B, K, 3)
 
         energies = e_pair.sum(axis=-1)  # (B,)
-        # Sum over neighbours; negate to match kernel convention: -(dE/dq)
+        # Sum over neighbours; negate because lj_grad/elec_grad return force
+        # direction (-dE/dq); negating gives gradient convention (+dE/dq).
         grads = -g_pair.sum(axis=-2)  # (B, 3)
         return energies, grads
 
@@ -624,7 +640,9 @@ def score_pairs_kernel(
     if rc_ret != 0:
         raise RuntimeError(f"score_pairs_kernel: {sym_name} returned {rc_ret}")
     if return_gradients:
-        # out_grad_flat[6*p + 3:6] = (-dE/dtx, -dE/dty, -dE/dtz) per pose
+        # out_grad_flat[6*p + 3:6] = (+dE/dtx, +dE/dty, +dE/dtz) per pose.
+        # lj_grad returns force direction (-dE/dx); pose_loop negates before
+        # writing out_grad, so the stored values are gradient direction (+dE/dx).
         grads = out_grad_flat.reshape(N, 6)[:, 3:6]
         return out_e, np.ascontiguousarray(grads)
     return out_e, None

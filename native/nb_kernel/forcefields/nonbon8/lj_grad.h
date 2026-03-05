@@ -20,8 +20,10 @@
  * Outputs
  * -------
  * energy : pairwise LJ energy (kcal/mol)
- * gx, gy, gz : dE/d(lig_xyz) components in force-direction convention
- *              (negated in the pose loop before writing to out_grad)
+ * gx, gy, gz : force components −dE/d(lig_xyz)  (force direction = negative
+ *              gradient).  The pose loop negates these before writing to
+ *              out_grad, yielding the gradient convention +dE/dx stored in
+ *              grid channels 1–3.
  *
  * Gradient derivation:
  *   E_lj = (rc * rr2 - ac) * rr2^3
