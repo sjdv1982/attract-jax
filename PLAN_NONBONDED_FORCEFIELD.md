@@ -120,6 +120,17 @@ all expensive intermediates (powers of `1/r`, LJ terms, etc.). The gradient is t
 a few extra multiplies on top. Separating them would either duplicate the expensive work or
 require passing intermediates through an awkward interface.
 
+> **Note — legacy gradient bug (discovered 2026-03-05):** The legacy
+> `grid_calculate.cpp` (`_calc_potential` and `_calc_potential_elec`) contains
+> a math error in the plateau region: after overwriting `dsq = plateaudissq`
+> and `rr2 = 1/plateaudissq`, the scaled displacement `dd` is computed with
+> the post-clamp `rr2` instead of the original `1/dsq_orig`. This incorrectly
+> scales gradient magnitudes inside the plateau sphere by `dsq_orig / plateaudissq`.
+> **Consequence:** gradient channels in legacy `.grid` files are wrong for
+> voxels inside the plateau sphere. The C kernel (`pose_loop.h`) uses the
+> correct formula. **Do not use legacy `.grid` gradient channels as a
+> reference** when validating new gradient implementations.
+
 **Concrete initial force fields:**
 
 - `nonbon8/` — 8/6 LJ with rdie (distance-dependent dielectric). This is the classic

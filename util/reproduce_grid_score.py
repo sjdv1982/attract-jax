@@ -355,12 +355,84 @@ def read_grid_with_electro(grid_data: bytes):
     maske = elec_ind > 0
     outer_elec_grid[maske] = energrads[elec_ind[maske] - 1]
 
+    # Legacy .grid stores force convention: channels 1:4 = -(dE/d_i).
+    # Negate to gradient convention: channels 1:4 = +(dE/d_i).
+    inner_potential_grid[:, :, :, :, 1:4] *= -1
+    outer_potential_grid[:, :, :, :, 1:4] *= -1
+    inner_elec_grid[:, :, :, 1:4] *= -1
+    outer_elec_grid[:, :, :, 1:4] *= -1
+
     d["inner_potential_grid"] = inner_potential_grid
     d["outer_potential_grid"] = outer_potential_grid
     d["inner_elec_grid"] = inner_elec_grid
     d["outer_elec_grid"] = outer_elec_grid
     d["alphabet_atomtypes"] = alphabet_atomtypes
 
+    grid_class = namedtuple("Grid", tuple(d.keys()) + ("neighbour_grid_ravel",))
+    return grid_class(*d.values(), neighbour_grid_ravel=None)
+
+
+# ---------------------------------------------------------------------------
+# NPZ grid serialisation
+# ---------------------------------------------------------------------------
+
+_GRID_SCALAR_FIELDS = (
+    "gridspacing",
+    "gridextension",
+    "plateaudis",
+    "neighbourdis",
+    "natoms",
+    "max_nr_neighbours",
+)
+_GRID_ARRAY_FIELDS = (
+    "alphabet",
+    "origin",
+    "dim",
+    "dim2",
+    "nr_neighbours",
+    "neighbour_grid",
+    "inner_potential_grid",
+    "outer_potential_grid",
+    "inner_elec_grid",
+    "outer_elec_grid",
+    "alphabet_atomtypes",
+)
+
+
+def write_grid_npz(grid, path: str) -> None:
+    """Serialise a Grid namedtuple (as returned by read_grid_with_electro or
+    grid_generator.generate_grid) to a compressed .npz file.
+
+    All array fields are stored verbatim.  Scalar fields are wrapped in
+    0-d numpy arrays so np.savez_compressed handles them uniformly.
+    ``neighbour_grid_ravel`` is recomputed on load and is NOT stored.
+    """
+    arrays = {}
+    for name in _GRID_SCALAR_FIELDS:
+        arrays[name] = np.array(getattr(grid, name))
+    for name in _GRID_ARRAY_FIELDS:
+        arrays[name] = np.asarray(getattr(grid, name))
+    np.savez_compressed(path, **arrays)
+
+
+def read_grid_npz(path: str):
+    """Load a Grid namedtuple previously written by write_grid_npz.
+
+    Returns the same namedtuple layout as read_grid_with_electro, with
+    ``neighbour_grid_ravel`` set to None (it will be built lazily by
+    JaxScoreOracle if needed).
+    """
+    data = np.load(path)
+    d = {}
+    for name in _GRID_SCALAR_FIELDS:
+        val = data[name]
+        # Restore Python scalars for the fields that were ints/floats
+        if name in ("gridextension", "natoms", "max_nr_neighbours"):
+            d[name] = int(val)
+        else:
+            d[name] = float(val)
+    for name in _GRID_ARRAY_FIELDS:
+        d[name] = data[name]
     grid_class = namedtuple("Grid", tuple(d.keys()) + ("neighbour_grid_ravel",))
     return grid_class(*d.values(), neighbour_grid_ravel=None)
 
@@ -604,7 +676,8 @@ def build_kernel(
                 all_coors_lig, lig_vdw_channel_idx0, grid0
             )
             ans = vdw_eg[:, :, 0]
-            atom_grad = -vdw_eg[:, :, 1:4]
+            # Channels 1:4 now store +dE/d_i (gradient convention).
+            atom_grad = vdw_eg[:, :, 1:4]
             if n_charged > 0:
                 all_coors_ch = all_coors_lig[:, charged_idx_j, :]
                 elec_eg_ch = potential_atom_energrads(
@@ -621,7 +694,7 @@ def build_kernel(
                 g_el = g_el.at[:, charged_idx_j, :].set(
                     qraw_ch[None, :, None] * elec_eg_ch[:, :, 1:4]
                 )
-                atom_grad = atom_grad - g_el
+                atom_grad = atom_grad + g_el
             tangent = (atom_grad * tangents[0]).sum(axis=2)
             return ans, tangent
 

@@ -969,7 +969,20 @@ def parse_args():
         ),
     )
     ap.add_argument(
-        "--grid", default=None, help="path to .grid file (required for --oracle jax)"
+        "--grid",
+        default=None,
+        help="path to .grid file (required for --oracle jax unless --generate-grid is used)",
+    )
+    ap.add_argument(
+        "--generate-grid",
+        action="store_true",
+        default=False,
+        help=(
+            "JAX-only: generate the NB potential grid in-house from the receptor PDB "
+            "(uses generate_grid() instead of a precomputed .grid file). "
+            "Requires --receptor-ens-list, --attract-par-npz. "
+            "Mutually exclusive with --grid."
+        ),
     )
     ap.add_argument("--attract-par-npz", default=None, help="path to attract-par.npz")
     ap.add_argument(
@@ -1039,6 +1052,7 @@ def parse_args():
     if args.oracle == "legacy":
         jax_only_opts = [
             "--grid",
+            "--generate-grid",
             "--attract-par-npz",
             "--receptor-ens-list",
             "--epsilon",
@@ -1054,8 +1068,13 @@ def parse_args():
                 "--oracle legacy: " + ", ".join(used)
             )
     else:
-        if not args.grid:
-            ap.error("--grid is required for --oracle jax")
+        if args.generate_grid and not args.grid:
+            ap.error(
+                "--generate-grid requires --grid <output.npz> "
+                "(the .npz path to write the generated grid to)"
+            )
+        if not args.grid and not args.generate_grid:
+            ap.error("--grid or --generate-grid is required for --oracle jax")
         if not args.attract_par_npz:
             ap.error("--attract-par-npz is required for --oracle jax")
         if args.energy_batch <= 0:
@@ -1070,7 +1089,7 @@ def main():
     args = parse_args()
     t0 = time.time()
     verbose = not args.score
-    if not args.score and not args.out_prefix:
+    if not args.score and not args.out_prefix and not args.generate_grid:
         raise ValueError("--out-prefix is required unless --score is used")
 
     if args.disable_jit and args.oracle == "jax":
@@ -1137,6 +1156,82 @@ def main():
         )
         grid_path = args.grid
         par_npz = args.attract_par_npz
+
+        # Optionally generate the grid in-house from the receptor.
+        grid_object = None
+        if args.generate_grid:
+            # --generate-grid: generate the grid, optionally write it, and exit.
+            # --grid is the *output* path (required, validated above).
+            import math as _math
+            import sys as _sys
+
+            _util_dir = os.path.dirname(os.path.abspath(__file__))
+            _jax_root = os.path.dirname(_util_dir)
+            for _p in (_util_dir, _jax_root):
+                if _p not in _sys.path:
+                    _sys.path.insert(0, _p)
+            from grid_generator import generate_grid as _gen_grid
+            from reproduce_grid_score import parse_reduced_pdb as _parse_pdb
+            from native.nb_kernel.forcefields.nonbon8.params import (
+                load_params as _load_params,
+            )
+
+            # Load first receptor ensemble member
+            _ens_lines = open(ens_list_path).read().splitlines()
+            _ens_lines = [l.strip() for l in _ens_lines if l.strip()]
+            _rec_pdb = _ens_lines[0]
+            if not os.path.isabs(_rec_pdb):
+                _rec_pdb = os.path.join(os.path.dirname(ens_list_path), _rec_pdb)
+            _rc, _rt, _rq, _ = _parse_pdb(_rec_pdb)
+            _ff_params = _load_params(par_npz)
+            _ffelec = _math.sqrt(332.053986 / args.epsilon)
+            # Ligand alphabet: use ligand atomtypes if ligand PDB is known,
+            # otherwise fall back to all 98 atomtypes.
+            _lig_atomtypes = None
+            if ligand_pdb_path and os.path.isfile(ligand_pdb_path):
+                _, _lt, _, _ = _parse_pdb(ligand_pdb_path)
+                _lig_atomtypes = _lt
+            if verbose:
+                if _lig_atomtypes is not None:
+                    print(
+                        f"Generating grid in-house from {_rec_pdb} (ligand alphabet from {ligand_pdb_path}) ..."
+                    )
+                else:
+                    print(
+                        f"Generating grid in-house from {_rec_pdb} (all atomtypes) ..."
+                    )
+            grid_object = _gen_grid(
+                rec_coords=_rc,
+                rec_atomtypes=_rt,
+                rec_charges_raw=_rq,
+                ff_params=_ff_params,
+                ff_module=None,
+                ffelec=_ffelec,
+                backend="kernel",
+                lig_atomtypes=_lig_atomtypes,
+            )
+            # Write the grid to the output .npz and exit.
+            from reproduce_grid_score import write_grid_npz as _write_npz
+
+            _write_npz(grid_object, args.grid)
+            if verbose:
+                print(f"Grid written to {args.grid}")
+            import sys as _sys_exit
+
+            _sys_exit.exit(0)
+            grid_path = None  # unreachable; kept for static analysers
+
+        # Dispatch --grid on extension: .npz → read_grid_npz, else legacy binary.
+        if grid_path is not None and grid_path.endswith(".npz"):
+            from reproduce_grid_score import read_grid_npz as _read_npz
+
+            grid_object = _read_npz(grid_path)
+            grid_path = None  # use grid_object path in JaxScoreOracle
+            if verbose:
+                print(
+                    f"Loaded NPZ grid (n_alpha={len(grid_object.alphabet_atomtypes)})"
+                )
+
         oracle = JaxScoreOracle(
             receptor_ens_list=ens_list_path,
             ligand_pdb=ligand_pdb_path,
@@ -1148,6 +1243,7 @@ def main():
             nb_kernel=args.nb_kernel,
             autodiff_potentials=bool(args.autodiff_potentials),
             energy_only=bool(args.energy_only),
+            grid_object=grid_object,
         )
         if verbose:
             print(

@@ -1,6 +1,7 @@
 ## Nonbonded Roadmap (Milestones 1-7)
 
 ### Brief Summary
+
 This roadmap delivers two immediate milestones already agreed (cdie removal and Section 2 MVP rewrite), then adds five follow-up milestones in this order:
 
 1. `cdie` removal + single-forcefield hardcoding.
@@ -17,43 +18,51 @@ This roadmap delivers two immediate milestones already agreed (cdie removal and 
 ### Public API / Interface / Type Changes
 
 1. Milestone 1:
+
 - Remove `--cdie` from maintained CLIs.
 - Remove runtime `cdie` branches from maintained code.
 - Remove runtime `potshape` branches from maintained code and hardcode nonbon8 behavior.
 
-2. Milestone 2:
+1. Milestone 2:
+
 - Introduce Section 2 policy/template kernel structure (MVP subset).
 - Expose manual wrapper symbols equivalent to codegen output for MVP combinations.
 - Keep external `.grid` input path intact.
 - Add minimal Section 5.1 Python forcefield module contract for nonbon8 (`lj_energy`, `elec_energy`, `load_params`).
 
-3. Milestone 3:
+1. Milestone 3:
+
 - Add `codegen_ff.py init` and `codegen_ff.py codegen` sufficient to reproduce nonbon8-generated wrapper output shape.
 - Makefile auto-build path must work for generated forcefield outputs.
 - Python forcefield discovery must load generated forcefield (`dummy`) correctly.
 
-4. Milestone 4:
+1. Milestone 4:
+
 - Validate that codegen emits wrapper variants from FF capabilities:
   - `lj_grad.h` + `elec_grad.h` present -> grad+energy wrappers.
   - either gradient header missing -> energy-only wrappers.
 - Confirm Python symbol probing/dispatch correctly selects available wrapper families.
 
 4a. Milestone 4a:
+
 - Add plateau mode as a template parameter to `pose_loop.h`: `correction` (current behavior: `E(d) - E(plateaudis)`) and `clamp` (grid precomputation: `E(max(d, plateaudis))`).
 - Same split for gradients.
 - Codegen emits wrappers for both modes.
 - Validate that existing concat scoring (first1000 + first10k) is reproduced exactly with `correction` mode — no regression.
 
-5. Milestone 5:
+1. Milestone 5:
+
 - Add in-house grid generation interface and remove runtime requirement for external `.grid` files in that path.
 - Add Python NB dispatch abstraction: a `score_pairs()` function that routes to either JAX (`vmap(ff_module.lj_energy)` etc.) or C kernel (voxel-as-pose via `pose_loop.h`), selected by backend flag.
 - Grid precomputation and NB correction both call through this dispatch — the only difference is input preparation.
 
-6. Milestone 6:
+1. Milestone 6:
+
 - Ensure pure JAX path supports in-house grids without C kernel dependency.
 - Validate that the NB dispatch with `backend="jax"` produces identical results to `backend="kernel"` on the same inputs.
 
-7. Milestone 7:
+1. Milestone 7:
+
 - Add second FF implementation: nonbon12 + cdie (feature present, no validation gate yet).
 
 ---
@@ -61,13 +70,15 @@ This roadmap delivers two immediate milestones already agreed (cdie removal and 
 ### Milestone-by-Milestone Plan
 
 1. Milestone 1: Remove `cdie`, hardcode single FF (`rdie`, nonbon8)
+
 - Update production kernel path and maintained harness kernels (`first1000`, `first10k`).
 - Remove `cdie` and `potshape` runtime branching in maintained paths.
 - Remove `--cdie` from maintained CLI surfaces.
 - Keep current `.grid` reading behavior unchanged.
 - Validate with current first1000/first10k scoring and minimization gates.
 
-2. Milestone 2: Section 2 MVP rewrite (manual boilerplate), minimal Python FF wiring
+1. Milestone 2: Section 2 MVP rewrite (manual boilerplate), minimal Python FF wiring
+
 - Refactor C kernel to policy/template architecture:
   - RotPolicy: Euler only.
   - FFPolicy: nonbon8 only.
@@ -79,7 +90,8 @@ This roadmap delivers two immediate milestones already agreed (cdie removal and 
   - Scoring: concat first1000 and first10k, strict parity.
   - Minimization: distribution/runtime similarity (no pose-by-pose correspondence).
 
-3. Milestone 3: Codegen implementation via temporary `dummy` forcefield
+1. Milestone 3: Codegen implementation via temporary `dummy` forcefield
+
 - Implement `codegen_ff.py init` to create a dummy FF scaffold.
 - Copy nonbon8 physics `.h` files into dummy FF.
 - Implement `codegen_ff.py codegen` so generated C++ output for `dummy` matches nonbon8 content/shape expectations.
@@ -87,7 +99,8 @@ This roadmap delivers two immediate milestones already agreed (cdie removal and 
 - Delete dummy FF after proving workflow.
 - Deliver codegen tests that assert generated output equivalence properties (content and symbols).
 
-4. Milestone 4: Validate capability-based wrapper emission and dispatch
+1. Milestone 4: Validate capability-based wrapper emission and dispatch
+
 - Confirm codegen capability detection works exactly as specified:
   - `lj_grad.h` + `elec_grad.h` present -> grad+energy wrapper set.
   - either gradient header missing -> energy-only wrapper set.
@@ -96,6 +109,7 @@ This roadmap delivers two immediate milestones already agreed (cdie removal and 
 - Regression check: where both variants are available, energy-only scoring equals the energy component of grad+energy within strict tolerance.
 
 4a. Milestone 4a: Plateau mode support in `pose_loop.h`
+
 - Currently `pose_loop.h` hardcodes the NB correction plateau behavior: `E(d) - E(plateaudis)`.
   Grid precomputation needs the opposite: `E(max(d, plateaudis))` (clamp mode).
 - Add a template parameter (or compile-time flag) to `pose_loop.h` selecting between:
@@ -112,7 +126,8 @@ This roadmap delivers two immediate milestones already agreed (cdie removal and 
   generated in-house). M4a only proves that the mode parameterization compiles, links,
   and does not break existing behavior.
 
-5. Milestone 5: In-house grid generation (replace external `.grid` dependency)
+1. Milestone 5: In-house grid generation (replace external `.grid` dependency)
+
 - Implement internal grid generation pipeline.
 - Keep existing external-grid path optionally for transition, but target path uses in-house grid artifacts.
 - Required validation: concat scoring on first1000 + first10k must be **harness-strict** close to current references.
@@ -143,6 +158,7 @@ def score_pairs(coords_i, neighbor_data, ff_params, ff_module, backend="jax"):
 Both the grid generator (computing potential grid values at voxels) and the runtime NB
 correction (computing NB energy for ligand atoms against their neighbors) call through this
 dispatch. The differences are:
+
 - Grid precomputation: `coords_i` = voxel centers, identity rotation, one "pose" per voxel.
 - NB correction: `coords_i` = transformed ligand atom positions, from the pose DOFs.
 - **Plateau distance handling differs between the two uses** (see below).
@@ -150,6 +166,7 @@ dispatch. The differences are:
 **Plateau distance correction — grid vs. NB correction:**
 The grid and the NB correction together must produce the correct total energy `E(d_actual)`.
 They split the work using the plateau distance `plateaudis`:
+
 - **Grid precomputation** stores the energy (and gradients) evaluated with distances clamped
   *at* plateau distance: `d = max(d_actual, plateaudis)`. This gives a smooth potential that
   avoids singularities at short range.
@@ -163,6 +180,17 @@ They split the work using the plateau distance `plateaudis`:
   cannot treat them as identical computations with different inputs — the plateau handling
   is fundamentally different.
 
+> **Note — legacy gradient bug (discovered 2026-03-05):** `grid_calculate.cpp`
+> contains a math error in the plateau region of both `_calc_potential` and
+> `_calc_potential_elec`. After clamping `dsq` and recomputing `rr2`, the
+> scaled displacement `dd` is formed with the *post-clamp* `rr2` instead of
+> the original `1/dsq_orig`. This scales gradient magnitudes inside the plateau
+> by `dsq_orig / plateaudissq < 1`. **Consequence:** gradient channels in
+> legacy `.grid` files are incorrect for voxels inside the plateau sphere.
+> Agreement with legacy grid gradient channels is **not** a validation target.
+> The C kernel (`pose_loop.h`, `nb_kernel_euler_clamp_grad`) uses the correct
+> formula and is the reference for gradient validation.
+
 **C kernel strategy — voxel-as-pose (no kernel restructuring beyond M4a):**
 The C kernel's only entry point remains `pose_loop.h`. For grid precomputation, each voxel is
 wrapped as a pseudo-pose: rotation = identity, translation = voxel center. The pose loop's
@@ -175,6 +203,7 @@ The dispatch abstraction lives entirely on the Python side. No new C entry point
 beyond the two wrapper variants (correction + clamp) emitted by codegen in M4a.
 
 **What already exists — DO NOT reimplement:**
+
 - `util/reproduce_grid_score.py`: contains `read_grid_with_electro()` (grid binary parser,
   returns `Grid` named tuple), `build_kernel()` (returns JAX scoring callable with `.ad` and
   `.pot_ad` variants), `nonbon()` / `elec_dsq_*()` (JAX pairwise energy functions),
@@ -201,12 +230,14 @@ beyond the two wrapper variants (correction + clamp) emitted by codegen in M4a.
   `--grid` argument pointing to in-house output) and confirm the scores match references.
 
 **Early prototype for reference (not production-ready):**
+
 - `test-calc-grid-energy.py` (lines 94-103): builds a `cKDTree` from receptor coordinates,
   queries grid voxel centers, and computes LJ potentials. Single atom type only, no
   electrostatics, no ensemble support. Use as conceptual reference for the KD-tree approach,
   but do not try to extend this script — write a clean module.
 
 **Grid culling scripts (optional, not part of M5 core):**
+
 - `playground/precompute_interior_voxels.py`: patches an existing `.grid` binary to zero out
   interior voxels using KD-tree pre-filter + energy lower-bound check. This is a post-
   processing optimization, not grid generation. It may be integrated later but is not required
@@ -219,6 +250,7 @@ wrong will produce silently incorrect results. The reference implementation is i
 `attract/bin/make-grid.cpp` → `grid_calculate.cpp`.
 
 *Potential grid — values at voxel CORNERS:*
+
 - Voxel `(i, j, k)` stores the potential at position `ori + (i, j, k) * gridspacing`.
   There is no half-voxel offset.
 - At scoring time, a ligand atom at continuous position `p` is mapped to fractional voxel
@@ -231,6 +263,7 @@ wrong will produce silently incorrect results. The reference implementation is i
   Python: `reproduce_grid_score.py` `interpolate_grid()` — identical trilinear interpolation.
 
 *Neighbour grid — lists at voxel CENTERS (half-voxel shifted):*
+
 - The neighbour list for voxel `(i, j, k)` contains receptor atoms within `neighbourdis` of
   position `ori + (i+0.5, j+0.5, k+0.5) * gridspacing` — the **center** of the voxel, not
   the corner.
@@ -242,6 +275,7 @@ wrong will produce silently incorrect results. The reference implementation is i
   Python: `reproduce_grid_score.py` `generate_ind_innergrid()` uses `floor(vox + 0.5)`.
 
 *Outer (big) grid:*
+
 - Same corner convention for potentials, but at double the spacing.
 - Voxel coordinates: `vox_outer = (vox_inner + gridextension) / 2.0`.
 
@@ -251,6 +285,7 @@ the resulting scores will be wrong by O(gridspacing) in position — enough to f
 
 **What the in-house grid generator must produce:**
 The `Grid` named tuple fields (see `read_grid_with_electro` return type):
+
 - `inner_potential_grid`: shape `(nr_vdw_channels, dx, dy, dz, 4)` — energy + 3 gradient
   components per atom type per voxel.
 - `outer_potential_grid`: same shape, for the outer (coarser) grid region.
@@ -263,7 +298,8 @@ The `Grid` named tuple fields (see `read_grid_with_electro` return type):
 The downstream code indexes into these arrays by position. As long as the shapes and semantics
 match, the source (legacy binary vs. in-house Python) is irrelevant.
 
-6. Milestone 6: In-house grid generation without C kernel (pure JAX)
+1. Milestone 6: In-house grid generation without C kernel (pure JAX)
+
 - Run same in-house grid pipeline but force NB backend to JAX-only.
 - Required validation: concat scoring only (first1000 + first10k), harness-strict thresholds.
 
@@ -275,6 +311,7 @@ pipeline works when `backend="jax"` everywhere — both grid precomputation and 
 This is mostly a validation milestone, not a major implementation milestone.
 
 **What already exists — DO NOT reimplement:**
+
 - `JaxScoreOracle` with `nb_kernel="jax"`: this path already works. It uses `main_ad` from
   `build_kernel()` which evaluates both potential grid lookup and NB correction in pure JAX,
   with gradients via `jax.value_and_grad` + `jax.vmap`. No C code is involved.
@@ -299,12 +336,14 @@ This is mostly a validation milestone, not a major implementation milestone.
    This is a unit-level check on the dispatch itself, independent of the full scoring pipeline.
 
 **What to build for M6:**
+
 - A variant of the concat scoring test scripts (or a flag/mode in the existing ones) that
   runs with `--nb-kernel jax` instead of `--nb-kernel nonbon8`.
 - A unit test for `score_pairs()` cross-backend consistency (same inputs, both backends,
   compare outputs).
 
 **What M6 is NOT:**
+
 - It is NOT a rewrite of the JAX scoring pipeline.
 - It is NOT a new grid format or new grid generator.
 - It is NOT a new test harness. The existing `test_first1000_concat_score.sh` /
@@ -317,7 +356,8 @@ This is wrong. The pure JAX scoring path already exists (`nb_kernel="jax"`). The
 generator and NB dispatch are built in M5. M6 is the *intersection*: confirm everything works
 together with `backend="jax"`, and that the two backends agree.
 
-7. Milestone 7: nonbon12 + cdie implementation
+1. Milestone 7: nonbon12 + cdie implementation
+
 - Add forcefield implementation and integration points.
 - No validation/test gate required in this milestone (explicit decision).
 - Mark feature as provisional and testing-deferred in docs/notes.
@@ -327,12 +367,14 @@ together with `backend="jax"`, and that the two backends agree.
 ### Test Cases and Scenarios
 
 1. Canonical rerun scripts (one script per case, each takes `OUT_DIR`):
+
 - `/home/sjoerd/attract-namespace/test/first1000/test_first1000_concat_score.sh`
 - `/home/sjoerd/attract-namespace/test/first10k/test_first10k_concat_score.sh`
 - `/home/sjoerd/attract-namespace/test/first1000/test_first1000_minimization.sh`
 - `/home/sjoerd/attract-namespace/test/first10k/test_first10k_minimization.sh`
 
-2. Inputs used by the four scripts:
+1. Inputs used by the four scripts:
+
 - `/home/sjoerd/attract-namespace/test/first1000/tmp_active_concat.dat`
 - `/home/sjoerd/attract-namespace/test/first10k/tmp_active_concat.dat`
 - `/home/sjoerd/attract-namespace/test/systsearch-ens1-first1000.dat`
@@ -342,7 +384,8 @@ together with `backend="jax"`, and that the two backends agree.
 - `/home/sjoerd/attract-namespace/test/ligandr.pdb`
 - `/home/sjoerd/data/work/attract-jax/attract-par.npz`
 
-3. Score references for energy/gradient checks:
+1. Score references for energy/gradient checks:
+
 - `/home/sjoerd/attract-namespace/test/first1000/score_legacy_first1000_concat_after_gridexcise.score`
 - `/home/sjoerd/attract-namespace/test/first1000/score_jax_fused_first1000_concat_pregridexcise_style.score`
 - `/home/sjoerd/attract-namespace/test/first1000/first1000_target_nb.*.energy.npy`
@@ -350,37 +393,44 @@ together with `backend="jax"`, and that the two backends agree.
 - `/home/sjoerd/attract-namespace/test/first10k/first1000_target_nb.*.energy.npy`
 - `/home/sjoerd/attract-namespace/test/first10k/first1000_target_nb.*.grad.npy`
 
-4. Minimization references on disk (JAX/legacy):
+1. Minimization references on disk (JAX/legacy):
+
 - `/home/sjoerd/attract-namespace/test/first1000/minfor_jax_fused_first1000.*`
 - `/home/sjoerd/attract-namespace/test/first1000/minfor_legacy_first1000.*`
 - `/home/sjoerd/attract-namespace/test/first10k/minfor_jax_fused_first10k.*`
 - `/home/sjoerd/attract-namespace/test/first10k/minfor_legacy_first10k.*`
 - `/home/sjoerd/attract-namespace/test/minfor_jax_fused_first10k_after_gridexcise.*`
 
-5. LRMSD reference inputs:
+1. LRMSD reference inputs:
+
 - `/home/sjoerd/attract-namespace/test/ligand-heavy.pdb`
 - `/home/sjoerd/attract-namespace/test/refe-rmsd-2.pdb`
 - `/home/sjoerd/attract-namespace/test/partner1-ensemble-aa-rmsd.list`
 - `/home/sjoerd/attract-namespace/test/partner1-ensemble/model-1-heavy.pdb`
 
-6. Latest full four-case rerun artifacts (2026-03-02):
+1. Latest full four-case rerun artifacts (2026-03-02):
+
 - `/tmp/status_case_runs_retry_20260302_163727/1_first1000_concat/`
 - `/tmp/status_case_runs_retry_20260302_163727/2_first10k_concat/`
 - `/tmp/status_case_runs_retry_20260302_163727/3_first1000_min_rerun/`
 - `/tmp/status_case_runs_retry_20260302_163727/4_first10k_min_rerun/`
 - `/tmp/status_case_runs_retry_20260302_163727/validation_summary.json`
 
-7. Milestone 1-2 scoring gate:
+1. Milestone 1-2 scoring gate:
+
 - Use strict existing harness/score parity behavior (no relaxed threshold).
 
-8. Milestone 1-2 minimization gate:
+1. Milestone 1-2 minimization gate:
+
 - No pose-by-pose correspondence requirement.
 - Require similar runtime and similar energy/LRMSD distributions (existing decision).
 
-9. Milestone 5-6 gate:
+1. Milestone 5-6 gate:
+
 - Concat scoring only, first1000 + first10k, harness-strict closeness.
 
-10. Milestone 7 gate:
+1. Milestone 7 gate:
+
 - No tests required yet.
 
 ---

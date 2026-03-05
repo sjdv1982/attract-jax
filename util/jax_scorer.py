@@ -41,6 +41,7 @@ import math
 import time
 from collections import namedtuple
 from pathlib import Path
+from typing import Optional
 
 import jax
 import jax.numpy as jnp
@@ -130,8 +131,9 @@ class JaxScoreOracle:
         Path to text file listing receptor ensemble PDB paths (one per line).
     ligand_pdb : str
         Path to reduced ligand PDB.
-    grid_file : str
-        Path to binary .grid file (produced by make-grid).
+    grid_file : str or None
+        Path to binary .grid file (produced by make-grid).  Mutually exclusive
+        with ``grid_object``; exactly one must be provided.
     attract_par_npz : str
         Path to attract-par.npz (pre-computed from attract.par).
     lig_pivot : ndarray (3,)
@@ -140,21 +142,26 @@ class JaxScoreOracle:
         Dielectric constant (default 15.0).
     energy_batch : int
         Max poses per JAX kernel call (controls peak memory).
+    grid_object : Grid namedtuple or None
+        Pre-built Grid (e.g. from ``generate_grid()``).  If provided,
+        ``grid_file`` is ignored.  Exactly one of ``grid_file`` or
+        ``grid_object`` must be supplied.
     """
 
     def __init__(
         self,
         receptor_ens_list: str,
         ligand_pdb: str,
-        grid_file: str,
-        attract_par_npz: str,
-        lig_pivot: np.ndarray,
+        grid_file: Optional[str] = None,
+        attract_par_npz: str = "",
+        lig_pivot: np.ndarray = None,
         epsilon: float = 15.0,
         cdie: bool = False,
         energy_batch: int = 256,
         nb_kernel: str = "jax",
         autodiff_potentials: bool = False,
         energy_only: bool = False,
+        grid_object=None,
     ):
         _ = cdie  # Milestone 1: nonbon8 + rdie fixed, keep arg for compatibility.
         self.energy_batch = int(max(1, energy_batch))
@@ -223,13 +230,25 @@ class JaxScoreOracle:
         )
 
         # --- Grid ---
-        grid = read_grid_with_electro(Path(grid_file).read_bytes())
+        if grid_object is not None:
+            # Use pre-built Grid (e.g. from generate_grid())
+            grid = grid_object
+        elif grid_file is not None:
+            grid = read_grid_with_electro(Path(grid_file).read_bytes())
+        else:
+            raise ValueError(
+                "JaxScoreOracle: exactly one of 'grid_file' or 'grid_object' must be provided"
+            )
 
         # Remap neighbour indices through the rec_mask mapping
-        rec_mapping = np.cumsum(rec_mask) - 1
-        nb_flat = grid.neighbour_grid.reshape(-1)
-        valid = nb_flat < 2**16 - 1
-        nb_flat[valid] = rec_mapping[nb_flat[valid]]
+        # (Only needed when grid was loaded from a binary file and neighbour
+        # indices reference the original unreduced receptor atom ordering.
+        # When grid_object is provided the indices already address the filtered array.)
+        if grid_object is None:
+            rec_mapping = np.cumsum(rec_mask) - 1
+            nb_flat = grid.neighbour_grid.reshape(-1)
+            valid = nb_flat < 2**16 - 1
+            nb_flat[valid] = rec_mapping[nb_flat[valid]]
 
         # Map ligand atom types to grid VDW channels
         alpos = grid.alphabet_atomtypes.tolist()
