@@ -5,6 +5,7 @@ Tests cover:
   1. 'init' mode: correct files created, with expected namespace and YAML structure.
   2. 'codegen' mode: generated .cpp has correct structure, symbols, and headers.
   3. 'codegen' capability detection: grad wrappers emitted iff both *_grad.h present.
+  3a. Milestone 4a: correction/clamp plateau mode wrappers are emitted.
   4. Full build test: dummy FF (nonbon8 physics, dummy namespace) builds to a working .so
      with the expected extern "C" symbols.
   5. Python FF discovery: load_forcefield / find_kernel_so / probe_kernel_symbols
@@ -356,6 +357,18 @@ class TestCodegenContent(unittest.TestCase):
     def test_energy_wrapper_present(self):
         self.assertIn("nb_kernel_euler_energy", self.cpp_text)
 
+    def test_correction_grad_wrapper_present(self):
+        self.assertIn("nb_kernel_euler_correction_grad", self.cpp_text)
+
+    def test_correction_energy_wrapper_present(self):
+        self.assertIn("nb_kernel_euler_correction_energy", self.cpp_text)
+
+    def test_clamp_grad_wrapper_present(self):
+        self.assertIn("nb_kernel_euler_clamp_grad", self.cpp_text)
+
+    def test_clamp_energy_wrapper_present(self):
+        self.assertIn("nb_kernel_euler_clamp_energy", self.cpp_text)
+
     def test_wrappers_are_extern_c(self):
         self.assertIn('extern "C"', self.cpp_text)
 
@@ -363,10 +376,10 @@ class TestCodegenContent(unittest.TestCase):
         self.assertIn("EulerRot", self.cpp_text)
 
     def test_grad_wrapper_instantiates_compute_grad_true(self):
-        self.assertIn("DummyFF, true>", self.cpp_text)
+        self.assertIn("DummyFF, true, PlateauMode::", self.cpp_text)
 
     def test_energy_wrapper_instantiates_compute_grad_false(self):
-        self.assertIn("DummyFF, false>", self.cpp_text)
+        self.assertIn("DummyFF, false, PlateauMode::", self.cpp_text)
 
     def test_validation_helpers_present(self):
         self.assertIn("validate_grad_inputs", self.cpp_text)
@@ -406,10 +419,14 @@ class TestCodegenEnergyOnly(unittest.TestCase):
 
     def test_energy_wrapper_present(self):
         self.assertIn("nb_kernel_euler_energy", self.cpp_text)
+        self.assertIn("nb_kernel_euler_correction_energy", self.cpp_text)
+        self.assertIn("nb_kernel_euler_clamp_energy", self.cpp_text)
 
     def test_grad_wrapper_absent(self):
         """No grad wrapper when either grad header is missing."""
         self.assertNotIn("nb_kernel_euler_grad", self.cpp_text)
+        self.assertNotIn("nb_kernel_euler_correction_grad", self.cpp_text)
+        self.assertNotIn("nb_kernel_euler_clamp_grad", self.cpp_text)
 
     def test_no_lj_grad_include(self):
         self.assertNotIn("lj_grad.h", self.cpp_text)
@@ -421,7 +438,7 @@ class TestCodegenEnergyOnly(unittest.TestCase):
         self.assertNotIn("lj_grad", self.cpp_text)
 
     def test_energy_wrapper_instantiates_compute_grad_false(self):
-        self.assertIn("false>", self.cpp_text)
+        self.assertIn("false, PlateauMode::", self.cpp_text)
 
 
 # ===========================================================================
@@ -447,7 +464,11 @@ class TestCodegenPartialGradHeaders(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             cpp_text = (ff_dir / f"nb_kernel_{case_name}.cpp").read_text()
             self.assertIn("nb_kernel_euler_energy", cpp_text)
+            self.assertIn("nb_kernel_euler_correction_energy", cpp_text)
+            self.assertIn("nb_kernel_euler_clamp_energy", cpp_text)
             self.assertNotIn("nb_kernel_euler_grad", cpp_text)
+            self.assertNotIn("nb_kernel_euler_correction_grad", cpp_text)
+            self.assertNotIn("nb_kernel_euler_clamp_grad", cpp_text)
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -501,6 +522,15 @@ class TestCodegenNonbon8Shape(unittest.TestCase):
 
     def test_generated_has_euler_energy_symbol(self):
         self.assertIn("nb_kernel_euler_energy", self.cpp_text)
+
+    def test_generated_has_plateau_mode_symbols(self):
+        for sym in (
+            "nb_kernel_euler_correction_grad",
+            "nb_kernel_euler_correction_energy",
+            "nb_kernel_euler_clamp_grad",
+            "nb_kernel_euler_clamp_energy",
+        ):
+            self.assertIn(sym, self.cpp_text)
 
     def test_reference_has_same_symbols(self):
         """The reference nb_kernel.cpp must contain both canonical symbols."""
@@ -597,6 +627,14 @@ class TestDummyBuildAndSymbols(unittest.TestCase):
         sym = lib.nb_kernel_euler_energy
         self.assertIsNotNone(sym)
 
+    def test_symbol_plateau_mode_wrappers_present(self):
+        self._skip_if_no_build()
+        lib = ctypes.CDLL(str(DUMMY_SO))
+        self.assertIsNotNone(lib.nb_kernel_euler_correction_grad)
+        self.assertIsNotNone(lib.nb_kernel_euler_correction_energy)
+        self.assertIsNotNone(lib.nb_kernel_euler_clamp_grad)
+        self.assertIsNotNone(lib.nb_kernel_euler_clamp_energy)
+
     def test_no_run_fused_alias_in_dummy_so(self):
         """nb_kernel_run_fused alias no longer exists in any .so."""
         self._skip_if_no_build()
@@ -615,6 +653,10 @@ class TestDummyBuildAndSymbols(unittest.TestCase):
 
         lib = ctypes.CDLL(str(DUMMY_SO))
         syms = probe_kernel_symbols(lib)
+        self.assertIn("nb_kernel_euler_correction_grad", syms)
+        self.assertIn("nb_kernel_euler_correction_energy", syms)
+        self.assertIn("nb_kernel_euler_clamp_grad", syms)
+        self.assertIn("nb_kernel_euler_clamp_energy", syms)
         self.assertIn("nb_kernel_euler_grad", syms)
         self.assertIn("nb_kernel_euler_energy", syms)
         self.assertNotIn("nb_kernel_run_fused", syms)
@@ -735,24 +777,39 @@ class TestKernelDispatchAndParity(unittest.TestCase):
     def test_dispatch_selects_grad_energy_when_both_symbols_exist(self):
         dispatch, grad_fn, energy_fn = self.bind_kernel_dispatch(self.nonbon8_lib)
         self.assertEqual(dispatch.family, "grad_energy")
-        self.assertEqual(dispatch.grad_symbol, "nb_kernel_euler_grad")
-        self.assertEqual(dispatch.energy_symbol, "nb_kernel_euler_energy")
+        self.assertEqual(dispatch.plateau_mode, "correction")
+        self.assertEqual(dispatch.grad_symbol, "nb_kernel_euler_correction_grad")
+        self.assertEqual(dispatch.energy_symbol, "nb_kernel_euler_correction_energy")
+        self.assertFalse(dispatch.uses_legacy_alias)
         self.assertIsNotNone(grad_fn)
         self.assertIsNotNone(energy_fn)
 
     def test_dispatch_selects_energy_only_when_grad_symbol_missing(self):
         dispatch, grad_fn, energy_fn = self.bind_kernel_dispatch(self.energyonly_lib)
         self.assertEqual(dispatch.family, "energy_only")
+        self.assertEqual(dispatch.plateau_mode, "correction")
         self.assertIsNone(dispatch.grad_symbol)
-        self.assertEqual(dispatch.energy_symbol, "nb_kernel_euler_energy")
+        self.assertEqual(dispatch.energy_symbol, "nb_kernel_euler_correction_energy")
+        self.assertFalse(dispatch.uses_legacy_alias)
         self.assertIsNone(grad_fn)
+        self.assertIsNotNone(energy_fn)
+
+    def test_dispatch_can_select_clamp_mode(self):
+        dispatch, grad_fn, energy_fn = self.bind_kernel_dispatch(
+            self.nonbon8_lib, plateau_mode="clamp"
+        )
+        self.assertEqual(dispatch.family, "grad_energy")
+        self.assertEqual(dispatch.plateau_mode, "clamp")
+        self.assertEqual(dispatch.grad_symbol, "nb_kernel_euler_clamp_grad")
+        self.assertEqual(dispatch.energy_symbol, "nb_kernel_euler_clamp_energy")
+        self.assertIsNotNone(grad_fn)
         self.assertIsNotNone(energy_fn)
 
     def test_energy_wrapper_matches_grad_energy_component(self):
         """For grad-capable kernels, energy-only output must equal grad path energy."""
         lib = self.nonbon8_lib
-        fn_grad = lib.nb_kernel_euler_grad
-        fn_energy = lib.nb_kernel_euler_energy
+        fn_grad = lib.nb_kernel_euler_correction_grad
+        fn_energy = lib.nb_kernel_euler_correction_energy
         for fn in (fn_grad, fn_energy):
             fn.argtypes = [
                 ctypes.POINTER(NbFusedStepData),

@@ -451,7 +451,9 @@ class JaxScoreOracle:
                 )
             lib = ctypes.CDLL(str(so))
 
-        dispatch, fn_nb_grad, fn_nb_energy = bind_kernel_dispatch(lib, rotation="euler")
+        dispatch, fn_nb_grad, fn_nb_energy = bind_kernel_dispatch(
+            lib, rotation="euler", plateau_mode="correction"
+        )
         if fn_nb_grad is not None:
             fn_nb_grad.argtypes = [
                 ctypes.POINTER(NbFusedStepData),
@@ -568,7 +570,8 @@ class JaxScoreOracle:
         self._total_kernel_time += time.monotonic() - t0
         self._total_kernel_calls += 1
         if rc != 0:
-            raise RuntimeError(f"nb_kernel_euler_energy failed with error code {rc}")
+            energy_symbol = self._nb["dispatch"].energy_symbol
+            raise RuntimeError(f"{energy_symbol} failed with error code {rc}")
 
     def _score_nb_nonbon8_batch(self, ens, dofs, compute_grad: bool = True):
         ens0 = np.ascontiguousarray(np.asarray(ens, dtype=np.int16) - 1, dtype=np.int16)
@@ -609,7 +612,8 @@ class JaxScoreOracle:
             self._total_kernel_time += time.monotonic() - t0
             self._total_kernel_calls += 1
             if rc != 0:
-                raise RuntimeError(f"nb_kernel_euler_grad failed with error code {rc}")
+                grad_symbol = self._nb["dispatch"].grad_symbol or "nb_kernel_grad"
+                raise RuntimeError(f"{grad_symbol} failed with error code {rc}")
             return out_e, out_g
 
         # Energy-only kernel fallback: approximate NB gradients by central FD.

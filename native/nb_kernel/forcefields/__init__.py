@@ -28,6 +28,10 @@ _REQUIRED_ATTRS = ("lj_energy", "elec_energy", "load_params")
 
 # Canonical extern "C" symbols emitted by codegen_ff.py.
 KNOWN_KERNEL_SYMBOLS = (
+    "nb_kernel_euler_correction_grad",
+    "nb_kernel_euler_correction_energy",
+    "nb_kernel_euler_clamp_grad",
+    "nb_kernel_euler_clamp_energy",
     "nb_kernel_euler_grad",
     "nb_kernel_euler_energy",
 )
@@ -38,8 +42,10 @@ class KernelDispatch:
     """Selected wrapper family for one rotation scheme."""
 
     family: str
+    plateau_mode: str
     grad_symbol: Optional[str]
     energy_symbol: str
+    uses_legacy_alias: bool = False
 
 
 def load_forcefield(ff_spec: str):
@@ -129,10 +135,16 @@ def probe_kernel_symbols(lib: "ctypes.CDLL") -> set:
     return available
 
 
-def select_kernel_dispatch(available_symbols: set, rotation: str = "euler") -> KernelDispatch:
+def select_kernel_dispatch(
+    available_symbols: set, rotation: str = "euler", plateau_mode: str = "correction"
+) -> KernelDispatch:
     """Pick grad+energy or energy-only wrapper family from available symbols."""
-    grad_sym = f"nb_kernel_{rotation}_grad"
-    energy_sym = f"nb_kernel_{rotation}_energy"
+    if plateau_mode not in {"correction", "clamp"}:
+        raise ValueError(
+            f"Unsupported plateau_mode={plateau_mode!r}; expected 'correction' or 'clamp'"
+        )
+    grad_sym = f"nb_kernel_{rotation}_{plateau_mode}_grad"
+    energy_sym = f"nb_kernel_{rotation}_{plateau_mode}_energy"
 
     has_grad = grad_sym in available_symbols
     has_energy = energy_sym in available_symbols
@@ -140,27 +152,55 @@ def select_kernel_dispatch(available_symbols: set, rotation: str = "euler") -> K
     if has_grad and has_energy:
         return KernelDispatch(
             family="grad_energy",
+            plateau_mode=plateau_mode,
             grad_symbol=grad_sym,
             energy_symbol=energy_sym,
         )
     if has_energy:
         return KernelDispatch(
             family="energy_only",
+            plateau_mode=plateau_mode,
             grad_symbol=None,
             energy_symbol=energy_sym,
         )
+
+    # Backward-compatible fallback for old correction-only symbol names.
+    if plateau_mode == "correction":
+        legacy_grad = f"nb_kernel_{rotation}_grad"
+        legacy_energy = f"nb_kernel_{rotation}_energy"
+        has_legacy_grad = legacy_grad in available_symbols
+        has_legacy_energy = legacy_energy in available_symbols
+        if has_legacy_grad and has_legacy_energy:
+            return KernelDispatch(
+                family="grad_energy",
+                plateau_mode=plateau_mode,
+                grad_symbol=legacy_grad,
+                energy_symbol=legacy_energy,
+                uses_legacy_alias=True,
+            )
+        if has_legacy_energy:
+            return KernelDispatch(
+                family="energy_only",
+                plateau_mode=plateau_mode,
+                grad_symbol=None,
+                energy_symbol=legacy_energy,
+                uses_legacy_alias=True,
+            )
+
     raise RuntimeError(
-        f"No callable wrappers for rotation '{rotation}'. "
+        f"No callable wrappers for rotation '{rotation}', plateau_mode '{plateau_mode}'. "
         f"Expected '{energy_sym}' (and optionally '{grad_sym}')."
     )
 
 
 def bind_kernel_dispatch(
-    lib: "ctypes.CDLL", rotation: str = "euler"
+    lib: "ctypes.CDLL", rotation: str = "euler", plateau_mode: str = "correction"
 ) -> Tuple[KernelDispatch, Optional[object], object]:
     """Probe and bind C wrapper functions from a loaded kernel library."""
     available = probe_kernel_symbols(lib)
-    dispatch = select_kernel_dispatch(available, rotation=rotation)
+    dispatch = select_kernel_dispatch(
+        available, rotation=rotation, plateau_mode=plateau_mode
+    )
     grad_fn = getattr(lib, dispatch.grad_symbol) if dispatch.grad_symbol else None
     energy_fn = getattr(lib, dispatch.energy_symbol)
     return dispatch, grad_fn, energy_fn

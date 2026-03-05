@@ -3,14 +3,16 @@
  *
  * The single function template:
  *
- *   template <typename RotPolicy, typename FFPolicy, bool ComputeGrad>
+ *   template <typename RotPolicy, typename FFPolicy, bool ComputeGrad,
+ *             PlateauMode Mode = PlateauMode::Correction>
  *   inline void run_pose_loop_fused(...)
  *
- * is parameterized by three compile-time axes:
+ * is parameterized by four compile-time axes:
  *
  *   RotPolicy   — rotation DOF → matrix mapping (see euler_rot.h)
  *   FFPolicy    — nonbonded force field physics  (see forcefields/<ff>/)
  *   ComputeGrad — whether to compute gradients (true) or energy only (false)
+ *   Mode        — plateau handling (Correction vs Clamp)
  *
  * When ComputeGrad=false the compiler eliminates:
  *   - pm2 computation and storage (dR/dq derivatives)
@@ -68,7 +70,14 @@ namespace
 
 } // anonymous namespace
 
-template <typename RotPolicy, typename FFPolicy, bool ComputeGrad>
+enum class PlateauMode
+{
+    Correction, // E(d) - E(plateau), current NB correction behavior
+    Clamp       // E(max(d, plateau)), grid precomputation behavior
+};
+
+template <typename RotPolicy, typename FFPolicy, bool ComputeGrad,
+          PlateauMode Mode = PlateauMode::Correction>
 inline void run_pose_loop_fused(
     const NbFusedStepData *step,
     const NbFusedGridData *grid,
@@ -201,9 +210,13 @@ inline void run_pose_loop_fused(
                 const double dy0 = hy - rxyz[1];
                 const double dz0 = hz - rxyz[2];
                 const double dsq = dx0 * dx0 + dy0 * dy0 + dz0 * dz0;
-                if (dsq > plateaudissq)
+                const bool within_plateau = dsq <= plateaudissq;
+                if constexpr (Mode == PlateauMode::Correction)
                 {
-                    continue;
+                    if (!within_plateau)
+                    {
+                        continue;
+                    }
                 }
 
                 const double rr2 = 1.0 / dsq;
@@ -225,76 +238,130 @@ inline void run_pose_loop_fused(
                     const double sdx = dx0 * rr2;
                     const double sdy = dy0 * rr2;
                     const double sdz = dz0 * rr2;
-                    // Plateau displacement: scale sdx toward plateau surface
-                    const double ratio = std::sqrt(dsq * plateaudissqinv);
-                    const double pdx = sdx * ratio;
-                    const double pdy = sdy * ratio;
-                    const double pdz = sdz * ratio;
 
-                    // LJ energy + gradient, with plateau correction
-                    double e0, gx0, gy0, gz0;
-                    FFPolicy::lj_grad(
-                        global->rc[tindex], global->ac[tindex],
-                        global->emin[tindex], global->rmin2[tindex],
-                        static_cast<int>(global->ivor[tindex]),
-                        dsq, rr2, sdx, sdy, sdz,
-                        e0, gx0, gy0, gz0);
-
-                    double ep, gxp, gyp, gzp;
-                    FFPolicy::lj_grad(
-                        global->rc[tindex], global->ac[tindex],
-                        global->emin[tindex], global->rmin2[tindex],
-                        static_cast<int>(global->ivor[tindex]),
-                        plateaudissq, plateaudissqinv, pdx, pdy, pdz,
-                        ep, gxp, gyp, gzp);
-
-                    e_pair = e0 - ep;
-                    gx_pair = gx0 - gxp;
-                    gy_pair = gy0 - gyp;
-                    gz_pair = gz0 - gzp;
-
-                    // Electrostatics (gradient path)
-                    const double charge = lig_charge * global->rec_charge[rec_base + rec_idx];
-                    if (std::fabs(charge) > 1.0e-3)
+                    if constexpr (Mode == PlateauMode::Correction)
                     {
-                        double ee0, egx0, egy0, egz0;
-                        FFPolicy::elec_grad(charge, rr2, sdx, sdy, sdz,
-                                            ee0, egx0, egy0, egz0);
+                        // Plateau displacement: scale toward plateau surface.
+                        const double ratio = std::sqrt(dsq * plateaudissqinv);
+                        const double pdx = sdx * ratio;
+                        const double pdy = sdy * ratio;
+                        const double pdz = sdz * ratio;
 
-                        double eep, egxp, egyp, egzp;
-                        FFPolicy::elec_grad(charge, plateaudissqinv, pdx, pdy, pdz,
-                                            eep, egxp, egyp, egzp);
+                        // LJ energy + gradient, with plateau correction
+                        double e0, gx0, gy0, gz0;
+                        FFPolicy::lj_grad(
+                            global->rc[tindex], global->ac[tindex],
+                            global->emin[tindex], global->rmin2[tindex],
+                            static_cast<int>(global->ivor[tindex]),
+                            dsq, rr2, sdx, sdy, sdz,
+                            e0, gx0, gy0, gz0);
 
-                        e_pair += (ee0 - eep);
-                        gx_pair += (egx0 - egxp);
-                        gy_pair += (egy0 - egyp);
-                        gz_pair += (egz0 - egzp);
+                        double ep, gxp, gyp, gzp;
+                        FFPolicy::lj_grad(
+                            global->rc[tindex], global->ac[tindex],
+                            global->emin[tindex], global->rmin2[tindex],
+                            static_cast<int>(global->ivor[tindex]),
+                            plateaudissq, plateaudissqinv, pdx, pdy, pdz,
+                            ep, gxp, gyp, gzp);
+
+                        e_pair = e0 - ep;
+                        gx_pair = gx0 - gxp;
+                        gy_pair = gy0 - gyp;
+                        gz_pair = gz0 - gzp;
+
+                        // Electrostatics (gradient path)
+                        const double charge = lig_charge * global->rec_charge[rec_base + rec_idx];
+                        if (std::fabs(charge) > 1.0e-3)
+                        {
+                            double ee0, egx0, egy0, egz0;
+                            FFPolicy::elec_grad(charge, rr2, sdx, sdy, sdz,
+                                                ee0, egx0, egy0, egz0);
+
+                            double eep, egxp, egyp, egzp;
+                            FFPolicy::elec_grad(charge, plateaudissqinv, pdx, pdy, pdz,
+                                                eep, egxp, egyp, egzp);
+
+                            e_pair += (ee0 - eep);
+                            gx_pair += (egx0 - egxp);
+                            gy_pair += (egy0 - egyp);
+                            gz_pair += (egz0 - egzp);
+                        }
+                    }
+                    else
+                    {
+                        // Clamp mode: evaluate at actual distance unless inside plateau,
+                        // in which case use the projected plateau distance.
+                        const bool use_plateau = within_plateau;
+                        const double ratio = use_plateau ? std::sqrt(dsq * plateaudissqinv) : 1.0;
+                        const double eval_dsq = use_plateau ? plateaudissq : dsq;
+                        const double eval_rr2 = use_plateau ? plateaudissqinv : rr2;
+                        const double eval_dx = sdx * ratio;
+                        const double eval_dy = sdy * ratio;
+                        const double eval_dz = sdz * ratio;
+
+                        FFPolicy::lj_grad(
+                            global->rc[tindex], global->ac[tindex],
+                            global->emin[tindex], global->rmin2[tindex],
+                            static_cast<int>(global->ivor[tindex]),
+                            eval_dsq, eval_rr2, eval_dx, eval_dy, eval_dz,
+                            e_pair, gx_pair, gy_pair, gz_pair);
+
+                        const double charge = lig_charge * global->rec_charge[rec_base + rec_idx];
+                        if (std::fabs(charge) > 1.0e-3)
+                        {
+                            double ee, egx, egy, egz;
+                            FFPolicy::elec_grad(charge, eval_rr2, eval_dx, eval_dy, eval_dz,
+                                                ee, egx, egy, egz);
+                            e_pair += ee;
+                            gx_pair += egx;
+                            gy_pair += egy;
+                            gz_pair += egz;
+                        }
                     }
                 }
                 else
                 {
-                    // Energy-only path: no displacement needed, no gradient variables
-                    const double e0 = FFPolicy::lj_energy(
-                        global->rc[tindex], global->ac[tindex],
-                        global->emin[tindex], global->rmin2[tindex],
-                        static_cast<int>(global->ivor[tindex]),
-                        dsq, rr2);
-
-                    const double ep = FFPolicy::lj_energy(
-                        global->rc[tindex], global->ac[tindex],
-                        global->emin[tindex], global->rmin2[tindex],
-                        static_cast<int>(global->ivor[tindex]),
-                        plateaudissq, plateaudissqinv);
-
-                    e_pair = e0 - ep;
-
-                    // Electrostatics (energy-only path)
-                    const double charge = lig_charge * global->rec_charge[rec_base + rec_idx];
-                    if (std::fabs(charge) > 1.0e-3)
+                    if constexpr (Mode == PlateauMode::Correction)
                     {
-                        const double ee0 = FFPolicy::elec_energy(charge, rr2);
-                        const double eep = FFPolicy::elec_energy(charge, plateaudissqinv);
-                        e_pair += (ee0 - eep);
+                        // Energy-only correction path.
+                        const double e0 = FFPolicy::lj_energy(
+                            global->rc[tindex], global->ac[tindex],
+                            global->emin[tindex], global->rmin2[tindex],
+                            static_cast<int>(global->ivor[tindex]),
+                            dsq, rr2);
+
+                        const double ep = FFPolicy::lj_energy(
+                            global->rc[tindex], global->ac[tindex],
+                            global->emin[tindex], global->rmin2[tindex],
+                            static_cast<int>(global->ivor[tindex]),
+                            plateaudissq, plateaudissqinv);
+
+                        e_pair = e0 - ep;
+
+                        // Electrostatics (energy-only path)
+                        const double charge = lig_charge * global->rec_charge[rec_base + rec_idx];
+                        if (std::fabs(charge) > 1.0e-3)
+                        {
+                            const double ee0 = FFPolicy::elec_energy(charge, rr2);
+                            const double eep = FFPolicy::elec_energy(charge, plateaudissqinv);
+                            e_pair += (ee0 - eep);
+                        }
+                    }
+                    else
+                    {
+                        const double eval_dsq = within_plateau ? plateaudissq : dsq;
+                        const double eval_rr2 = within_plateau ? plateaudissqinv : rr2;
+                        e_pair = FFPolicy::lj_energy(
+                            global->rc[tindex], global->ac[tindex],
+                            global->emin[tindex], global->rmin2[tindex],
+                            static_cast<int>(global->ivor[tindex]),
+                            eval_dsq, eval_rr2);
+
+                        const double charge = lig_charge * global->rec_charge[rec_base + rec_idx];
+                        if (std::fabs(charge) > 1.0e-3)
+                        {
+                            e_pair += FFPolicy::elec_energy(charge, eval_rr2);
+                        }
                     }
                 }
 

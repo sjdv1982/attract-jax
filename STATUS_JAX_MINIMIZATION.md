@@ -93,6 +93,30 @@ LRMSD verification:
   - pregrad: best `14.413`, median `63.5435`, p10 `43.5241`
   - autodiff: best `11.017`, median `64.1995`, p10 `43.8858`
 
+## 2026-03-05 Timing Rerun (after milestone 4a, Measured)
+
+Rerun roots:
+
+- `/home/sjoerd/attract-namespace/attract-jax/validation/m4a/timings_rerun_first1000/`
+- `/home/sjoerd/attract-namespace/attract-jax/validation/m4a/timings_rerun_first10k/`
+
+Command protocol:
+
+- `test/first1000/test_first1000_concat_score.sh <OUT_DIR>`
+- `test/first10k/test_first10k_concat_score.sh <OUT_DIR>`
+
+Concat-score timing snapshot (after milestone 4a):
+
+| Case | Pregrad | Autodiff | STATUS pregrad reference | Check |
+|---|---:|---:|---:|---|
+| `first1000` concat score (`tmp_active_concat.dat`) | `67.604 s` | `60.837 s` | `39.26 s` | Pregrad `+72.20%`, autodiff `+54.96%` vs STATUS pregrad reference |
+| `first10k` concat score (`tmp_active_concat.dat`) | `401.676 s` | `428.477 s` | `323.10 s` | Pregrad `+24.32%`, autodiff `+32.61%` vs STATUS pregrad reference |
+
+Harness status lines:
+
+- `first1000_concat_pregrad_vs_status WARN measured=67.604s expected=39.260s delta_pct=+72.20% tol_pct=20.0%`
+- `first10k_concat_pregrad_vs_status WARN measured=401.676s expected=323.100s delta_pct=+24.32% tol_pct=20.0%`
+
 ## Energy-Only Score Output Update (2026-03-04)
 
 Objective of this update:
