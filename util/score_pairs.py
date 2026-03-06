@@ -3,8 +3,10 @@
 score_pairs.py — Python NB dispatch abstraction (Milestone 5).
 
 ``score_pairs()`` evaluates pairwise nonbonded energy (and optionally the
-spatial gradient w.r.t. query position) over precomputed neighbour lists,
-routing to either a pure-JAX backend or the compiled C kernel backend.
+spatial gradient w.r.t. query position) over precomputed neighbour lists.
+The backend (JAX or compiled C kernel) is selected automatically: if a
+compiled ``nb_kernel_<forcefield>.so`` is found next to the force-field
+package, the kernel backend is used; otherwise pure JAX is used.
 
 Both the in-house grid generator (M5) and the NB correction path call through
 this dispatch.  The difference is the plateau mode:
@@ -18,32 +20,31 @@ this dispatch.  The difference is the plateau mode:
       Runtime NB correction: ``E(d) - E(plateaudis)`` for pairs inside the
       plateau.  Only pairs with ``d < plateaudis`` contribute.
 
-Backend dispatch
-----------------
-  backend="jax"
-      Pure JAX via ``jnp.vmap``/``jit``.  Uses ``ff_module.lj_energy`` and
-      ``ff_module.elec_energy`` from the force-field module.  Gradients
-      returned via ``jax.grad`` through the energy function.
-
-  backend="kernel"
-      Calls the compiled C kernel via ctypes.  Each query position is
-      wrapped as a pseudo-pose (identity rotation, translation = query
-      position) with a single probe atom at the origin.  The correct
-      plateau-mode symbol (``correction`` or ``clamp``) is selected
+Backend selection (automatic)
+------------------------------
+  kernel  (preferred)
+      Used when ``nb_kernel_<forcefield>.so`` is found near the force-field
+      package.  Calls the compiled C kernel via ctypes; each query position is
+      wrapped as a pseudo-pose.  The correct plateau-mode symbol is selected
       automatically from the loaded shared library.
+
+  jax  (fallback)
+      Pure JAX via ``jnp.vmap``/``jit``.  Used when no compiled kernel is
+      found for the requested force field.
 
 Public API
 ----------
 ``score_pairs(query_coords, rec_coords, rec_atomtypes_idx, rec_charges_scaled,
-              query_atomtype_idx, query_charge, ff_params, ff_module,
+              query_atomtype_idx, query_charge, ff_params, forcefield,
               nr_neigh, nb_start, nb_concat, origin, gridspacing, dim,
-              plateaudis_sq, plateau_mode, backend, return_gradients)``
+              plateaudis_sq, plateau_mode, return_gradients)``
 
 All arrays must be NumPy.  JAX arrays are accepted and will be converted
 internally where needed (at a copy cost); pass NumPy for best performance.
 """
 
 import ctypes
+import subprocess
 import sys
 from pathlib import Path
 from typing import Optional, Tuple
@@ -53,6 +54,84 @@ import jax.numpy as jnp
 import numpy as np
 
 jax.config.update("jax_enable_x64", True)
+
+# ---------------------------------------------------------------------------
+# Force-field + kernel loader (cached per forcefield name)
+# ---------------------------------------------------------------------------
+
+_ff_lib_cache: dict = {}
+
+
+def _load_ff_and_lib(forcefield: str):
+    """Load the ff_module for *forcefield* and obtain its kernel library.
+
+    Backend selection is based on the ``lj.h`` header in the force-field
+    package directory:
+
+    - If ``lj.h`` is absent or is a generated skeleton (contains ``// TODO``),
+      the JAX backend is used and ``lib`` is ``None``.
+    - Otherwise the kernel backend is required.  The compiled
+      ``nb_kernel_<forcefield>.so`` is located by walking up the directory
+      tree from the FF package.  If it is not found, ``make nb_kernel_<name>.so``
+      is attempted in the ``native/nb_kernel`` build directory.  If compilation
+      fails, a ``RuntimeError`` is raised.
+
+    Results are cached so subsequent calls for the same name are free.
+
+    Parameters
+    ----------
+    forcefield : str
+        Short forcefield name, e.g. ``"nonbon8"``.
+
+    Returns
+    -------
+    ff_module : module
+    lib : ctypes.CDLL or None
+    """
+    if forcefield in _ff_lib_cache:
+        return _ff_lib_cache[forcefield]
+
+    kernel_root = Path(__file__).resolve().parents[1] / "native" / "nb_kernel"
+    if str(kernel_root) not in sys.path:
+        sys.path.insert(0, str(kernel_root))
+
+    from forcefields import find_kernel_so, load_forcefield  # noqa: PLC0415
+
+    ff_module = load_forcefield(f"forcefields.{forcefield}")
+
+    # Determine whether the kernel backend is intended by inspecting lj.h.
+    ff_dir = Path(ff_module.__file__).parent
+    lj_h = ff_dir / "lj.h"
+    kernel_intended = lj_h.exists() and "// TODO" not in lj_h.read_text()
+
+    if kernel_intended:
+        lib = find_kernel_so(ff_module)
+        if lib is None:
+            so_name = f"nb_kernel_{forcefield}.so"
+            result = subprocess.run(
+                ["make", so_name],
+                cwd=str(kernel_root),
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"Kernel backend required for force field '{forcefield}' "
+                    f"(lj.h is not a skeleton) but '{so_name}' is missing "
+                    f"and compilation failed:\n{result.stderr}"
+                )
+            lib = find_kernel_so(ff_module)
+            if lib is None:
+                raise RuntimeError(
+                    f"make succeeded but '{so_name}' still not found near "
+                    f"{ff_dir}; check the Makefile output directory."
+                )
+    else:
+        lib = None
+
+    _ff_lib_cache[forcefield] = (ff_module, lib)
+    return ff_module, lib
+
 
 # ---------------------------------------------------------------------------
 # ctypes structures (shared with jax_scorer.py; duplicated here to avoid
@@ -661,7 +740,7 @@ def score_pairs(
     query_atomtype_idx: int,
     query_charge: float,
     ff_params,
-    ff_module,
+    forcefield: str,
     nr_neigh: np.ndarray,
     nb_start: np.ndarray,
     nb_concat: np.ndarray,
@@ -670,12 +749,14 @@ def score_pairs(
     dim: np.ndarray,
     plateaudis_sq: float,
     plateau_mode: str = "clamp",
-    backend: str = "jax",
     return_gradients: bool = False,
     batch_size: int = 16384,
-    lib: Optional["ctypes.CDLL"] = None,
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-    """Evaluate pairwise NB energy over neighbour lists, JAX or kernel backend.
+    """Evaluate pairwise NB energy over neighbour lists.
+
+    The backend (JAX or compiled C kernel) is selected automatically: if
+    ``nb_kernel_<forcefield>.so`` is found near the force-field package the
+    kernel backend is used; otherwise pure JAX is used.
 
     Parameters
     ----------
@@ -694,9 +775,11 @@ def score_pairs(
         unit electrostatic potential grid channel.
     ff_params : FFParams
         Namedtuple with rc, ac, ivor, emin, rmin2 2-D arrays.
-    ff_module : module
-        Force-field module (``lj_energy``, ``elec_energy``).  Used for the
-        kernel-backend's library lookup when ``lib`` is not provided.
+    forcefield : str
+        Short force-field name (e.g. ``"nonbon8"``).  The corresponding
+        ``forcefields.<forcefield>`` module is imported automatically.
+        If ``nb_kernel_<forcefield>.so`` is found near the FF package the
+        kernel backend is used; otherwise pure JAX is used.
     nr_neigh : (N,) int32
         Number of neighbours for each query position.
     nb_start : (N,) int64
@@ -712,21 +795,17 @@ def score_pairs(
     plateaudis_sq : float
         Plateau distance squared (Å²).
     plateau_mode : "clamp" | "correction"
-    backend : "jax" | "kernel"
     return_gradients : bool
-        JAX backend only.  Return dE/d(query_pos) alongside energies.
+        Return dE/d(query_pos) alongside energies (JAX backend) or from the
+        kernel's grad symbol (kernel backend).
     batch_size : int
         JAX backend: queries per JIT call.
-    lib : ctypes.CDLL or None
-        Pre-loaded kernel shared library.  Required for ``backend="kernel"``.
-        If None and ``backend="kernel"``, the function attempts to locate
-        ``nb_kernel_nonbon8.so`` next to the force-field module.
 
     Returns
     -------
     energies : (N,) float64
     gradients : (N, 3) float64 or None
-        None unless ``return_gradients=True`` and ``backend="jax"``.
+        None unless ``return_gradients=True``.
     """
     query_coords = np.asarray(query_coords, dtype=np.float64)
     rec_coords = np.asarray(rec_coords, dtype=np.float64)
@@ -740,41 +819,11 @@ def score_pairs(
 
     if plateau_mode not in ("clamp", "correction"):
         raise ValueError(f"Invalid plateau_mode={plateau_mode!r}")
-    if backend not in ("jax", "kernel"):
-        raise ValueError(f"Invalid backend={backend!r}")
 
-    if backend == "jax":
-        return score_pairs_jax(
-            query_coords=query_coords,
-            rec_coords=rec_coords,
-            rec_atomtypes_idx=rec_atomtypes_idx,
-            rec_charges_scaled=rec_charges_scaled,
-            query_atomtype_idx=query_atomtype_idx,
-            query_charge=query_charge,
-            ff_params=ff_params,
-            ff_module=ff_module,
-            nr_neigh=nr_neigh,
-            nb_start=nb_start,
-            nb_concat=nb_concat,
-            plateaudis_sq=plateaudis_sq,
-            plateau_mode=plateau_mode,
-            return_gradients=return_gradients,
-            batch_size=batch_size,
-        )
-    else:
-        # kernel backend
-        if lib is None:
-            kernel_root = Path(__file__).resolve().parents[1] / "native" / "nb_kernel"
-            so = kernel_root / "nb_kernel_nonbon8.so"
-            if not so.exists():
-                raise RuntimeError(
-                    f"No kernel .so found at {so}; run `make` in {kernel_root}"
-                )
-            lib = ctypes.CDLL(str(so))
-            if str(kernel_root) not in sys.path:
-                sys.path.insert(0, str(kernel_root))
+    ff_module, lib = _load_ff_and_lib(forcefield)
 
-        energies, gradients = score_pairs_kernel(
+    if lib is not None:
+        return score_pairs_kernel(
             query_coords=query_coords,
             rec_coords=rec_coords,
             rec_atomtypes_idx=rec_atomtypes_idx,
@@ -793,4 +842,21 @@ def score_pairs(
             plateau_mode=plateau_mode,
             return_gradients=return_gradients,
         )
-        return energies, gradients
+    else:
+        return score_pairs_jax(
+            query_coords=query_coords,
+            rec_coords=rec_coords,
+            rec_atomtypes_idx=rec_atomtypes_idx,
+            rec_charges_scaled=rec_charges_scaled,
+            query_atomtype_idx=query_atomtype_idx,
+            query_charge=query_charge,
+            ff_params=ff_params,
+            ff_module=ff_module,
+            nr_neigh=nr_neigh,
+            nb_start=nb_start,
+            nb_concat=nb_concat,
+            plateaudis_sq=plateaudis_sq,
+            plateau_mode=plateau_mode,
+            return_gradients=return_gradients,
+            batch_size=batch_size,
+        )

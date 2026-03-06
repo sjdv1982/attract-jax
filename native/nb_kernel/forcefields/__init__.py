@@ -88,11 +88,12 @@ def load_forcefield(ff_spec: str):
 
 
 def find_kernel_so(ff_module) -> "ctypes.CDLL | None":
-    """Look for nb_kernel_<name>.so next to the force field module.
+    """Look for nb_kernel_<name>.so near the force field module.
 
-    The convention (Section 5.6) is that the shared library lives in the same
-    directory as the force field Python package, named ``nb_kernel_<name>.so``
-    where *name* is the last component of the module's ``__name__``.
+    Searches from the FF package directory upward (up to 4 levels) for a file
+    named ``nb_kernel_<name>.so``, where *name* is the last component of the
+    module's ``__name__``.  This accommodates layouts where the compiled kernel
+    sits in a parent directory of the force field Python package.
 
     Parameters
     ----------
@@ -106,9 +107,13 @@ def find_kernel_so(ff_module) -> "ctypes.CDLL | None":
     """
     ff_dir = Path(ff_module.__file__).parent
     ff_name = ff_module.__name__.split(".")[-1]
-    so_path = ff_dir / f"nb_kernel_{ff_name}.so"
-    if so_path.exists():
-        return ctypes.CDLL(str(so_path))
+    so_name = f"nb_kernel_{ff_name}.so"
+    candidate = ff_dir
+    for _ in range(4):
+        so_path = candidate / so_name
+        if so_path.exists():
+            return ctypes.CDLL(str(so_path))
+        candidate = candidate.parent
     return None
 
 

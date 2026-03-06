@@ -1208,9 +1208,8 @@ def main():
                 rec_atomtypes=_rt,
                 rec_charges_raw=_rq,
                 ff_params=_ff_params,
-                ff_module=None,
+                forcefield="nonbon8",
                 ffelec=_ffelec,
-                backend="kernel",
                 lig_atomtypes=_lig_atomtypes,
             )
             if args.generate_grid:
