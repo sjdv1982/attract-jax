@@ -154,7 +154,10 @@ class JaxScoreOracle:
 
     def __init__(
         self,
-        receptor_ens_list: str,
+        receptor_ens_list: Optional[str] = None,
+        receptor_ensemble: Optional[np.ndarray] = None,
+        receptor_atomtypes: Optional[np.ndarray] = None,
+        receptor_charges: Optional[np.ndarray] = None,
         ligand_pdb: Optional[str] = None,
         ligand_ensemble: Optional[np.ndarray] = None,
         ligand_atomtypes: Optional[np.ndarray] = None,
@@ -178,21 +181,61 @@ class JaxScoreOracle:
         self._energy_only = bool(energy_only)
 
         # --- Load receptor ensemble ---
-        with open(receptor_ens_list) as f:
-            rec_files = [line.strip() for line in f if line.strip()]
-        if not rec_files:
-            raise ValueError("Empty receptor ensemble list")
-
-        list_dir = Path(receptor_ens_list).resolve().parent
         rec_coords_all, rec_types_all, rec_charge_all = [], [], []
-        for rf in rec_files:
-            p = Path(rf)
-            if not p.is_absolute():
-                p = list_dir / p
-            c, a, q, _w = parse_reduced_pdb(str(p))
-            rec_coords_all.append(c)
-            rec_types_all.append(a)
-            rec_charge_all.append(q)
+        if receptor_ensemble is not None:
+            rec_coords_ens_raw = np.asarray(receptor_ensemble, dtype=np.float64)
+            if rec_coords_ens_raw.ndim == 2:
+                if rec_coords_ens_raw.shape[1] != 3:
+                    raise ValueError(
+                        f"receptor_ensemble must have shape (N,3) or (E,N,3), got {rec_coords_ens_raw.shape}"
+                    )
+                rec_coords_ens_raw = rec_coords_ens_raw[None, :, :]
+            elif rec_coords_ens_raw.ndim != 3 or rec_coords_ens_raw.shape[2] != 3:
+                raise ValueError(
+                    f"receptor_ensemble must have shape (N,3) or (E,N,3), got {rec_coords_ens_raw.shape}"
+                )
+            if receptor_atomtypes is None:
+                raise ValueError(
+                    "receptor_atomtypes is required with receptor_ensemble"
+                )
+            rec_types0 = np.asarray(receptor_atomtypes, dtype=np.int32)
+            if rec_types0.ndim != 1 or len(rec_types0) != rec_coords_ens_raw.shape[1]:
+                raise ValueError(
+                    "receptor_atomtypes must have shape (N,) matching receptor_ensemble"
+                )
+            if receptor_charges is None:
+                rec_charge0 = np.zeros((rec_coords_ens_raw.shape[1],), dtype=np.float64)
+            else:
+                rec_charge0 = np.asarray(receptor_charges, dtype=np.float64)
+                if rec_charge0.ndim != 1 or len(rec_charge0) != rec_coords_ens_raw.shape[1]:
+                    raise ValueError(
+                        "receptor_charges must have shape (N,) matching receptor_ensemble"
+                    )
+            rec_coords_all = [
+                np.asarray(rec_coords_ens_raw[i], dtype=np.float64)
+                for i in range(rec_coords_ens_raw.shape[0])
+            ]
+            rec_types_all = [rec_types0.copy() for _ in range(rec_coords_ens_raw.shape[0])]
+            rec_charge_all = [rec_charge0.copy() for _ in range(rec_coords_ens_raw.shape[0])]
+        else:
+            if receptor_ens_list is None:
+                raise ValueError(
+                    "Either receptor_ens_list or receptor_ensemble must be provided"
+                )
+            with open(receptor_ens_list) as f:
+                rec_files = [line.strip() for line in f if line.strip()]
+            if not rec_files:
+                raise ValueError("Empty receptor ensemble list")
+
+            list_dir = Path(receptor_ens_list).resolve().parent
+            for rf in rec_files:
+                p = Path(rf)
+                if not p.is_absolute():
+                    p = list_dir / p
+                c, a, q, _w = parse_reduced_pdb(str(p))
+                rec_coords_all.append(c)
+                rec_types_all.append(a)
+                rec_charge_all.append(q)
 
         # --- Load ligand ---
         if ligand_ensemble is not None:

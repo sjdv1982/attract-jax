@@ -3,7 +3,7 @@
 
 import argparse
 import re
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 
@@ -55,12 +55,69 @@ def load_header(template_dat: str) -> List[str]:
     return header
 
 
+def load_ligand_pivot(
+    ligand_pdb: Optional[str],
+    ligand_ensemble: Optional[str],
+    ligand_pivot: Optional[List[float]],
+) -> Optional[np.ndarray]:
+    if ligand_pivot is not None:
+        arr = np.asarray(ligand_pivot, dtype=np.float64)
+        if arr.shape != (3,):
+            raise ValueError(f"Expected 3 pivot values, got {arr.shape}")
+        return arr
+
+    if ligand_ensemble:
+        lig = np.load(ligand_ensemble)
+        if lig.ndim == 3:
+            lig0 = lig[0]
+        elif lig.ndim == 2:
+            lig0 = lig
+        else:
+            raise ValueError(
+                f"Expected ligand ensemble shape (N,3) or (C,N,3), got {lig.shape}"
+            )
+        if lig0.ndim != 2 or lig0.shape[1] != 3:
+            raise ValueError(
+                f"Expected ligand ensemble shape (N,3) or (C,N,3), got {lig.shape}"
+            )
+        return np.mean(np.asarray(lig0, dtype=np.float64), axis=0)
+
+    if ligand_pdb:
+        coords = []
+        with open(ligand_pdb) as f:
+            for line in f:
+                if line.startswith("ATOM"):
+                    coords.append(
+                        (float(line[30:38]), float(line[38:46]), float(line[46:54]))
+                    )
+        if not coords:
+            raise ValueError(f"No ATOM records found in ligand PDB: {ligand_pdb}")
+        return np.mean(np.asarray(coords, dtype=np.float64), axis=0)
+
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("input_npy", help="input .npy with shape (N, 4, 4)")
     ap.add_argument("output_dat", help="output ATTRACT .dat")
     ap.add_argument("--template-dat", help="template .dat header source (recommended: start.dat)")
     ap.add_argument("--ens-npy", help="optional .npy with ensemble indices (1-based as in ATTRACT)")
+    ap.add_argument(
+        "--ligand-pdb",
+        help="optional ligand PDB used to derive the pivot for non-centered DOFs",
+    )
+    ap.add_argument(
+        "--ligand-ensemble",
+        help="optional ligand coordinate .npy used to derive the pivot for non-centered DOFs",
+    )
+    ap.add_argument(
+        "--ligand-pivot",
+        nargs=3,
+        type=float,
+        metavar=("X", "Y", "Z"),
+        help="explicit ligand pivot to invert mat4 -> ATTRACT translation DOFs",
+    )
     args = ap.parse_args()
 
     mats = np.load(args.input_npy)
@@ -68,6 +125,7 @@ def main():
         raise ValueError(f"Expected (N,4,4), got {mats.shape}")
 
     header = load_header(args.template_dat)
+    pivot = load_ligand_pivot(args.ligand_pdb, args.ligand_ensemble, args.ligand_pivot)
 
     ens = None
     if args.ens_npy:
@@ -82,8 +140,12 @@ def main():
             f.write(f"#{i}\n")
             f.write("           0           0           0           0           0           0\n")
 
-            phi, ssi, rot = rotmat_to_euler_attr(np.asarray(mat[:3, :3].T, dtype=np.float64))
-            xa, ya, za = [float(v) for v in mat[3, :3]]
+            rot_row = np.asarray(mat[:3, :3], dtype=np.float64)
+            phi, ssi, rot = rotmat_to_euler_attr(rot_row.T)
+            trans = np.asarray(mat[3, :3], dtype=np.float64)
+            if pivot is not None:
+                trans = trans - pivot + pivot.dot(rot_row)
+            xa, ya, za = [float(v) for v in trans]
 
             if ens is None:
                 f.write(
@@ -99,4 +161,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

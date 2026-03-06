@@ -1122,6 +1122,46 @@ def resolve_receptor_ensemble_list(args, test_dir: str):
     return list_path, tmpdir_ctx
 
 
+def resolve_receptor_inputs(args, test_dir: str):
+    if args.receptor_coordinates:
+        rec_coords = np.asarray(np.load(args.receptor_coordinates), dtype=np.float64)
+        if rec_coords.ndim == 2:
+            if rec_coords.shape[1] != 3:
+                raise ValueError(
+                    f"--receptor-coordinates expected shape (N,3) or (E,N,3), got {rec_coords.shape}"
+                )
+        elif rec_coords.ndim != 3 or rec_coords.shape[2] != 3:
+            raise ValueError(
+                f"--receptor-coordinates expected shape (N,3) or (E,N,3), got {rec_coords.shape}"
+            )
+        natoms = rec_coords.shape[-2]
+        rec_atomtypes = _load_required_vector(
+            args.receptor_atomtypes, natoms, "--receptor-atomtypes", np.int32
+        )
+        if args.receptor_charges:
+            rec_charges = _load_required_vector(
+                args.receptor_charges, natoms, "--receptor-charges", np.float64
+            )
+        else:
+            rec_charges = np.zeros((natoms,), dtype=np.float64)
+        return {
+            "receptor_ens_list": None,
+            "receptor_ensemble": rec_coords,
+            "receptor_atomtypes": rec_atomtypes,
+            "receptor_charges": rec_charges,
+            "tmp_ctx": None,
+        }
+
+    ens_list_path, tmp_ctx = resolve_receptor_ensemble_list(args, test_dir)
+    return {
+        "receptor_ens_list": ens_list_path,
+        "receptor_ensemble": None,
+        "receptor_atomtypes": None,
+        "receptor_charges": None,
+        "tmp_ctx": tmp_ctx,
+    }
+
+
 def resolve_attract_paths(test_dir, ligand_pdb=None):
     attractdir = os.environ.get("ATTRACTDIR", "")
     if not attractdir:
@@ -1233,6 +1273,21 @@ def parse_args():
         ),
     )
     ap.add_argument(
+        "--receptor-coordinates",
+        default=None,
+        help="optional receptor coordinate .npy with shape (N,3) or (E,N,3)",
+    )
+    ap.add_argument(
+        "--receptor-atomtypes",
+        default=None,
+        help="required with --receptor-coordinates: per-atom ATTRACT types (.npy)",
+    )
+    ap.add_argument(
+        "--receptor-charges",
+        default=None,
+        help="optional with --receptor-coordinates: per-atom charges (.npy)",
+    )
+    ap.add_argument(
         "--ligand-pdb",
         default=None,
         help=(
@@ -1336,10 +1391,16 @@ def parse_args():
                 "The following options are JAX-only and cannot be used with "
                 "--oracle legacy: " + ", ".join(used)
             )
-        if args.ligand_ensemble or args.ligand_pdb_list or args.ligand_conformers:
+        if (
+            args.ligand_ensemble
+            or args.ligand_pdb_list
+            or args.ligand_conformers
+            or args.receptor_coordinates
+        ):
             ap.error(
-                "--oracle legacy only supports --ligand-pdb; "
-                "--ligand-ensemble/--ligand-pdb-list/--ligand-conformers require --oracle jax"
+                "--oracle legacy only supports PDB/list receptor+ligand inputs; "
+                "--ligand-ensemble/--ligand-pdb-list/--ligand-conformers/"
+                "--receptor-coordinates require --oracle jax"
             )
     else:
         if args.generate_grid and not args.grid:
@@ -1353,6 +1414,19 @@ def parse_args():
             ap.error("--energy-batch must be >= 1")
     if args.energy_only and not args.score:
         ap.error("--energy-only is only valid together with --score")
+    receptor_mode_count = int(bool(args.receptor_ens_list)) + int(bool(args.receptor_pdb)) + int(
+        bool(args.receptor_coordinates)
+    )
+    if receptor_mode_count > 1:
+        ap.error(
+            "--receptor-ens-list, --receptor-pdb, and --receptor-coordinates are mutually exclusive"
+        )
+    if args.receptor_coordinates and not args.receptor_atomtypes:
+        ap.error("--receptor-coordinates requires --receptor-atomtypes")
+    if args.receptor_atomtypes and not args.receptor_coordinates:
+        ap.error("--receptor-atomtypes is only valid with --receptor-coordinates")
+    if args.receptor_charges and not args.receptor_coordinates:
+        ap.error("--receptor-charges is only valid with --receptor-coordinates")
     ligand_mode_count = int(bool(args.ligand_pdb)) + int(bool(args.ligand_ensemble)) + int(
         bool(args.ligand_pdb_list)
     )
@@ -1430,14 +1504,13 @@ def main():
 
     # --- Build oracle ---
     tmpdir_ctx = None
-    receptor_ens_list_ctx = None
+    receptor_inputs = resolve_receptor_inputs(args, test_dir)
+    receptor_ens_list_ctx = receptor_inputs["tmp_ctx"]
     oracle = None
     if args.oracle == "jax":
         from jax_scorer import JaxScoreOracle
 
-        ens_list_path, receptor_ens_list_ctx = resolve_receptor_ensemble_list(
-            args, test_dir
-        )
+        ens_list_path = receptor_inputs["receptor_ens_list"]
         grid_path = args.grid
         par_npz = args.attract_par_npz
 
@@ -1517,6 +1590,9 @@ def main():
 
         oracle = JaxScoreOracle(
             receptor_ens_list=ens_list_path,
+            receptor_ensemble=receptor_inputs["receptor_ensemble"],
+            receptor_atomtypes=receptor_inputs["receptor_atomtypes"],
+            receptor_charges=receptor_inputs["receptor_charges"],
             ligand_pdb=ligand_pdb_path,
             ligand_ensemble=ligand_inputs["ligand_ensemble"],
             ligand_atomtypes=ligand_inputs["ligand_atomtypes"],
