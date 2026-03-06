@@ -1211,6 +1211,14 @@ def parse_args():
         action="store_true",
         help="with --score: print energy-only legacy-style blocks (omit Gradients lines)",
     )
+    ap.add_argument(
+        "--benchmark-steady-state",
+        action="store_true",
+        help=(
+            "benchmarking instrument for JAX --score: run one untimed warmup "
+            "score pass, then time a second steady-state pass and report it to stderr"
+        ),
+    )
     ap.add_argument("--maxfun", type=int, default=150)
     ap.add_argument("--max-poses", type=int, default=0, help="0 = all")
     ap.add_argument(
@@ -1336,6 +1344,33 @@ def parse_args():
         ),
     )
     ap.add_argument(
+        "--score-mode",
+        default="default",
+        choices=["default", "bulk"],
+        help=(
+            "JAX-only score scheduling mode. "
+            "'default' keeps minimization-oriented batching; "
+            "'bulk' uses larger score-only chunks."
+        ),
+    )
+    ap.add_argument(
+        "--score-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "JAX-only: optional chunk size for --score bulk mode. "
+            "If omitted, bulk mode uses an internal default."
+        ),
+    )
+    ap.add_argument(
+        "--pool-conformers",
+        action="store_true",
+        help=(
+            "JAX-only: for score-only pooled-conformer batches, avoid pre-splitting "
+            "poses by ligand conformer before scoring."
+        ),
+    )
+    ap.add_argument(
         "--nb-kernel",
         default="nonbon8",
         choices=["jax", "nonbon8"],
@@ -1381,6 +1416,10 @@ def parse_args():
             "--receptor-ens-list",
             "--epsilon",
             "--energy-batch",
+            "--benchmark-steady-state",
+            "--score-mode",
+            "--score-batch-size",
+            "--pool-conformers",
             "--nb-kernel",
             "--autodiff-potentials",
             "--disable-jit",
@@ -1412,8 +1451,24 @@ def parse_args():
             ap.error("--attract-par-npz is required for --oracle jax")
         if args.energy_batch <= 0:
             ap.error("--energy-batch must be >= 1")
+        if args.score_batch_size is not None and args.score_batch_size <= 0:
+            ap.error("--score-batch-size must be >= 1")
     if args.energy_only and not args.score:
         ap.error("--energy-only is only valid together with --score")
+    if args.benchmark_steady_state and not args.score:
+        ap.error("--benchmark-steady-state is only valid together with --score")
+    if args.benchmark_steady_state and args.oracle != "jax":
+        ap.error("--benchmark-steady-state currently requires --oracle jax")
+    if args.score_mode != "default" and not args.score:
+        ap.error("--score-mode is only valid together with --score")
+    if args.score_batch_size is not None and not args.score:
+        ap.error("--score-batch-size is only valid together with --score")
+    if args.pool_conformers and not args.score:
+        ap.error("--pool-conformers is only valid together with --score")
+    if args.pool_conformers and not args.energy_only:
+        ap.error("--pool-conformers currently requires --energy-only")
+    if args.pool_conformers and args.nb_kernel != "jax":
+        ap.error("--pool-conformers currently requires --nb-kernel jax")
     receptor_mode_count = int(bool(args.receptor_ens_list)) + int(bool(args.receptor_pdb)) + int(
         bool(args.receptor_coordinates)
     )
@@ -1602,6 +1657,9 @@ def main():
             lig_pivot=lig_pivot,
             epsilon=args.epsilon,
             energy_batch=args.energy_batch,
+            score_mode=args.score_mode,
+            score_batch_size=args.score_batch_size,
+            pool_conformers=bool(args.pool_conformers),
             nb_kernel=args.nb_kernel,
             autodiff_potentials=bool(args.autodiff_potentials),
             energy_only=bool(args.energy_only),
@@ -1610,7 +1668,10 @@ def main():
         if verbose:
             print(
                 "JAX oracle initialized "
-                f"(energy_batch={args.energy_batch}, nb_kernel={args.nb_kernel}, "
+                f"(energy_batch={args.energy_batch}, score_mode={args.score_mode}, "
+                f"score_batch_size={args.score_batch_size}, "
+                f"pool_conformers={bool(args.pool_conformers)}, "
+                f"nb_kernel={args.nb_kernel}, "
                 f"autodiff_potentials={bool(args.autodiff_potentials)}, "
                 f"energy_only={bool(args.energy_only)})"
             )
@@ -1639,7 +1700,33 @@ def main():
         # Score starting poses
         if verbose:
             print("Scoring starting poses...")
-        start_e, start_g = oracle.score_batch(ens, dofs0, conformers=ligand_conformers)
+        if args.benchmark_steady_state:
+            if verbose:
+                print(
+                    "Benchmarking steady-state score pass "
+                    "(warmup pass + timed pass)..."
+                )
+            oracle.score_batch(ens, dofs0, conformers=ligand_conformers)
+            kernel_time0 = getattr(oracle, "_total_kernel_time", 0.0)
+            kernel_calls0 = getattr(oracle, "_total_kernel_calls", 0)
+            t_score0 = time.perf_counter()
+            start_e, start_g = oracle.score_batch(
+                ens, dofs0, conformers=ligand_conformers
+            )
+            t_score1 = time.perf_counter()
+            kernel_time1 = getattr(oracle, "_total_kernel_time", kernel_time0)
+            kernel_calls1 = getattr(oracle, "_total_kernel_calls", kernel_calls0)
+            print(
+                "Benchmark steady-state "
+                f"(--benchmark-steady-state): wall={t_score1 - t_score0:.6f}s "
+                f"kernel={kernel_time1 - kernel_time0:.6f}s "
+                f"kernel_calls={kernel_calls1 - kernel_calls0}",
+                file=sys.stderr,
+            )
+        else:
+            start_e, start_g = oracle.score_batch(
+                ens, dofs0, conformers=ligand_conformers
+            )
         if args.score:
             print_legacy_score(
                 start_e,

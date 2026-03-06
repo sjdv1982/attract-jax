@@ -505,6 +505,22 @@ def transform_ligand(mats, coor_lig):
     return all_coors_lig[:, :, :3]
 
 
+@jit
+def transform_ligand_pooled(mats, coor_lig_ens, conformers):
+    coor_lig2 = jnp.concatenate(
+        (
+            coor_lig_ens,
+            jnp.ones(
+                (coor_lig_ens.shape[0], coor_lig_ens.shape[1], 1),
+                dtype=coor_lig_ens.dtype,
+            ),
+        ),
+        axis=2,
+    )
+    all_coors_lig = jnp.einsum("bij,bjk->bik", coor_lig2[conformers], mats)
+    return all_coors_lig[:, :, :3]
+
+
 def build_kernel(
     grid,
     ff,
@@ -833,8 +849,10 @@ def build_kernel(
                 )
             return energies
 
-    @partial(jit, static_argnames=("grid_dim",))
-    def generate_ind_innergrid(all_coors_lig, grid0, grid_dim):
+    grid_dim_const = tuple(int(x) for x in grid.dim)
+
+    @jit
+    def generate_ind_innergrid(all_coors_lig, grid0):
         vox_innergrid = (all_coors_lig - grid0.origin) / grid0.gridspacing
         x, y, z = vox_innergrid[:, :, 0], vox_innergrid[:, :, 1], vox_innergrid[:, :, 2]
         in_innergrid = (
@@ -845,14 +863,16 @@ def build_kernel(
             & (z >= 0)
             & (z < grid0.dim[2] - 1)
         )
-        out_of_bounds = max(grid_dim) + 2
+        out_of_bounds = max(grid_dim_const) + 2
         pos = jnp.where(
             in_innergrid[:, :, None],
             jnp.floor(vox_innergrid + 0.5).astype(np.int32),
             out_of_bounds,
         )
         ind = jnp.ravel_multi_index(
-            (pos[:, :, 0], pos[:, :, 1], pos[:, :, 2]), dims=grid_dim, mode="clip"
+            (pos[:, :, 0], pos[:, :, 1], pos[:, :, 2]),
+            dims=grid_dim_const,
+            mode="clip",
         )
         ind = ind + out_of_bounds**3 * (1 - in_innergrid.astype(np.uint8))
         nb_index = jnp.take(grid0.nr_neighbours, ind)
@@ -1003,26 +1023,21 @@ def build_kernel(
                 max_nr_neighbours_int,
             )
 
-    def neighbour_energy(
-        mats,
+    def neighbour_energy_from_all_coors(
+        all_coors_lig,
         coor_rec,
         rec_atomtypes,
         rec_charge_scaled0,
-        coor_lig,
         lig_atomtypes0,
         lig_charge_scaled0,
         ff0,
         grid0,
         nb_chunk_thresholds,
         nb_chunk_size,
-        grid_dim,
     ):
-        all_coors_lig = transform_ligand(mats, coor_lig)
-        ind_innergrid, nb_index, max_contacts = generate_ind_innergrid(
-            all_coors_lig, grid0, grid_dim
-        )
+        ind_innergrid, nb_index, max_contacts = generate_ind_innergrid(all_coors_lig, grid0)
         if int(max_contacts) == 0:
-            return jnp.zeros(mats.shape[0], dtype=jnp.float64)
+            return jnp.zeros(all_coors_lig.shape[0], dtype=jnp.float64)
 
         sort_index, nr_inner_atoms = generate_sort_index(nb_index)
         sorted_ind_innergrid = ind_innergrid[sort_index[0], sort_index[1]]
@@ -1109,6 +1124,33 @@ def build_kernel(
         energies = energies.at[sort_index[0]].add(atom_energies)
         return energies
 
+    def neighbour_energy(
+        mats,
+        coor_rec,
+        rec_atomtypes,
+        rec_charge_scaled0,
+        coor_lig,
+        lig_atomtypes0,
+        lig_charge_scaled0,
+        ff0,
+        grid0,
+        nb_chunk_thresholds,
+        nb_chunk_size,
+    ):
+        all_coors_lig = transform_ligand(mats, coor_lig)
+        return neighbour_energy_from_all_coors(
+            all_coors_lig,
+            coor_rec,
+            rec_atomtypes,
+            rec_charge_scaled0,
+            lig_atomtypes0,
+            lig_charge_scaled0,
+            ff0,
+            grid0,
+            nb_chunk_thresholds,
+            nb_chunk_size,
+        )
+
     def main(
         dofs,
         coor_rec,
@@ -1138,11 +1180,47 @@ def build_kernel(
             grid0,
             nb_chunk_thresholds,
             NB_CHUNK_SIZE,
-            grid_dim,
         )
         pot_energies = potential_energy(
             mats, coor_lig, lig_vdw_channel_idx0, lig_charge_raw0, grid0
         )
+        energies = pot_energies + nb_energies
+        return energies.sum(), energies
+
+    def main_pooled(
+        dofs,
+        coor_rec,
+        rec_atomtypes,
+        rec_charge_scaled0,
+        coor_lig_ens,
+        conformers,
+        lig_atomtypes0,
+        lig_vdw_channel_idx0,
+        lig_charge_raw0,
+        lig_charge_scaled0,
+        ff0,
+        grid0,
+        nb_chunk_thresholds,
+        grid_dim,
+        lig_pivot,
+    ):
+        mats = dofs_to_mats(dofs, lig_pivot)
+        all_coors_lig = transform_ligand_pooled(mats, coor_lig_ens, conformers)
+        nb_energies = neighbour_energy_from_all_coors(
+            all_coors_lig,
+            coor_rec,
+            rec_atomtypes,
+            rec_charge_scaled0,
+            lig_atomtypes0,
+            lig_charge_scaled0,
+            ff0,
+            grid0,
+            nb_chunk_thresholds,
+            NB_CHUNK_SIZE,
+        )
+        pot_energies = potential_atom_energies(
+            all_coors_lig, lig_vdw_channel_idx0, lig_charge_raw0, grid0
+        ).sum(axis=1)
         energies = pot_energies + nb_energies
         return energies.sum(), energies
 
@@ -1261,6 +1339,7 @@ def build_kernel(
     else:
         main.ad = None
 
+    main.pooled = main_pooled
     main.pot_ad = potential_ad
     return main
 
