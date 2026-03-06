@@ -129,8 +129,12 @@ class JaxScoreOracle:
     ----------
     receptor_ens_list : str
         Path to text file listing receptor ensemble PDB paths (one per line).
-    ligand_pdb : str
+    ligand_pdb : str or None
         Path to reduced ligand PDB.
+    ligand_ensemble : ndarray or None
+        Optional ligand coordinate array with shape ``(N,3)`` or ``(C,N,3)``.
+        When provided, ``ligand_atomtypes`` is required and ``ligand_charges``
+        defaults to zero if omitted.
     grid_file : str or None
         Path to binary .grid file (produced by make-grid).  Mutually exclusive
         with ``grid_object``; exactly one must be provided.
@@ -151,7 +155,10 @@ class JaxScoreOracle:
     def __init__(
         self,
         receptor_ens_list: str,
-        ligand_pdb: str,
+        ligand_pdb: Optional[str] = None,
+        ligand_ensemble: Optional[np.ndarray] = None,
+        ligand_atomtypes: Optional[np.ndarray] = None,
+        ligand_charges: Optional[np.ndarray] = None,
         grid_file: Optional[str] = None,
         attract_par_npz: str = "",
         lig_pivot: np.ndarray = None,
@@ -188,7 +195,38 @@ class JaxScoreOracle:
             rec_charge_all.append(q)
 
         # --- Load ligand ---
-        lig_coords0, lig_types0, lig_charge0, _lig_w = parse_reduced_pdb(ligand_pdb)
+        if ligand_ensemble is not None:
+            lig_coords_ens_raw = np.asarray(ligand_ensemble, dtype=np.float64)
+            if lig_coords_ens_raw.ndim == 2:
+                if lig_coords_ens_raw.shape[1] != 3:
+                    raise ValueError(
+                        f"ligand_ensemble must have shape (N,3) or (C,N,3), got {lig_coords_ens_raw.shape}"
+                    )
+                lig_coords_ens_raw = lig_coords_ens_raw[None, :, :]
+            elif lig_coords_ens_raw.ndim != 3 or lig_coords_ens_raw.shape[2] != 3:
+                raise ValueError(
+                    f"ligand_ensemble must have shape (N,3) or (C,N,3), got {lig_coords_ens_raw.shape}"
+                )
+            if ligand_atomtypes is None:
+                raise ValueError("ligand_atomtypes is required with ligand_ensemble")
+            lig_types0 = np.asarray(ligand_atomtypes, dtype=np.int32)
+            if lig_types0.ndim != 1 or len(lig_types0) != lig_coords_ens_raw.shape[1]:
+                raise ValueError(
+                    "ligand_atomtypes must have shape (N,) matching ligand_ensemble"
+                )
+            if ligand_charges is None:
+                lig_charge0 = np.zeros((lig_coords_ens_raw.shape[1],), dtype=np.float64)
+            else:
+                lig_charge0 = np.asarray(ligand_charges, dtype=np.float64)
+                if lig_charge0.ndim != 1 or len(lig_charge0) != lig_coords_ens_raw.shape[1]:
+                    raise ValueError(
+                        "ligand_charges must have shape (N,) matching ligand_ensemble"
+                    )
+        else:
+            if ligand_pdb is None:
+                raise ValueError("Either ligand_pdb or ligand_ensemble must be provided")
+            lig_coords0, lig_types0, lig_charge0, _lig_w = parse_reduced_pdb(ligand_pdb)
+            lig_coords_ens_raw = np.asarray(lig_coords0[None, :, :], dtype=np.float64)
 
         # Mask out dummy atoms (type 99)
         rec_mask = rec_types_all[0] != 99
@@ -202,7 +240,7 @@ class JaxScoreOracle:
         rec_charge_ens_raw = np.asarray(
             [q[rec_mask] for q in rec_charge_all], dtype=np.float64
         )
-        lig_coords = lig_coords0[lig_mask].astype(np.float64)
+        lig_coords = lig_coords_ens_raw[:, lig_mask, :].astype(np.float64)
         lig_charge_raw = lig_charge0[lig_mask].astype(np.float64)
 
         # --- Electrostatics scaling ---
@@ -304,7 +342,7 @@ class JaxScoreOracle:
         grid_dim = tuple(int(x) for x in grid.dim)
 
         # --- Build JAX kernel (forward pass only, no jax.grad) ---
-        n_lig_atoms = int(lig_coords.shape[0])
+        n_lig_atoms = int(lig_coords.shape[1])
         padded_nb_size = energy_batch * n_lig_atoms
 
         kernel_main = build_kernel(
@@ -337,7 +375,12 @@ class JaxScoreOracle:
         self._rec_coor_ens_np = rec_coords_ens  # (n_ens, Nrec, 3)
         self._rec_charge_ens_np = rec_charge_ens_scaled  # (n_ens, Nrec)
         self._rec_atomtypes_ff_j = jnp.array(rec_atomtypes_ff, dtype=np.int32)
-        self._coor_lig_j = jnp.array(lig_coords, dtype=jnp.float64)
+        self._coor_lig_ens_np = lig_coords
+        self._coor_lig_ens_j = [
+            jnp.array(lig_coords[i], dtype=jnp.float64)
+            for i in range(lig_coords.shape[0])
+        ]
+        self._coor_lig_j = self._coor_lig_ens_j[0]
         self._lig_atomtypes_ff_j = jnp.array(lig_atomtypes_ff, dtype=np.int32)
         self._lig_vdw_channel_idx_j = jnp.array(lig_vdw_channel_idx, dtype=np.int32)
         self._lig_charge_raw_j = jnp.array(lig_charge_raw, dtype=jnp.float64)
@@ -349,6 +392,7 @@ class JaxScoreOracle:
         self._lig_pivot_j = jnp.array(lig_pivot, dtype=jnp.float64)
         self._pad_poses = int(energy_batch)
         self._n_lig_atoms = n_lig_atoms
+        self._n_lig_conformers = int(lig_coords.shape[0])
         self._nens = int(rec_coords_ens.shape[0])
         self._nrec = int(rec_coords_ens.shape[1])
         # --- Build value_and_grad function for analytical gradients ---
@@ -380,6 +424,26 @@ class JaxScoreOracle:
             _vg_single = jax.value_and_grad(_single_energy)
             self._vg_single = jax.jit(_vg_single)
 
+            def _single_energy_dynamic_ligand(
+                dof_1d, rec_coor, rec_charge_scaled, coor_lig
+            ):
+                dof_2d = dof_1d[None, :]
+                _, per_pose = kernel_ad(
+                    dof_2d,
+                    rec_coor,
+                    self._rec_atomtypes_ff_j,
+                    rec_charge_scaled,
+                    coor_lig,
+                    self._lig_atomtypes_ff_j,
+                    self._lig_vdw_channel_idx_j,
+                    self._lig_charge_raw_j,
+                    self._lig_charge_scaled_j,
+                    self._ff,
+                    self._grid_j,
+                    self._lig_pivot_j,
+                )
+                return per_pose[0]
+
             def _single_potential_energy(dof_1d, rec_coor, rec_charge_scaled):
                 dof_2d = dof_1d[None, :]
                 _, per_pose = kernel_pot_ad(
@@ -398,9 +462,42 @@ class JaxScoreOracle:
                 )
                 return per_pose[0]
 
+            def _single_potential_energy_dynamic_ligand(
+                dof_1d, rec_coor, rec_charge_scaled, coor_lig
+            ):
+                dof_2d = dof_1d[None, :]
+                _, per_pose = kernel_pot_ad(
+                    dof_2d,
+                    rec_coor,
+                    self._rec_atomtypes_ff_j,
+                    rec_charge_scaled,
+                    coor_lig,
+                    self._lig_atomtypes_ff_j,
+                    self._lig_vdw_channel_idx_j,
+                    self._lig_charge_raw_j,
+                    self._lig_charge_scaled_j,
+                    self._ff,
+                    self._grid_j,
+                    self._lig_pivot_j,
+                )
+                return per_pose[0]
+
             _pot_vg_single = jax.value_and_grad(_single_potential_energy)
             self._pot_vg_single = jax.jit(_pot_vg_single)
             self._pot_e_single = jax.jit(_single_potential_energy)
+            _vg_single_dynamic = jax.value_and_grad(_single_energy_dynamic_ligand)
+            self._vg_batch_dynamic = jax.jit(
+                jax.vmap(_vg_single_dynamic, in_axes=(0, 0, 0, None))
+            )
+            _pot_vg_single_dynamic = jax.value_and_grad(
+                _single_potential_energy_dynamic_ligand
+            )
+            self._pot_vg_batch_dynamic = jax.jit(
+                jax.vmap(_pot_vg_single_dynamic, in_axes=(0, 0, 0, None))
+            )
+            self._pot_e_batch_dynamic = jax.jit(
+                jax.vmap(_single_potential_energy_dynamic_ligand, in_axes=(0, 0, 0, None))
+            )
             # vmap over (dof, rec_coor, rec_charge): each pose carries its own
             # receptor data. At large scale this avoids per-ensemble Python dispatch.
             _vg_batch = jax.jit(jax.vmap(_vg_single, in_axes=(0, 0, 0)))
@@ -416,6 +513,9 @@ class JaxScoreOracle:
             self._pot_vg_batch = None
             self._pot_e_single = None
             self._pot_e_batch = None
+            self._vg_batch_dynamic = None
+            self._pot_vg_batch_dynamic = None
+            self._pot_e_batch_dynamic = None
 
         if self._nb_kernel == "nonbon8":
             self._init_nonbon8_backend(
@@ -423,7 +523,7 @@ class JaxScoreOracle:
                 rec_coords_ens=rec_coords_ens,
                 rec_charge_ens_scaled=rec_charge_ens_scaled,
                 rec_atomtypes_ff=rec_atomtypes_ff.astype(np.int16, copy=False),
-                lig_coords=lig_coords,
+                lig_coords_ens=lig_coords,
                 lig_atomtypes_ff=lig_atomtypes_ff.astype(np.int16, copy=False),
                 lig_charge_scaled=lig_charge_scaled,
                 rc=rc,
@@ -440,7 +540,7 @@ class JaxScoreOracle:
         rec_coords_ens,
         rec_charge_ens_scaled,
         rec_atomtypes_ff,
-        lig_coords,
+        lig_coords_ens,
         lig_atomtypes_ff,
         lig_charge_scaled,
         rc,
@@ -524,7 +624,7 @@ class JaxScoreOracle:
             "emin": np.ascontiguousarray(emin, dtype=np.float64),
             "rmin2": np.ascontiguousarray(rmin2, dtype=np.float64),
             "ivor": np.ascontiguousarray(ivor, dtype=np.int8),
-            "lig_coord": np.ascontiguousarray(lig_coords, dtype=np.float64),
+            "lig_coord_ens": np.ascontiguousarray(lig_coords_ens, dtype=np.float64),
             "lig_type": np.ascontiguousarray(lig_atomtypes_ff, dtype=np.int16),
             "lig_charge": np.ascontiguousarray(lig_charge_scaled, dtype=np.float64),
             "plateaudissq": float(plateaudissq),
@@ -564,15 +664,26 @@ class JaxScoreOracle:
             num_threads=np.int32(nthreads), kernel_variant=np.int32(1)
         )
 
-    def _run_nb_energy_kernel(self, ens0: np.ndarray, dofs64: np.ndarray, out_e: np.ndarray):
+    def _run_nb_energy_kernel(
+        self,
+        ens0: np.ndarray,
+        dofs64: np.ndarray,
+        out_e: np.ndarray,
+        lig_coords: Optional[np.ndarray] = None,
+    ):
         pivot = np.ascontiguousarray(np.asarray(self._lig_pivot_j), dtype=np.float64)
         n = int(dofs64.shape[0])
+        lig_coords_use = (
+            self._nb["lig_coord_ens"][0]
+            if lig_coords is None
+            else np.ascontiguousarray(lig_coords, dtype=np.float64)
+        )
         step = NbFusedStepData(
             nposes=np.int32(n),
-            natoms=np.int32(self._nb["lig_coord"].shape[0]),
+            natoms=np.int32(lig_coords_use.shape[0]),
             dofs=_as_ptr(dofs64.reshape(-1), ctypes.c_double),
             ens=_as_ptr(ens0, ctypes.c_int16),
-            lig_coords=_as_ptr(self._nb["lig_coord"].reshape(-1), ctypes.c_double),
+            lig_coords=_as_ptr(lig_coords_use.reshape(-1), ctypes.c_double),
             lig_pivot=_as_ptr(pivot, ctypes.c_double),
             lig_type=_as_ptr(self._nb["lig_type"], ctypes.c_int16),
             lig_charge=_as_ptr(self._nb["lig_charge"], ctypes.c_double),
@@ -592,7 +703,13 @@ class JaxScoreOracle:
             energy_symbol = self._nb["dispatch"].energy_symbol
             raise RuntimeError(f"{energy_symbol} failed with error code {rc}")
 
-    def _score_nb_nonbon8_batch(self, ens, dofs, compute_grad: bool = True):
+    def _score_nb_nonbon8_batch(
+        self,
+        ens,
+        dofs,
+        compute_grad: bool = True,
+        ligand_conformer: int = 0,
+    ):
         ens0 = np.ascontiguousarray(np.asarray(ens, dtype=np.int16) - 1, dtype=np.int16)
         dofs64 = np.ascontiguousarray(
             np.asarray(dofs, dtype=np.float64), dtype=np.float64
@@ -600,18 +717,19 @@ class JaxScoreOracle:
         n = int(dofs64.shape[0])
         out_e = np.zeros((n,), dtype=np.float64)
         out_g = np.zeros((n, 6), dtype=np.float64)
+        lig_coords = self._nb["lig_coord_ens"][int(ligand_conformer)]
 
         if not compute_grad:
-            self._run_nb_energy_kernel(ens0, dofs64, out_e)
+            self._run_nb_energy_kernel(ens0, dofs64, out_e, lig_coords=lig_coords)
             return out_e, out_g
 
         pivot = np.ascontiguousarray(np.asarray(self._lig_pivot_j), dtype=np.float64)
         step = NbFusedStepData(
             nposes=np.int32(n),
-            natoms=np.int32(self._nb["lig_coord"].shape[0]),
+            natoms=np.int32(lig_coords.shape[0]),
             dofs=_as_ptr(dofs64.reshape(-1), ctypes.c_double),
             ens=_as_ptr(ens0, ctypes.c_int16),
-            lig_coords=_as_ptr(self._nb["lig_coord"].reshape(-1), ctypes.c_double),
+            lig_coords=_as_ptr(lig_coords.reshape(-1), ctypes.c_double),
             lig_pivot=_as_ptr(pivot, ctypes.c_double),
             lig_type=_as_ptr(self._nb["lig_type"], ctypes.c_int16),
             lig_charge=_as_ptr(self._nb["lig_charge"], ctypes.c_double),
@@ -636,7 +754,7 @@ class JaxScoreOracle:
             return out_e, out_g
 
         # Energy-only kernel fallback: approximate NB gradients by central FD.
-        self._run_nb_energy_kernel(ens0, dofs64, out_e)
+        self._run_nb_energy_kernel(ens0, dofs64, out_e, lig_coords=lig_coords)
         for d in range(6):
             dofs_plus = dofs64.copy()
             dofs_minus = dofs64.copy()
@@ -645,11 +763,39 @@ class JaxScoreOracle:
 
             e_plus = np.zeros((n,), dtype=np.float64)
             e_minus = np.zeros((n,), dtype=np.float64)
-            self._run_nb_energy_kernel(ens0, dofs_plus, e_plus)
-            self._run_nb_energy_kernel(ens0, dofs_minus, e_minus)
+            self._run_nb_energy_kernel(ens0, dofs_plus, e_plus, lig_coords=lig_coords)
+            self._run_nb_energy_kernel(
+                ens0, dofs_minus, e_minus, lig_coords=lig_coords
+            )
             out_g[:, d] = (e_plus - e_minus) / (2.0 * FD_DELTA[d])
 
         return out_e, out_g
+
+    def _normalize_conformers(self, conformers, nposes: int):
+        if conformers is None:
+            return None
+        arr = np.asarray(conformers, dtype=np.int32).reshape(-1)
+        if len(arr) != nposes:
+            raise ValueError(
+                f"Expected {nposes} ligand conformer indices, got {len(arr)}"
+            )
+        if arr.size and (arr.min() < 0 or arr.max() >= self._n_lig_conformers):
+            raise ValueError(
+                f"Ligand conformer indices must be in [0, {self._n_lig_conformers - 1}]"
+            )
+        return arr
+
+    def _iter_group_slices(self, ens: np.ndarray, conformers: np.ndarray):
+        order = np.lexsort((conformers, ens))
+        ens_sorted = ens[order]
+        conf_sorted = conformers[order]
+        breaks = np.nonzero(
+            (ens_sorted[1:] != ens_sorted[:-1]) | (conf_sorted[1:] != conf_sorted[:-1])
+        )[0] + 1
+        starts = np.concatenate(([0], breaks))
+        stops = np.concatenate((breaks, [len(order)]))
+        for start, stop in zip(starts, stops):
+            yield int(ens_sorted[start]) - 1, int(conf_sorted[start]), order[start:stop]
 
     def _vg_ensemble(self, ens0: int, dofs_j: jnp.ndarray):
         """Compute per-pose energies AND gradients for one ensemble.
@@ -689,6 +835,34 @@ class JaxScoreOracle:
         self._total_kernel_time += time.monotonic() - t0
         self._total_kernel_calls += 1
 
+        return np.asarray(energies[:M]), np.asarray(grads[:M])
+
+    def _vg_ensemble_conformer(
+        self, ens0: int, conformer0: int, dofs_j: jnp.ndarray
+    ):
+        M = dofs_j.shape[0]
+        pad_n = _round_up_batch(M)
+
+        if M < pad_n:
+            dofs_j = jnp.pad(dofs_j, ((0, pad_n - M), (0, 0)))
+
+        rec_coor_j = jnp.broadcast_to(
+            self._rec_coor_ens_j[ens0][None, :, :],
+            (pad_n,) + self._rec_coor_ens_j[ens0].shape,
+        )
+        rec_charge_j = jnp.broadcast_to(
+            self._rec_charge_ens_scaled_j[ens0][None, :],
+            (pad_n,) + self._rec_charge_ens_scaled_j[ens0].shape,
+        )
+        lig_coor_j = self._coor_lig_ens_j[conformer0]
+
+        t0 = time.monotonic()
+        energies, grads = self._vg_batch_dynamic(
+            dofs_j, rec_coor_j, rec_charge_j, lig_coor_j
+        )
+        energies.block_until_ready()
+        self._total_kernel_time += time.monotonic() - t0
+        self._total_kernel_calls += 1
         return np.asarray(energies[:M]), np.asarray(grads[:M])
 
     def _energy_ensemble(self, ens0: int, dofs_j: jnp.ndarray) -> np.ndarray:
@@ -735,6 +909,39 @@ class JaxScoreOracle:
 
         return np.asarray(per_pose_e[:M])
 
+    def _energy_ensemble_conformer(
+        self, ens0: int, conformer0: int, dofs_j: jnp.ndarray
+    ) -> np.ndarray:
+        M = dofs_j.shape[0]
+        if M < self._pad_poses:
+            dofs_j = jnp.pad(dofs_j, ((0, self._pad_poses - M), (0, 0)))
+
+        rec_coor_j = self._rec_coor_ens_j[ens0]
+        rec_charge_j = self._rec_charge_ens_scaled_j[ens0]
+        lig_coor_j = self._coor_lig_ens_j[conformer0]
+
+        t0 = time.monotonic()
+        _, per_pose_e = self._kernel_main(
+            dofs_j,
+            rec_coor_j,
+            self._rec_atomtypes_ff_j,
+            rec_charge_j,
+            lig_coor_j,
+            self._lig_atomtypes_ff_j,
+            self._lig_vdw_channel_idx_j,
+            self._lig_charge_raw_j,
+            self._lig_charge_scaled_j,
+            self._ff,
+            self._grid_j,
+            self._nb_chunk_thresholds,
+            self._grid_dim,
+            self._lig_pivot_j,
+        )
+        per_pose_e.block_until_ready()
+        self._total_kernel_time += time.monotonic() - t0
+        self._total_kernel_calls += 1
+        return np.asarray(per_pose_e[:M])
+
     def _energy_batch_raw(self, ens: np.ndarray, dofs: np.ndarray) -> np.ndarray:
         """Compute energies for a mixed-ensemble batch.
 
@@ -761,7 +968,51 @@ class JaxScoreOracle:
 
         return energies
 
-    def score_batch(self, ens, dofs):
+    def _score_batch_grouped(self, ens, dofs, conformers, compute_grad: bool):
+        n = len(dofs)
+        energies = np.zeros(n, dtype=np.float64)
+        gradients = np.zeros((n, 6), dtype=np.float64)
+
+        for ens0, conformer0, idx in self._iter_group_slices(ens, conformers):
+            for start in range(0, len(idx), self.energy_batch):
+                sub = idx[start : start + self.energy_batch]
+                dofs_j = jnp.array(dofs[sub], dtype=jnp.float64)
+                if compute_grad:
+                    if self._nb_kernel == "nonbon8":
+                        e_pot, g_pot = self._score_potential_batch_group(
+                            ens0, conformer0, dofs_j
+                        )
+                        e_nb, g_nb = self._score_nb_nonbon8_batch(
+                            ens[sub],
+                            dofs[sub],
+                            compute_grad=True,
+                            ligand_conformer=conformer0,
+                        )
+                        energies[sub] = e_pot + e_nb
+                        gradients[sub] = g_pot + g_nb
+                    else:
+                        e_b, g_b = self._vg_ensemble_conformer(ens0, conformer0, dofs_j)
+                        energies[sub] = e_b
+                        gradients[sub] = g_b
+                else:
+                    if self._nb_kernel == "nonbon8":
+                        e_pot = self._score_potential_energy_batch_group(
+                            ens0, conformer0, dofs_j
+                        )
+                        e_nb, _ = self._score_nb_nonbon8_batch(
+                            ens[sub],
+                            dofs[sub],
+                            compute_grad=False,
+                            ligand_conformer=conformer0,
+                        )
+                        energies[sub] = e_pot + e_nb
+                    else:
+                        energies[sub] = self._energy_ensemble_conformer(
+                            ens0, conformer0, dofs_j
+                        )
+        return energies, gradients
+
+    def score_batch(self, ens, dofs, conformers=None):
         """Score a batch of poses using the selected NB backend.
 
         Parameters
@@ -775,6 +1026,14 @@ class JaxScoreOracle:
         gradients : (N, 6) float64
         """
         self._call_count += 1
+        ens = np.asarray(ens, dtype=np.int32)
+        dofs = np.asarray(dofs, dtype=np.float64)
+        conformers = self._normalize_conformers(conformers, len(dofs))
+        if conformers is not None:
+            return self._score_batch_grouped(
+                ens, dofs, conformers, compute_grad=(not self._energy_only)
+            )
+
         if self._energy_only:
             if self._nb_kernel == "nonbon8":
                 e_pot = self.score_potential_energy_batch(ens, dofs)
@@ -819,8 +1078,51 @@ class JaxScoreOracle:
             self._total_kernel_calls += 1
         return energies, gradients
 
-    def score_potential_energy_batch(self, ens, dofs):
+    def _score_potential_energy_batch_group(
+        self, ens0: int, conformer0: int, dofs_j: jnp.ndarray
+    ):
+        m = int(dofs_j.shape[0])
+        if m < self._pad_poses:
+            dofs_j = jnp.pad(dofs_j, ((0, self._pad_poses - m), (0, 0)))
+        rc_j = self._rec_coor_ens_j[ens0]
+        rq_j = self._rec_charge_ens_scaled_j[ens0]
+        lig_j = self._coor_lig_ens_j[conformer0]
+        t0 = time.monotonic()
+        _, e_b = self._kernel_pot_ad(
+            dofs_j,
+            rc_j,
+            self._rec_atomtypes_ff_j,
+            rq_j,
+            lig_j,
+            self._lig_atomtypes_ff_j,
+            self._lig_vdw_channel_idx_j,
+            self._lig_charge_raw_j,
+            self._lig_charge_scaled_j,
+            self._ff,
+            self._grid_j,
+            self._lig_pivot_j,
+        )
+        e_b.block_until_ready()
+        self._total_kernel_time += time.monotonic() - t0
+        self._total_kernel_calls += 1
+        return np.asarray(e_b[:m])
+
+    def score_potential_energy_batch(self, ens, dofs, conformers=None):
         """Score potential-grid contribution only (energy-only)."""
+        ens = np.asarray(ens, dtype=np.int32)
+        dofs = np.asarray(dofs, dtype=np.float64)
+        conformers = self._normalize_conformers(conformers, len(dofs))
+        if conformers is not None:
+            energies = np.zeros(len(dofs), dtype=np.float64)
+            for ens0, conformer0, idx in self._iter_group_slices(ens, conformers):
+                for start in range(0, len(idx), self.energy_batch):
+                    sub = idx[start : start + self.energy_batch]
+                    dofs_j = jnp.array(dofs[sub], dtype=jnp.float64)
+                    energies[sub] = self._score_potential_energy_batch_group(
+                        ens0, conformer0, dofs_j
+                    )
+            return energies
+
         n = len(dofs)
         ens0 = np.asarray(ens, dtype=np.intp) - 1
         energies = np.zeros(n, dtype=np.float64)
@@ -861,8 +1163,48 @@ class JaxScoreOracle:
 
         return energies
 
-    def score_potential_batch(self, ens, dofs):
+    def _score_potential_batch_group(
+        self, ens0: int, conformer0: int, dofs_j: jnp.ndarray
+    ):
+        m = int(dofs_j.shape[0])
+        pad_n = _round_up_batch(m)
+        if m < pad_n:
+            dofs_j = jnp.pad(dofs_j, ((0, pad_n - m), (0, 0)))
+        rec_coor_j = jnp.broadcast_to(
+            self._rec_coor_ens_j[ens0][None, :, :],
+            (pad_n,) + self._rec_coor_ens_j[ens0].shape,
+        )
+        rec_charge_j = jnp.broadcast_to(
+            self._rec_charge_ens_scaled_j[ens0][None, :],
+            (pad_n,) + self._rec_charge_ens_scaled_j[ens0].shape,
+        )
+        lig_j = self._coor_lig_ens_j[conformer0]
+        t0 = time.monotonic()
+        e_b, g_b = self._pot_vg_batch_dynamic(dofs_j, rec_coor_j, rec_charge_j, lig_j)
+        e_b.block_until_ready()
+        self._total_kernel_time += time.monotonic() - t0
+        self._total_kernel_calls += 1
+        return np.asarray(e_b[:m]), np.asarray(g_b[:m])
+
+    def score_potential_batch(self, ens, dofs, conformers=None):
         """Score potential-grid contribution only (no NB correction)."""
+        ens = np.asarray(ens, dtype=np.int32)
+        dofs = np.asarray(dofs, dtype=np.float64)
+        conformers = self._normalize_conformers(conformers, len(dofs))
+        if conformers is not None:
+            energies = np.zeros(len(dofs), dtype=np.float64)
+            gradients = np.zeros((len(dofs), 6), dtype=np.float64)
+            for ens0, conformer0, idx in self._iter_group_slices(ens, conformers):
+                for start in range(0, len(idx), self.energy_batch):
+                    sub = idx[start : start + self.energy_batch]
+                    dofs_j = jnp.array(dofs[sub], dtype=jnp.float64)
+                    e_b, g_b = self._score_potential_batch_group(
+                        ens0, conformer0, dofs_j
+                    )
+                    energies[sub] = e_b
+                    gradients[sub] = g_b
+            return energies, gradients
+
         n = len(dofs)
         ens0 = np.asarray(ens, dtype=np.intp) - 1
         energies = np.zeros(n, dtype=np.float64)
@@ -889,9 +1231,17 @@ class JaxScoreOracle:
 
         return energies, gradients
 
-    def score_single(self, ens_id, dof):
+    def score_single(self, ens_id, dof, conformer=None):
         """Score a single pose."""
-        e, g = self.score_batch(np.array([ens_id], dtype=np.int32), dof.reshape(1, 6))
+        e, g = self.score_batch(
+            np.array([ens_id], dtype=np.int32),
+            dof.reshape(1, 6),
+            conformers=(
+                None
+                if conformer is None
+                else np.array([conformer], dtype=np.int32)
+            ),
+        )
         return float(e[0]), g[0]
 
     def print_stats(self):

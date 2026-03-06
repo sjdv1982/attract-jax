@@ -41,6 +41,11 @@ FLOAT_RE = re.compile(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eEdD][-+]?\d+)?")
 DAT_ENERGY_RE = re.compile(r"^##\s*Energy:\s*([-+0-9.eE]+)\s*$")
 
 
+def _allclose_zero(values, atol: float = 1.0e-12) -> bool:
+    arr = np.asarray(values, dtype=np.float64)
+    return bool(np.all(np.abs(arr) <= atol))
+
+
 def parse_dat_two_body(path: str, max_poses: int = 0):
     header: List[str] = []
     pivots: Dict[int, np.ndarray] = {}
@@ -51,29 +56,62 @@ def parse_dat_two_body(path: str, max_poses: int = 0):
     current_lines: List[List[float]] = []
     current_energy: Optional[float] = None
     seen_first_struct = False
+    current_struct_id: Optional[int] = None
 
     def flush():
-        nonlocal current_lines, current_energy
+        nonlocal current_lines, current_energy, current_struct_id
         if not current_lines:
             return
-        if len(current_lines) < 2:
-            raise ValueError("Expected at least two numeric DOF lines per structure")
+        struct_label = (
+            f"structure #{current_struct_id}" if current_struct_id is not None else path
+        )
+        if len(current_lines) != 2:
+            raise ValueError(
+                f"{struct_label}: expected exactly two numeric DOF lines "
+                f"(receptor then ligand), got {len(current_lines)}"
+            )
         first = current_lines[0]
-        second = current_lines[-1]
-        if len(first) != 7:
-            raise ValueError(f"Expected 7 fields, got {len(first)}")
-        ens = int(round(first[0]))
-        if len(second) == 7:
-            second = second[1:]
-        if len(second) != 6:
-            raise ValueError(f"Expected 6 DOF fields, got {len(second)}")
+        second = current_lines[1]
+        if len(first) not in (6, 7):
+            raise ValueError(
+                f"{struct_label}: receptor line must have 6 or 7 fields, got {len(first)}"
+            )
+        if len(second) not in (6, 7):
+            raise ValueError(
+                f"{struct_label}: ligand line must have 6 or 7 fields, got {len(second)}"
+            )
+
+        if len(first) == 6:
+            if not _allclose_zero(first):
+                raise ValueError(
+                    f"{struct_label}: receptor line without ensemble index must have zero DOFs"
+                )
+            ens = 1
+        else:
+            ens = int(round(first[0]))
+            if ens < 1:
+                raise ValueError(
+                    f"{struct_label}: receptor ensemble index must be >= 1, got {ens}"
+                )
+            if not _allclose_zero(first[1:]):
+                raise ValueError(
+                    f"{struct_label}: receptor line with ensemble index must have zero DOFs"
+                )
+
+        ligand_dofs = second[1:] if len(second) == 7 else second
+        if len(ligand_dofs) != 6:
+            raise ValueError(
+                f"{struct_label}: ligand line is missing pose DOF fields "
+                f"(expected 6, got {len(ligand_dofs)})"
+            )
         ens_list.append(ens)
-        dof_list.append(tuple(float(v) for v in second))
+        dof_list.append(tuple(float(v) for v in ligand_dofs))
         energy_list.append(
             float("nan") if current_energy is None else float(current_energy)
         )
         current_lines = []
         current_energy = None
+        current_struct_id = None
 
     with open(path) as f:
         for raw in f:
@@ -88,11 +126,13 @@ def parse_dat_two_body(path: str, max_poses: int = 0):
             if em:
                 current_energy = float(em.group(1))
                 continue
-            if STRUCT_RE.match(line):
+            sm = STRUCT_RE.match(line)
+            if sm:
                 if max_poses and len(ens_list) >= max_poses:
                     break
                 seen_first_struct = True
                 flush()
+                current_struct_id = int(line[1:].strip())
                 continue
             if not seen_first_struct:
                 header.append(raw)
@@ -252,7 +292,7 @@ class LegacyScoreOracle:
             raise ValueError(f"Expected {expected_n} energies, got {len(e)}")
         return e, g
 
-    def score_single(self, ens_id, dof):
+    def score_single(self, ens_id, dof, conformer=None):
         self._call_count += 1
         dat_path = os.path.join(self.tmpdir, f"_s{self._call_count}.dat")
         write_dat_two_body(
@@ -263,7 +303,7 @@ class LegacyScoreOracle:
         # ATTRACT --score prints forces (−∂E/∂x); negate to get gradient (+∂E/∂x)
         return float(e[0]), -g[0]
 
-    def score_batch(self, ens, dofs):
+    def score_batch(self, ens, dofs, conformers=None):
         self._call_count += 1
         dat_path = os.path.join(self.tmpdir, f"_s{self._call_count}.dat")
         write_dat_two_body(dat_path, self.header, ens, dofs)
@@ -474,6 +514,7 @@ def minfor_minimize_batched(
     oracle,
     ens,
     dofs0,
+    conformers=None,
     maxfun=150,
     init_metric=0.01,
     acc=1e-9,
@@ -530,7 +571,7 @@ def minfor_minimize_batched(
     traj_energies = np.full(N, np.nan, dtype=np.float64)
 
     # --- Initial batch evaluation ---
-    e0, g0 = oracle.score_batch(ens, dofs0)
+    e0, g0 = oracle.score_batch(ens, dofs0, conformers=conformers)
     nfev[:] = 1
     gesa[:] = e0
     g[:] = g0
@@ -592,7 +633,10 @@ def minfor_minimize_batched(
 
         # One batch oracle call for all active poses
         _t0 = time.time()
-        e_batch, g_batch = oracle.score_batch(ens[act_idx], xbb[act_idx])
+        batch_conformers = None if conformers is None else conformers[act_idx]
+        e_batch, g_batch = oracle.score_batch(
+            ens[act_idx], xbb[act_idx], conformers=batch_conformers
+        )
         _t1 = time.time()
         _cum_kernel += _t1 - _t0
         nfev[act_idx] += 1
@@ -892,6 +936,192 @@ def summarize(name, ref, cand):
     )
 
 
+def _mean_pivot_from_pdb(path: str) -> np.ndarray:
+    coor = []
+    with open(path) as f:
+        for line in f:
+            if line.startswith("ATOM"):
+                coor.append(
+                    (float(line[30:38]), float(line[38:46]), float(line[46:54]))
+                )
+    if not coor:
+        raise ValueError(f"No ATOM records found in ligand PDB: {path}")
+    return np.mean(np.asarray(coor, dtype=np.float64), axis=0)
+
+
+def _normalize_ligand_ensemble_array(coords: np.ndarray, source: str) -> np.ndarray:
+    arr = np.asarray(coords, dtype=np.float64)
+    if arr.ndim == 2:
+        if arr.shape[1] != 3:
+            raise ValueError(f"{source}: expected shape (N,3), got {arr.shape}")
+        arr = arr[None, :, :]
+    elif arr.ndim != 3 or arr.shape[2] != 3:
+        raise ValueError(f"{source}: expected shape (N,3) or (C,N,3), got {arr.shape}")
+    return np.ascontiguousarray(arr, dtype=np.float64)
+
+
+def _load_required_vector(path: str, expected_len: int, name: str, dtype) -> np.ndarray:
+    arr = np.asarray(np.load(path), dtype=dtype)
+    if arr.ndim != 1 or len(arr) != expected_len:
+        raise ValueError(
+            f"{name}: expected shape ({expected_len},), got {arr.shape} from {path}"
+        )
+    return arr
+
+
+def _load_ligand_conformers(
+    path: Optional[str], nposes: int, nconformers: int
+) -> Optional[np.ndarray]:
+    if path is None:
+        return None
+    arr = np.asarray(np.load(path), dtype=np.int64).reshape(-1)
+    if len(arr) != nposes:
+        raise ValueError(
+            f"--ligand-conformers length mismatch: expected {nposes}, got {len(arr)}"
+        )
+    if nconformers <= 0:
+        raise ValueError("Ligand conformer library is empty")
+    if arr.size == 0:
+        return arr.astype(np.int32)
+    if arr.min() >= 1 and arr.max() <= nconformers:
+        arr = arr - 1
+    elif arr.min() >= 0 and arr.max() < nconformers:
+        arr = arr.copy()
+    else:
+        raise ValueError(
+            "--ligand-conformers must be 1-based in [1, C] or 0-based in [0, C-1]"
+        )
+    return arr.astype(np.int32, copy=False)
+
+
+def _load_ligand_pdb_list(path: str):
+    from reproduce_grid_score import parse_reduced_pdb
+
+    list_dir = Path(path).resolve().parent
+    pdb_paths: List[str] = []
+    coords: List[np.ndarray] = []
+    atomtypes_ref: Optional[np.ndarray] = None
+    charges_ref: Optional[np.ndarray] = None
+
+    with open(path) as f:
+        entries = [line.strip() for line in f if line.strip()]
+    if not entries:
+        raise ValueError(f"Empty ligand PDB list: {path}")
+
+    for i, entry in enumerate(entries, start=1):
+        p = Path(entry)
+        if not p.is_absolute():
+            p = list_dir / p
+        pdb_paths.append(str(p))
+        coor, atomtypes, charges, _weights = parse_reduced_pdb(str(p))
+        if atomtypes_ref is None:
+            atomtypes_ref = np.asarray(atomtypes, dtype=np.int32)
+            charges_ref = np.asarray(charges, dtype=np.float64)
+        else:
+            if atomtypes.shape != atomtypes_ref.shape or not np.array_equal(
+                atomtypes, atomtypes_ref
+            ):
+                raise ValueError(
+                    f"{path}: ligand PDB #{i} has different atom types/size; "
+                    "mixed ligand metadata is not supported in --ligand-pdb-list mode"
+                )
+            if charges.shape != charges_ref.shape or not np.allclose(
+                charges, charges_ref
+            ):
+                raise ValueError(
+                    f"{path}: ligand PDB #{i} has different charges; "
+                    "mixed ligand charges are not supported in --ligand-pdb-list mode"
+                )
+        coords.append(np.asarray(coor, dtype=np.float64))
+
+    assert atomtypes_ref is not None and charges_ref is not None
+    return {
+        "ligand_pdb_path": pdb_paths[0],
+        "ligand_ensemble": np.asarray(coords, dtype=np.float64),
+        "ligand_atomtypes": atomtypes_ref,
+        "ligand_charges": charges_ref,
+        "ligand_atomtypes_for_grid": atomtypes_ref,
+        "ligand_pivot": np.mean(coords[0], axis=0),
+    }
+
+
+def resolve_ligand_inputs(args, test_dir: str, nposes: int):
+    from reproduce_grid_score import parse_reduced_pdb
+
+    if args.ligand_ensemble:
+        lig_coords = _normalize_ligand_ensemble_array(
+            np.load(args.ligand_ensemble), "--ligand-ensemble"
+        )
+        natoms = lig_coords.shape[1]
+        lig_atomtypes = _load_required_vector(
+            args.ligand_atomtypes, natoms, "--ligand-atomtypes", np.int32
+        )
+        if args.ligand_charges:
+            lig_charges = _load_required_vector(
+                args.ligand_charges, natoms, "--ligand-charges", np.float64
+            )
+        else:
+            lig_charges = np.zeros((natoms,), dtype=np.float64)
+        return {
+            "mode": "ensemble",
+            "ligand_pdb_path": None,
+            "ligand_ensemble": lig_coords,
+            "ligand_atomtypes": lig_atomtypes,
+            "ligand_charges": lig_charges,
+            "ligand_conformers": _load_ligand_conformers(
+                args.ligand_conformers, nposes, lig_coords.shape[0]
+            ),
+            "ligand_atomtypes_for_grid": lig_atomtypes,
+            "ligand_pivot": np.mean(lig_coords[0], axis=0),
+        }
+
+    if args.ligand_pdb_list:
+        result = _load_ligand_pdb_list(args.ligand_pdb_list)
+        result.update(
+            {
+                "mode": "pdb-list",
+                "ligand_conformers": _load_ligand_conformers(
+                    args.ligand_conformers,
+                    nposes,
+                    int(result["ligand_ensemble"].shape[0]),
+                ),
+            }
+        )
+        return result
+
+    ligand_pdb_path = args.ligand_pdb or os.path.join(test_dir, "ligandr.pdb")
+    lig_coords0, lig_atomtypes0, lig_charge0, _lig_w = parse_reduced_pdb(ligand_pdb_path)
+    return {
+        "mode": "pdb",
+        "ligand_pdb_path": ligand_pdb_path,
+        "ligand_ensemble": None,
+        "ligand_atomtypes": None,
+        "ligand_charges": None,
+        "ligand_conformers": None,
+        "ligand_atomtypes_for_grid": np.asarray(lig_atomtypes0, dtype=np.int32),
+        "ligand_pivot": _mean_pivot_from_pdb(ligand_pdb_path),
+    }
+
+
+def resolve_receptor_ensemble_list(args, test_dir: str):
+    if args.receptor_ens_list:
+        return args.receptor_ens_list, None
+    receptor_pdb = args.receptor_pdb
+    if receptor_pdb is None:
+        default_single = os.path.join(test_dir, "partner1-ensemble", "model-1r.pdb")
+        if os.path.isfile(default_single):
+            receptor_pdb = default_single
+    if receptor_pdb is None:
+        return os.path.join(test_dir, "partner1-ensemble.list"), None
+
+    tmpdir_ctx = tempfile.TemporaryDirectory(prefix="minfor_receptor_ens_")
+    list_path = os.path.join(tmpdir_ctx.name, "receptor.list")
+    receptor_path_abs = os.path.abspath(receptor_pdb)
+    with open(list_path, "w") as f:
+        f.write(receptor_path_abs + "\n")
+    return list_path, tmpdir_ctx
+
+
 def resolve_attract_paths(test_dir, ligand_pdb=None):
     attractdir = os.environ.get("ATTRACTDIR", "")
     if not attractdir:
@@ -995,12 +1225,45 @@ def parse_args():
         "--receptor-ens-list", default=None, help="path to receptor ensemble list"
     )
     ap.add_argument(
+        "--receptor-pdb",
+        default=None,
+        help=(
+            "single receptor PDB to wrap as a one-line ensemble list when "
+            "--receptor-ens-list is not provided"
+        ),
+    )
+    ap.add_argument(
         "--ligand-pdb",
         default=None,
         help=(
             "path to ligand PDB used by both oracles "
             "(default: {test-dir}/ligandr.pdb)"
         ),
+    )
+    ap.add_argument(
+        "--ligand-ensemble",
+        default=None,
+        help="ligand coordinate .npy with shape (N,3) or (C,N,3)",
+    )
+    ap.add_argument(
+        "--ligand-conformers",
+        default=None,
+        help="per-pose ligand conformer indices (.npy; accepts 1-based or 0-based)",
+    )
+    ap.add_argument(
+        "--ligand-atomtypes",
+        default=None,
+        help="required with --ligand-ensemble: per-atom ATTRACT types (.npy, shape (N,))",
+    )
+    ap.add_argument(
+        "--ligand-charges",
+        default=None,
+        help="optional with --ligand-ensemble: per-atom charges (.npy, shape (N,))",
+    )
+    ap.add_argument(
+        "--ligand-pdb-list",
+        default=None,
+        help="optional ligand ensemble list: one reduced ligand PDB per line",
     )
     ap.add_argument(
         "--epsilon",
@@ -1073,6 +1336,11 @@ def parse_args():
                 "The following options are JAX-only and cannot be used with "
                 "--oracle legacy: " + ", ".join(used)
             )
+        if args.ligand_ensemble or args.ligand_pdb_list or args.ligand_conformers:
+            ap.error(
+                "--oracle legacy only supports --ligand-pdb; "
+                "--ligand-ensemble/--ligand-pdb-list/--ligand-conformers require --oracle jax"
+            )
     else:
         if args.generate_grid and not args.grid:
             ap.error(
@@ -1085,6 +1353,23 @@ def parse_args():
             ap.error("--energy-batch must be >= 1")
     if args.energy_only and not args.score:
         ap.error("--energy-only is only valid together with --score")
+    ligand_mode_count = int(bool(args.ligand_pdb)) + int(bool(args.ligand_ensemble)) + int(
+        bool(args.ligand_pdb_list)
+    )
+    if ligand_mode_count > 1:
+        ap.error(
+            "--ligand-pdb, --ligand-ensemble, and --ligand-pdb-list are mutually exclusive"
+        )
+    if args.ligand_ensemble and not args.ligand_atomtypes:
+        ap.error("--ligand-ensemble requires --ligand-atomtypes")
+    if args.ligand_atomtypes and not args.ligand_ensemble:
+        ap.error("--ligand-atomtypes is only valid with --ligand-ensemble")
+    if args.ligand_charges and not args.ligand_ensemble:
+        ap.error("--ligand-charges is only valid with --ligand-ensemble")
+    if args.ligand_conformers and not (args.ligand_ensemble or args.ligand_pdb_list):
+        ap.error(
+            "--ligand-conformers requires --ligand-ensemble or --ligand-pdb-list"
+        )
 
     return args
 
@@ -1122,19 +1407,13 @@ def main():
         )
         print(f"Ensemble ids: {np.unique(ens)}, centered_ligands: {centered_ligands}")
 
-    # --- Resolve ligand pivot ---
-    ligand_pdb_path = args.ligand_pdb or os.path.join(test_dir, "ligandr.pdb")
+    ligand_inputs = resolve_ligand_inputs(args, test_dir, n)
+    ligand_pdb_path = ligand_inputs["ligand_pdb_path"]
+    ligand_conformers = ligand_inputs["ligand_conformers"]
     if 2 in pivots:
         lig_pivot = pivots[2]
     else:
-        coor = []
-        with open(ligand_pdb_path) as f:
-            for line in f:
-                if line.startswith("ATOM"):
-                    coor.append(
-                        (float(line[30:38]), float(line[38:46]), float(line[46:54]))
-                    )
-        lig_pivot = np.mean(coor, axis=0)
+        lig_pivot = np.asarray(ligand_inputs["ligand_pivot"], dtype=np.float64)
     if verbose:
         print(f"Ligand pivot: {lig_pivot}")
 
@@ -1151,12 +1430,13 @@ def main():
 
     # --- Build oracle ---
     tmpdir_ctx = None
+    receptor_ens_list_ctx = None
     oracle = None
     if args.oracle == "jax":
         from jax_scorer import JaxScoreOracle
 
-        ens_list_path = args.receptor_ens_list or os.path.join(
-            test_dir, "partner1-ensemble.list"
+        ens_list_path, receptor_ens_list_ctx = resolve_receptor_ensemble_list(
+            args, test_dir
         )
         grid_path = args.grid
         par_npz = args.attract_par_npz
@@ -1188,16 +1468,16 @@ def main():
             _rc, _rt, _rq, _ = _parse_pdb(_rec_pdb)
             _ff_params = _load_params(par_npz)
             _ffelec = _math.sqrt(332.053986 / args.epsilon)
-            # Ligand alphabet: use ligand atomtypes if ligand PDB is known,
-            # otherwise fall back to all 98 atomtypes.
-            _lig_atomtypes = None
-            if ligand_pdb_path and os.path.isfile(ligand_pdb_path):
+            # Ligand alphabet: prefer explicit ligand metadata when available.
+            _lig_atomtypes = ligand_inputs["ligand_atomtypes_for_grid"]
+            if _lig_atomtypes is None and ligand_pdb_path and os.path.isfile(ligand_pdb_path):
                 _, _lt, _, _ = _parse_pdb(ligand_pdb_path)
                 _lig_atomtypes = _lt
             if verbose:
                 if _lig_atomtypes is not None:
                     print(
-                        f"Generating grid in-house from {_rec_pdb} (ligand alphabet from {ligand_pdb_path}) ..."
+                        f"Generating grid in-house from {_rec_pdb} "
+                        "(ligand alphabet restricted to ligand metadata) ..."
                     )
                 else:
                     print(
@@ -1238,6 +1518,9 @@ def main():
         oracle = JaxScoreOracle(
             receptor_ens_list=ens_list_path,
             ligand_pdb=ligand_pdb_path,
+            ligand_ensemble=ligand_inputs["ligand_ensemble"],
+            ligand_atomtypes=ligand_inputs["ligand_atomtypes"],
+            ligand_charges=ligand_inputs["ligand_charges"],
             grid_file=grid_path,
             attract_par_npz=par_npz,
             lig_pivot=lig_pivot,
@@ -1280,7 +1563,7 @@ def main():
         # Score starting poses
         if verbose:
             print("Scoring starting poses...")
-        start_e, start_g = oracle.score_batch(ens, dofs0)
+        start_e, start_g = oracle.score_batch(ens, dofs0, conformers=ligand_conformers)
         if args.score:
             print_legacy_score(
                 start_e,
@@ -1302,6 +1585,7 @@ def main():
             oracle,
             ens,
             dofs0,
+            conformers=ligand_conformers,
             maxfun=args.maxfun,
             init_metric=args.init_metric,
             trace_every=args.trace_every,
@@ -1312,6 +1596,8 @@ def main():
 
         t2 = time.time()
     finally:
+        if receptor_ens_list_ctx is not None:
+            receptor_ens_list_ctx.cleanup()
         if tmpdir_ctx is not None:
             tmpdir_ctx.__exit__(None, None, None)
         if oracle is not None and hasattr(oracle, "close"):
