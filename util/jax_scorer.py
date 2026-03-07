@@ -176,8 +176,10 @@ class JaxScoreOracle:
         autodiff_potentials: bool = False,
         energy_only: bool = False,
         grid_object=None,
+        dof_type: str = "euler",
     ):
         _ = cdie  # Milestone 1: nonbon8 + rdie fixed, keep arg for compatibility.
+        self._dof_type = str(dof_type)
         self.energy_batch = int(max(1, energy_batch))
         self._score_mode = str(score_mode)
         if self._score_mode not in ("default", "bulk"):
@@ -421,6 +423,7 @@ class JaxScoreOracle:
             cdie=False,
             padded_nb_size=padded_nb_size,
             use_precomputed_grid_gradients=self._use_precomputed_grid_gradients,
+            rotation=self._dof_type,
         )
 
         # Store per-ensemble data
@@ -647,7 +650,7 @@ class JaxScoreOracle:
             lib = ctypes.CDLL(str(so))
 
         dispatch, fn_nb_grad, fn_nb_energy = bind_kernel_dispatch(
-            lib, rotation="euler", plateau_mode="correction"
+            lib, rotation=self._dof_type, plateau_mode="correction"
         )
         if fn_nb_grad is not None:
             fn_nb_grad.argtypes = [

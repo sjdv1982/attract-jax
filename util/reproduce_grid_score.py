@@ -484,6 +484,41 @@ def euler2rotmat(phi, ssi, rot):
 
 
 @jit
+def rotvec2rotmat(v0, v1, v2):
+    """Rodrigues rotation-vector to 3x3 rotation matrix (standard scipy convention)."""
+    theta = jnp.sqrt(v0 * v0 + v1 * v1 + v2 * v2)
+    safe_t = jnp.where(theta > 1.0e-10, theta, 1.0)
+    k0 = v0 / safe_t
+    k1 = v1 / safe_t
+    k2 = v2 / safe_t
+    s = jnp.where(theta > 1.0e-10, jnp.sin(theta), theta)
+    c = jnp.where(theta > 1.0e-10, jnp.cos(theta), 1.0 - 0.5 * theta * theta)
+    omc = 1.0 - c
+    return jnp.asarray(
+        [
+            [c + omc * k0 * k0, omc * k0 * k1 - s * k2, omc * k0 * k2 + s * k1],
+            [omc * k1 * k0 + s * k2, c + omc * k1 * k1, omc * k1 * k2 - s * k0],
+            [omc * k2 * k0 - s * k1, omc * k2 * k1 + s * k0, c + omc * k2 * k2],
+        ],
+        dtype=jnp.float64,
+    )
+
+
+@jit
+def rotvec_dofs_to_mats(dofs, pivot):
+    """Like dofs_to_mats but for rotvec DOFs: (v0, v1, v2, tx, ty, tz)."""
+    rot_col = jax.vmap(rotvec2rotmat)(dofs[:, 0], dofs[:, 1], dofs[:, 2])
+    rot_row = jnp.swapaxes(rot_col, 1, 2)
+    pivot_rot = jnp.einsum("j,bji->bi", pivot, rot_row)
+    trans = dofs[:, 3:6] + pivot[None, :] - pivot_rot
+    mats = jnp.zeros((dofs.shape[0], 4, 4), dtype=jnp.float64)
+    mats = mats.at[:, :3, :3].set(rot_row)
+    mats = mats.at[:, 3, :3].set(trans)
+    mats = mats.at[:, 3, 3].set(1.0)
+    return mats
+
+
+@jit
 def dofs_to_mats(dofs, pivot):
     rot_col = jax.vmap(euler2rotmat)(dofs[:, 0], dofs[:, 1], dofs[:, 2])
     rot_row = jnp.swapaxes(rot_col, 1, 2)
@@ -532,7 +567,9 @@ def build_kernel(
     padded_nb_size: int = 0,
     max_nb_cap: int = 0,
     use_precomputed_grid_gradients: bool = True,
+    rotation: str = "euler",
 ):
+    _dofs_to_mats = rotvec_dofs_to_mats if rotation == "rotvec" else dofs_to_mats
     plateaudissq = jnp.float64(grid.plateaudis**2)
     inv50sq = jnp.float64(1.0 / (50.0 * 50.0))
     inv50 = jnp.float64(1.0 / 50.0)
@@ -1167,7 +1204,7 @@ def build_kernel(
         grid_dim,
         lig_pivot,
     ):
-        mats = dofs_to_mats(dofs, lig_pivot)
+        mats = _dofs_to_mats(dofs, lig_pivot)
         nb_energies = neighbour_energy(
             mats,
             coor_rec,
@@ -1204,7 +1241,7 @@ def build_kernel(
         grid_dim,
         lig_pivot,
     ):
-        mats = dofs_to_mats(dofs, lig_pivot)
+        mats = _dofs_to_mats(dofs, lig_pivot)
         all_coors_lig = transform_ligand_pooled(mats, coor_lig_ens, conformers)
         nb_energies = neighbour_energy_from_all_coors(
             all_coors_lig,
@@ -1248,7 +1285,7 @@ def build_kernel(
             lig_charge_scaled0,
             ff0,
         )
-        mats = dofs_to_mats(dofs, lig_pivot0)
+        mats = _dofs_to_mats(dofs, lig_pivot0)
         all_coors_lig = transform_ligand(mats, coor_lig0)
         pot_e = potential_atom_energies(
             all_coors_lig, lig_vdw_channel_idx0, lig_charge_raw0, grid0
@@ -1280,7 +1317,7 @@ def build_kernel(
             grid0,
             lig_pivot0,
         ):
-            mats = dofs_to_mats(dofs, lig_pivot0)
+            mats = _dofs_to_mats(dofs, lig_pivot0)
             all_coors_lig = transform_ligand(mats, coor_lig0)
 
             # --- Grid potential (differentiable via custom_jvp) ---

@@ -17,9 +17,9 @@ cdie: false
 potshape: 8
 
 # Rotation schemes supported by this force field.
-# euler_rot.h is always available; rotvec_rot.h is added in a later milestone.
 supported_rotations:
   - euler
+  - rotvec
 
 # Gradient support: lj_grad.h and elec_grad.h are present.
 has_lj_grad: true

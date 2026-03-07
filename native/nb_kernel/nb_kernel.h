@@ -77,6 +77,25 @@ extern "C"
       double *out_grad    // unused (may be NULL)
   );
 
+  // Rotvec rotation: dofs[0..2]=(v0,v1,v2) Rodrigues vector, dofs[3..5]=translation.
+  int nb_kernel_rotvec_grad(
+      const NbFusedStepData *step,
+      const NbFusedGridData *grid,
+      const NbGlobalData *global,
+      const NbRunConfig *cfg,
+      double *out_energy, // nposes
+      double *out_grad    // nposes*6
+  );
+
+  int nb_kernel_rotvec_energy(
+      const NbFusedStepData *step,
+      const NbFusedGridData *grid,
+      const NbGlobalData *global,
+      const NbRunConfig *cfg,
+      double *out_energy, // nposes
+      double *out_grad    // unused (may be NULL)
+  );
+
 #ifdef __cplusplus
 }
 #endif

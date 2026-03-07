@@ -47,126 +47,23 @@ def _allclose_zero(values, atol: float = 1.0e-12) -> bool:
 
 
 def parse_dat_two_body(path: str, max_poses: int = 0):
-    header: List[str] = []
-    pivots: Dict[int, np.ndarray] = {}
-    ens_list: List[int] = []
-    dof_list: List[Tuple[float, ...]] = []
-    energy_list: List[float] = []
-    centered_ligands: Optional[bool] = None
-    current_lines: List[List[float]] = []
-    current_energy: Optional[float] = None
-    seen_first_struct = False
-    current_struct_id: Optional[int] = None
+    from dat_to_npy import parse_dat_two_body_loadtxt
 
-    def flush():
-        nonlocal current_lines, current_energy, current_struct_id
-        if not current_lines:
-            return
-        struct_label = (
-            f"structure #{current_struct_id}" if current_struct_id is not None else path
-        )
-        if len(current_lines) != 2:
-            raise ValueError(
-                f"{struct_label}: expected exactly two numeric DOF lines "
-                f"(receptor then ligand), got {len(current_lines)}"
-            )
-        first = current_lines[0]
-        second = current_lines[1]
-        if len(first) not in (6, 7):
-            raise ValueError(
-                f"{struct_label}: receptor line must have 6 or 7 fields, got {len(first)}"
-            )
-        if len(second) not in (6, 7):
-            raise ValueError(
-                f"{struct_label}: ligand line must have 6 or 7 fields, got {len(second)}"
-            )
-
-        if len(first) == 6:
-            if not _allclose_zero(first):
-                raise ValueError(
-                    f"{struct_label}: receptor line without ensemble index must have zero DOFs"
-                )
-            ens = 1
-        else:
-            ens = int(round(first[0]))
-            if ens < 1:
-                raise ValueError(
-                    f"{struct_label}: receptor ensemble index must be >= 1, got {ens}"
-                )
-            if not _allclose_zero(first[1:]):
-                raise ValueError(
-                    f"{struct_label}: receptor line with ensemble index must have zero DOFs"
-                )
-
-        ligand_dofs = second[1:] if len(second) == 7 else second
-        if len(ligand_dofs) != 6:
-            raise ValueError(
-                f"{struct_label}: ligand line is missing pose DOF fields "
-                f"(expected 6, got {len(ligand_dofs)})"
-            )
-        ens_list.append(ens)
-        dof_list.append(tuple(float(v) for v in ligand_dofs))
-        energy_list.append(
-            float("nan") if current_energy is None else float(current_energy)
-        )
-        current_lines = []
-        current_energy = None
-        current_struct_id = None
-
-    with open(path) as f:
-        for raw in f:
-            line = raw.rstrip("\n")
-            pm = PIVOT_RE.match(line)
-            if pm:
-                pivots[int(pm.group(1))] = np.array(
-                    [float(pm.group(2)), float(pm.group(3)), float(pm.group(4))],
-                    dtype=np.float64,
-                )
-            em = DAT_ENERGY_RE.match(line)
-            if em:
-                current_energy = float(em.group(1))
-                continue
-            sm = STRUCT_RE.match(line)
-            if sm:
-                if max_poses and len(ens_list) >= max_poses:
-                    break
-                seen_first_struct = True
-                flush()
-                current_struct_id = int(line[1:].strip())
-                continue
-            if not seen_first_struct:
-                header.append(raw)
-                low = line.strip().lower()
-                if low.startswith("#centered ligands:"):
-                    if "true" in low:
-                        centered_ligands = True
-                    elif "false" in low:
-                        centered_ligands = False
-            parts = line.strip().split()
-            if not parts:
-                continue
-            try:
-                vals = [float(p) for p in parts]
-            except ValueError:
-                continue
-            if len(vals) in (6, 7):
-                current_lines.append(vals)
-
-    if not (max_poses and len(ens_list) >= max_poses):
-        flush()
-    if not ens_list:
-        raise ValueError(f"No structures parsed from {path}")
-    return (
+    (
         header,
         pivots,
-        np.asarray(ens_list, dtype=np.int32),
-        np.asarray(dof_list, dtype=np.float64),
-        np.asarray(energy_list, dtype=np.float64),
+        receptor_ens,
+        dofs,
+        energies,
         centered_ligands,
-    )
+        ligand_ens,
+        _receptor_has_ens,
+        _ligand_has_ens,
+    ) = parse_dat_two_body_loadtxt(path, max_poses=max_poses)
+    return header, pivots, receptor_ens, dofs, energies, centered_ligands, ligand_ens
 
 
-def write_dat_two_body(path, header, ens, dofs, energies=None):
+def write_dat_two_body(path, header, ens, dofs, energies=None, ligand_ens=None):
     with open(path, "w") as f:
         for line in header:
             f.write(line)
@@ -176,10 +73,16 @@ def write_dat_two_body(path, header, ens, dofs, energies=None):
                 f.write(f"## Energy: {energies[i]:.15e}\n")
             f.write(f"{int(ens[i]):12d}{0:12d}{0:12d}{0:12d}{0:12d}{0:12d}{0:12d}\n")
             phi, ssi, rot, xa, ya, za = dofs[i]
-            f.write(
-                f"{phi:24.16f} {ssi:24.16f} {rot:24.16f} "
-                f"{xa:24.16f} {ya:24.16f} {za:24.16f}\n"
-            )
+            if ligand_ens is None:
+                f.write(
+                    f"{phi:24.16f} {ssi:24.16f} {rot:24.16f} "
+                    f"{xa:24.16f} {ya:24.16f} {za:24.16f}\n"
+                )
+            else:
+                f.write(
+                    f"{int(ligand_ens[i]) + 1:12d} {phi:24.16f} {ssi:24.16f} {rot:24.16f} "
+                    f"{xa:24.16f} {ya:24.16f} {za:24.16f}\n"
+                )
 
 
 def parse_score_output(text):
@@ -910,6 +813,52 @@ def euler2rotmat_np(phi, ssi, rot):
     return out
 
 
+def rotvec2rotmat_np(v):
+    """Rodrigues rotvec (N,3) → rotation matrices (N,3,3) standard convention."""
+    theta = np.linalg.norm(v, axis=1, keepdims=True)  # (N,1)
+    safe_t = np.where(theta > 1.0e-10, theta, 1.0)
+    k = v / safe_t  # (N,3)
+    s = np.where(theta > 1.0e-10, np.sin(theta), theta).squeeze(1)
+    c = np.where(theta > 1.0e-10, np.cos(theta), 1.0 - 0.5 * theta * theta).squeeze(1)
+    omc = 1.0 - c
+    k0, k1, k2 = k[:, 0], k[:, 1], k[:, 2]
+    out = np.zeros((len(v), 3, 3), dtype=np.float64)
+    out[:, 0, 0] = c + omc * k0 * k0
+    out[:, 0, 1] = omc * k0 * k1 - s * k2
+    out[:, 0, 2] = omc * k0 * k2 + s * k1
+    out[:, 1, 0] = omc * k1 * k0 + s * k2
+    out[:, 1, 1] = c + omc * k1 * k1
+    out[:, 1, 2] = omc * k1 * k2 - s * k0
+    out[:, 2, 0] = omc * k2 * k0 - s * k1
+    out[:, 2, 1] = omc * k2 * k1 + s * k0
+    out[:, 2, 2] = c + omc * k2 * k2
+    return out
+
+
+def rotvec_dofs_to_mats_np(dofs, pivot):
+    rot_col = rotvec2rotmat_np(dofs[:, :3])
+    rot_row = np.swapaxes(rot_col, 1, 2)
+    pivot_rot = np.einsum("j,bji->bi", pivot, rot_row)
+    trans = dofs[:, 3:6] + pivot[None, :] - pivot_rot
+    mats = np.zeros((len(dofs), 4, 4), dtype=np.float64)
+    mats[:, :3, :3] = rot_row
+    mats[:, 3, :3] = trans
+    mats[:, 3, 3] = 1.0
+    return mats
+
+
+def rotvec_world_to_attr_np(dofs, pivot):
+    """Convert world-centered rotvec DOFs to ATTRACT pivot-centered DOFs.
+
+    `pivot` is the single fixed ligand pivot used by ATTRACT semantics.
+    For ligand ensembles, this is the pivot of conformer 1 / index 0.
+    """
+    out = np.asarray(dofs, dtype=np.float64).copy()
+    rot_col = rotvec2rotmat_np(out[:, :3])
+    out[:, 3:6] += np.einsum("bij,j->bi", rot_col, pivot) - pivot[None, :]
+    return out
+
+
 def dofs_to_mats_np(dofs, pivot):
     rot_col = euler2rotmat_np(dofs[:, 0], dofs[:, 1], dofs[:, 2])
     rot_row = np.swapaxes(rot_col, 1, 2)
@@ -1199,7 +1148,74 @@ def parse_args():
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    ap.add_argument("input_dat", help="starting .dat file")
+    ap.add_argument(
+        "input_dat",
+        nargs="?",
+        default=None,
+        help="starting .dat file (optional when --input-npy is provided)",
+    )
+    ap.add_argument(
+        "--input-npy",
+        default=None,
+        metavar="DOF_NPY",
+        help="Nx6 float64 array: rotations+translations; interpretation set by --input-format",
+    )
+    ap.add_argument(
+        "--input-format",
+        choices=("rotvec", "euler"),
+        default=None,
+        help="rotation parameterization for --input-npy",
+    )
+    ap.add_argument(
+        "--input-euler",
+        default=None,
+        metavar="EULER_NPY",
+        help=argparse.SUPPRESS,
+    )
+    ap.add_argument(
+        "--input-rotvec",
+        default=None,
+        metavar="ROTVEC_NPY",
+        help=argparse.SUPPRESS,
+    )
+    ap.add_argument(
+        "--input-conformers",
+        default=None,
+        metavar="CONF_NPY",
+        help="N int32 array: 0-based ligand conformer index per pose (for --input-npy)",
+    )
+    ap.add_argument(
+        "--input-ens",
+        default=None,
+        metavar="ENS_NPY",
+        help="N int32 array: receptor ensemble index per pose (accepts 0-based or 1-based for --input-npy)",
+    )
+    ap.add_argument(
+        "--input-world-centered",
+        action="store_true",
+        default=False,
+        help=(
+            "For --input-rotvec, input translations are world-frame translations "
+            "(for example raw offsets from stack.py / convert_poses pre-inversion). "
+            "minfor converts them to ATTRACT tx/ty/tz using the ligand pivot and pose rotation."
+        ),
+    )
+    ap.add_argument(
+        "--input-pivot-centered",
+        action="store_true",
+        default=False,
+        help=(
+            "For --input-rotvec, input translations are already ATTRACT tx/ty/tz "
+            "DOFs relative to the ligand pivot. This is the default if no "
+            "translation-convention flag is provided."
+        ),
+    )
+    ap.add_argument(
+        "--input-centered",
+        action="store_true",
+        default=False,
+        help=argparse.SUPPRESS,
+    )
     ap.add_argument("--out-prefix", default=None)
     ap.add_argument(
         "--score",
@@ -1499,6 +1515,47 @@ def parse_args():
         ap.error(
             "--ligand-conformers requires --ligand-ensemble or --ligand-pdb-list"
         )
+    nx6_inputs = int(bool(args.input_npy)) + int(bool(args.input_rotvec)) + int(bool(args.input_euler))
+    if nx6_inputs > 1:
+        ap.error("--input-npy, --input-rotvec, and --input-euler are mutually exclusive")
+    if args.input_rotvec:
+        args.input_npy = args.input_rotvec
+        args.input_format = "rotvec"
+    elif args.input_euler:
+        args.input_npy = args.input_euler
+        args.input_format = "euler"
+    if args.input_npy and args.input_format is None:
+        ap.error("--input-format is required with --input-npy")
+    if args.input_format and not args.input_npy:
+        ap.error("--input-format requires --input-npy")
+    if args.input_npy:
+        if args.input_dat:
+            ap.error("input_dat is mutually exclusive with --input-npy")
+        if args.oracle != "jax":
+            ap.error("--input-npy requires --oracle jax")
+    else:
+        if not args.input_dat:
+            ap.error("input_dat is required unless --input-npy is provided")
+    if args.input_conformers and not args.input_npy:
+        ap.error("--input-conformers requires --input-npy")
+    if args.input_ens and not args.input_npy:
+        ap.error("--input-ens requires --input-npy")
+    if (
+        args.input_world_centered
+        or args.input_pivot_centered
+        or args.input_centered
+    ) and args.input_format != "rotvec":
+        ap.error(
+            "--input-world-centered/--input-pivot-centered currently only apply to --input-format rotvec"
+        )
+    if args.input_world_centered and args.input_pivot_centered:
+        ap.error(
+            "--input-world-centered and --input-pivot-centered are mutually exclusive"
+        )
+    if args.input_centered:
+        if args.input_pivot_centered:
+            ap.error("--input-centered conflicts with --input-pivot-centered")
+        args.input_world_centered = True
 
     return args
 
@@ -1509,6 +1566,7 @@ def main():
     verbose = not args.score
     if not args.score and not args.out_prefix and not args.generate_grid:
         raise ValueError("--out-prefix is required unless --score is used")
+    ligand_ens_dat = None
 
     if args.disable_jit and args.oracle == "jax":
         import jax
@@ -1517,34 +1575,123 @@ def main():
         if verbose:
             print("JAX JIT disabled (--disable-jit)")
 
-    test_dir = args.test_dir or str(Path(args.input_dat).resolve().parent)
-
-    # Read poses (max_poses includes offset, so read offset + max_poses total)
-    total_read = (args.pose_offset + args.max_poses) if args.max_poses else 0
-    header, pivots, ens, dofs0, _, centered_ligands = parse_dat_two_body(
-        args.input_dat, max_poses=total_read
-    )
-    # Apply offset
-    if args.pose_offset > 0:
-        ens = ens[args.pose_offset :]
-        dofs0 = dofs0[args.pose_offset :]
-    n = len(dofs0)
-    if verbose:
-        print(
-            f"Poses: {n} (offset={args.pose_offset}), "
-            f"maxfun: {args.maxfun}, oracle: {args.oracle}"
+    # --- Nx6 input path ---
+    _dof_type = "euler"
+    if args.input_npy:
+        test_dir = args.test_dir or str(Path(args.input_npy).resolve().parent)
+        dofs0 = np.load(args.input_npy).astype(np.float64)
+        if dofs0.ndim != 2 or dofs0.shape[1] != 6:
+            raise ValueError(
+                f"Nx6 input must have shape (N,6), got {dofs0.shape}"
+            )
+        if args.input_conformers:
+            ligand_conformers_rotvec = np.load(args.input_conformers).astype(np.int32).reshape(-1)
+        else:
+            ligand_conformers_rotvec = None
+        if args.input_ens:
+            ens = np.load(args.input_ens).astype(np.int64).reshape(-1)
+            if len(ens) != len(dofs0):
+                raise ValueError(
+                    f"--input-ens length mismatch: expected {len(dofs0)}, got {len(ens)}"
+                )
+            if ens.size:
+                if ens.min() >= 1:
+                    ens = ens.astype(np.int32)
+                elif ens.min() >= 0:
+                    ens = (ens + 1).astype(np.int32)
+                else:
+                    raise ValueError("--input-ens must be 0-based or 1-based integers")
+            else:
+                ens = ens.astype(np.int32)
+        else:
+            ens = np.ones(len(dofs0), dtype=np.int32)
+        if args.pose_offset > 0:
+            dofs0 = dofs0[args.pose_offset :]
+            if ligand_conformers_rotvec is not None:
+                ligand_conformers_rotvec = ligand_conformers_rotvec[args.pose_offset :]
+            ens = ens[args.pose_offset :]
+        if args.max_poses:
+            dofs0 = dofs0[: args.max_poses]
+            if ligand_conformers_rotvec is not None:
+                ligand_conformers_rotvec = ligand_conformers_rotvec[: args.max_poses]
+            ens = ens[: args.max_poses]
+        n = len(dofs0)
+        if ligand_conformers_rotvec is not None and len(ligand_conformers_rotvec) != n:
+            raise ValueError(
+                f"--input-conformers length mismatch: expected {n}, got {len(ligand_conformers_rotvec)}"
+            )
+        header = []
+        pivots = {}
+        centered_ligands = None
+        _dof_type = str(args.input_format)
+        if verbose:
+            print(
+                f"Poses: {n} (offset={args.pose_offset}), "
+                f"maxfun: {args.maxfun}, oracle: {args.oracle}, dof_type={_dof_type}"
+            )
+    else:
+        test_dir = args.test_dir or str(Path(args.input_dat).resolve().parent)
+        # Read poses (max_poses includes offset, so read offset + max_poses total)
+        total_read = (args.pose_offset + args.max_poses) if args.max_poses else 0
+        header, pivots, ens, dofs0, _, centered_ligands, ligand_ens_dat = parse_dat_two_body(
+            args.input_dat, max_poses=total_read
         )
-        print(f"Ensemble ids: {np.unique(ens)}, centered_ligands: {centered_ligands}")
+        # Apply offset
+        if args.pose_offset > 0:
+            ens = ens[args.pose_offset :]
+            dofs0 = dofs0[args.pose_offset :]
+            ligand_ens_dat = ligand_ens_dat[args.pose_offset :]
+        n = len(dofs0)
+        ligand_conformers_rotvec = None
+        if verbose:
+            print(
+                f"Poses: {n} (offset={args.pose_offset}), "
+                f"maxfun: {args.maxfun}, oracle: {args.oracle}"
+            )
+            print(f"Ensemble ids: {np.unique(ens)}, centered_ligands: {centered_ligands}")
 
     ligand_inputs = resolve_ligand_inputs(args, test_dir, n)
     ligand_pdb_path = ligand_inputs["ligand_pdb_path"]
-    ligand_conformers = ligand_inputs["ligand_conformers"]
+    ligand_conformers = (
+        ligand_conformers_rotvec
+        if ligand_conformers_rotvec is not None
+        else ligand_inputs["ligand_conformers"]
+    )
+    if ligand_ens_dat is not None and np.any(ligand_ens_dat):
+        if np.any(ligand_ens_dat == 0):
+            raise ValueError(
+                "input_dat mixes ligand lines with and without ensemble indices; this is not supported"
+            )
+        if ligand_conformers is not None:
+            raise ValueError(
+                "input_dat already contains ligand ensemble indices; remove --ligand-conformers/--input-conformers"
+            )
+        ligand_library = ligand_inputs["ligand_ensemble"]
+        if ligand_library is None:
+            raise ValueError(
+                "input_dat contains ligand ensemble indices, but no ligand ensemble library was provided"
+            )
+        nconformers = int(ligand_library.shape[0])
+        if int(ligand_ens_dat.max()) > nconformers:
+            raise ValueError(
+                f"input_dat ligand ensemble index {int(ligand_ens_dat.max())} exceeds "
+                f"the provided ligand library size {nconformers}"
+            )
+        ligand_conformers = ligand_ens_dat.astype(np.int32) - 1
     if 2 in pivots:
         lig_pivot = pivots[2]
     else:
         lig_pivot = np.asarray(ligand_inputs["ligand_pivot"], dtype=np.float64)
     if verbose:
         print(f"Ligand pivot: {lig_pivot}")
+
+    # --- Convert world-frame translations → ATTRACT DOFs (rotvec path) ---
+    if _dof_type == "rotvec" and args.input_world_centered:
+        dofs0 = rotvec_world_to_attr_np(dofs0, lig_pivot)
+        if verbose:
+            print(
+                "Converted world-frame rotvec translations to ATTRACT DOFs using the ligand pivot"
+            )
 
     # --- Convert centered → non-centered for JAX oracle only ---
     input_centered = bool(centered_ligands) if centered_ligands is not None else False
@@ -1664,6 +1811,7 @@ def main():
             autodiff_potentials=bool(args.autodiff_potentials),
             energy_only=bool(args.energy_only),
             grid_object=grid_object,
+            dof_type=_dof_type,
         )
         if verbose:
             print(
@@ -1787,23 +1935,38 @@ def main():
         f"max={improv.max():.3f}"
     )
 
-    mats = dofs_to_mats_np(
-        dofs_out if not input_centered else dofs_out.copy(), lig_pivot
-    )
+    if _dof_type == "rotvec":
+        mats = rotvec_dofs_to_mats_np(dofs_out, lig_pivot)
+    else:
+        mats = dofs_to_mats_np(
+            dofs_out if not input_centered else dofs_out.copy(), lig_pivot
+        )
 
     np.save(args.out_prefix + ".dofs.npy", dofs_out.astype(np.float32))
     np.save(args.out_prefix + ".mat4.npy", mats.astype(np.float32))
     np.save(args.out_prefix + ".energy.npy", energies_out.astype(np.float32))
     np.save(args.out_prefix + ".ens.npy", ens.astype(np.int32))
     np.save(args.out_prefix + ".nfev.npy", nfev_out.astype(np.int32))
+    if ligand_conformers is not None and _dof_type == "rotvec":
+        np.save(args.out_prefix + ".conformers.npy", ligand_conformers.astype(np.int32))
 
-    out_dat = args.out_prefix + ".dat"
-    write_dat_two_body(out_dat, header, ens, dofs_out, energies=energies_out)
-    print(f"Saved: {args.out_prefix}.[dofs|energy|mat4|ens|nfev].npy + {out_dat}")
+    if _dof_type != "rotvec":
+        out_dat = args.out_prefix + ".dat"
+        write_dat_two_body(
+            out_dat,
+            header,
+            ens,
+            dofs_out,
+            energies=energies_out,
+            ligand_ens=ligand_conformers,
+        )
+        print(f"Saved: {args.out_prefix}.[dofs|energy|mat4|ens|nfev].npy + {out_dat}")
+    else:
+        print(f"Saved: {args.out_prefix}.[dofs|energy|mat4|ens|nfev].npy")
 
     # Compare with legacy
     if args.legacy_dat:
-        _, _, ens_ref, _, e_ref, _ = parse_dat_two_body(args.legacy_dat, max_poses=n)
+        _, _, ens_ref, _, e_ref, _, _ = parse_dat_two_body(args.legacy_dat, max_poses=n)
         m = min(n, len(e_ref))
         if np.isfinite(e_ref[:m]).all():
             summarize("energy_vs_legacy", e_ref[:m], energies_out[:m])

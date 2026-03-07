@@ -41,9 +41,11 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 # ---------------------------------------------------------------------------
 ROT_HEADER = {
     "euler": "include/euler_rot.h",
+    "rotvec": "include/rotvec_rot.h",
 }
 ROT_POLICY = {
     "euler": "EulerRot",
+    "rotvec": "RotVecRot",
 }
 PLATEAU_MODES = {
     "correction": "Correction",
@@ -747,19 +749,18 @@ def codegen_mode(name: str, ff_dir: Path) -> None:
     print(f"  Rotations  : {', '.join(rotations)}")
     print(f"  Has grad   : {has_grad}")
     print("  Plateau    : correction, clamp")
-    if has_grad:
-        print(
-            "  Wrappers   : "
-            "nb_kernel_euler_correction_grad, nb_kernel_euler_correction_energy, "
-            "nb_kernel_euler_clamp_grad, nb_kernel_euler_clamp_energy, "
-            "nb_kernel_euler_grad (alias), nb_kernel_euler_energy (alias)"
-        )
-    else:
-        print(
-            "  Wrappers   : "
-            "nb_kernel_euler_correction_energy, nb_kernel_euler_clamp_energy, "
-            "nb_kernel_euler_energy (alias)  (no gradient headers found)"
-        )
+    wrapper_names = []
+    for rot in rotations:
+        if rot not in ROT_POLICY:
+            continue
+        for pm in ("correction", "clamp"):
+            if has_grad:
+                wrapper_names.append(f"nb_kernel_{rot}_{pm}_grad")
+            wrapper_names.append(f"nb_kernel_{rot}_{pm}_energy")
+        if has_grad:
+            wrapper_names.append(f"nb_kernel_{rot}_grad (alias)")
+        wrapper_names.append(f"nb_kernel_{rot}_energy (alias)")
+    print(f"  Wrappers   : {', '.join(wrapper_names)}")
     print(f"\nBuild with:  make nb_kernel_{name}.so")
 
 

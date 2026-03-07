@@ -34,6 +34,12 @@ KNOWN_KERNEL_SYMBOLS = (
     "nb_kernel_euler_clamp_energy",
     "nb_kernel_euler_grad",
     "nb_kernel_euler_energy",
+    "nb_kernel_rotvec_correction_grad",
+    "nb_kernel_rotvec_correction_energy",
+    "nb_kernel_rotvec_clamp_grad",
+    "nb_kernel_rotvec_clamp_energy",
+    "nb_kernel_rotvec_grad",
+    "nb_kernel_rotvec_energy",
 )
 
 
