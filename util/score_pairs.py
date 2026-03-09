@@ -44,6 +44,7 @@ internally where needed (at a copy cost); pass NumPy for best performance.
 """
 
 import ctypes
+import inspect
 import subprocess
 import sys
 from pathlib import Path
@@ -191,85 +192,28 @@ def _ptr(arr, ctype):
 
 
 # ---------------------------------------------------------------------------
-# JAX pair-energy helpers
+# Force-field call helpers
 # ---------------------------------------------------------------------------
 
 
-def _make_jax_kernel(ff_module, plateau_mode: str, plateaudis_sq: float):
-    """Return a JAX function that computes (N,) energies from vectorised inputs.
+def _ff_elec_accepts_dsq(elec_energy_fn) -> bool:
+    """Return whether ``elec_energy`` accepts a third ``dsq`` argument."""
+    try:
+        sig = inspect.signature(elec_energy_fn)
+    except (TypeError, ValueError):
+        # Builtins/C-extension callables without inspectable signatures:
+        # keep maximum compatibility by assuming dsq is accepted.
+        return True
 
-    The returned function signature::
-
-        energies = kernel(
-            query_c,           # (N, 1, 3) float64
-            rec_c,             # (N, K, 3) float64
-            dsq,               # (N, K) float64
-            valid,             # (N, K) bool
-            rt,                # (N, K) int32  — receptor atom-type indices
-            qt,                # (N, K) int32  — query atom-type index
-            rec_charge,        # (N, K) float64
-            query_charge_full, # (N, K) float64  — rec_charge * query_charge
-            rc, ac, emin, rmin2, ivor,  # 2-D arrays (nrec_t, nlig_t)
-        )
-    """
-    pdsq = float(plateaudis_sq)
-    prr2 = 1.0 / pdsq
-
-    def kernel(
-        query_c,
-        rec_c,
-        dsq,
-        valid,
-        rt,
-        qt,
-        rec_charge,
-        query_charge_full,
-        rc,
-        ac,
-        emin,
-        rmin2,
-        ivor,
+    params = list(sig.parameters.values())
+    if any(
+        p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+        for p in params
     ):
-        if plateau_mode == "clamp":
-            dsq_eff = jnp.where(dsq < pdsq, pdsq, dsq)
-        else:
-            # correction: only pairs inside plateau contribute
-            valid = valid & (dsq <= pdsq)
-            dsq_eff = jnp.where(valid, dsq, 1.0)  # avoid div-by-zero
-
-        rr2 = 1.0 / dsq_eff
-
-        # LJ energy (vectorised over (N, K))
-        rlen = rc[rt, qt]
-        alen = ac[rt, qt]
-        emin_v = emin[rt, qt]
-        rmin2_v = rmin2[rt, qt]
-        iv = ivor[rt, qt]
-        rr23 = rr2 * rr2 * rr2
-        rep = rlen * rr2
-        vlj = (rep - alen) * rr23
-        e_lj = jnp.where(dsq_eff < rmin2_v, vlj + (iv - 1.0) * emin_v, iv * vlj)
-
-        if plateau_mode == "correction":
-            # Subtract E(plateaudis)
-            vlj_p = (rlen * prr2 - alen) * (prr2**3)
-            e_lj_p = jnp.where(pdsq < rmin2_v, vlj_p + (iv - 1.0) * emin_v, iv * vlj_p)
-            e_lj = e_lj - e_lj_p
-
-        # Electrostatics (rdie, nonbon8 convention)
-        inv50sq = (1.0 / 50.0) ** 2
-        charge = query_charge_full
-        dd = jnp.where(rr2 > inv50sq, rr2 - inv50sq, 0.0)
-        e_elec = charge * dd
-
-        if plateau_mode == "correction":
-            dd_p = jnp.where(prr2 > inv50sq, prr2 - inv50sq, 0.0)
-            e_elec = e_elec - charge * dd_p
-
-        e_pair = jnp.where(valid, e_lj + e_elec, 0.0)
-        return e_pair.sum(axis=-1)  # (N,)
-
-    return jax.jit(kernel)
+        return True
+    if len(params) >= 3:
+        return True
+    return any(p.name == "dsq" for p in params)
 
 
 # ---------------------------------------------------------------------------
@@ -312,8 +256,9 @@ def score_pairs_jax(
         Namedtuple with rc, ac, ivor, emin, rmin2 arrays of shape
         (nrec_types, nlig_types).
     ff_module : module
-        Force-field module (used for API reference; physics inlined here for
-        performance).
+        Force-field module implementing ``lj_energy`` and ``elec_energy``.
+        The JAX backend calls these energy primitives directly and obtains
+        gradients via autodiff.
     nr_neigh, nb_start, nb_concat : numpy arrays
         Compact neighbour list representation.
     plateaudis_sq : float
@@ -365,25 +310,19 @@ def score_pairs_jax(
             "score_pairs_jax: ff_module is required for the JAX backend. "
             "Pass the force-field module (e.g. nonbon8) or use backend='kernel'."
         )
-
-    if return_gradients:
-        if not getattr(ff_module, "lj_grad", None) or not getattr(
-            ff_module, "elec_grad", None
-        ):
-            missing = [
-                n for n in ("lj_grad", "elec_grad") if not getattr(ff_module, n, None)
-            ]
-            raise AttributeError(
-                f"score_pairs_jax: return_gradients=True requires {missing} in "
-                f"ff_module ({ff_module.__name__ if hasattr(ff_module, '__name__') else ff_module}). "
-                "Implement these functions or use autodiff potentials (--autodiff-potentials)."
-            )
+    _lj_energy = ff_module.lj_energy
+    _elec_energy = ff_module.elec_energy
+    _elec_accepts_dsq = _ff_elec_accepts_dsq(_elec_energy)
 
     pdsq_f = float(plateaudis_sq)
     prr2_f = 1.0 / pdsq_f
 
-    @jax.jit
-    def _batch_energy(qc_batch, nr_batch, nb_start_batch):
+    def _call_elec_energy(charge, rr2, dsq):
+        if _elec_accepts_dsq:
+            return _elec_energy(charge, rr2, dsq)
+        return _elec_energy(charge, rr2)
+
+    def _batch_energy_raw(qc_batch, nr_batch, nb_start_batch):
         # qc_batch : (B, 3)
         # nr_batch : (B,)
         # nb_start_batch : (B,)
@@ -416,34 +355,46 @@ def score_pairs_jax(
         rmin2_v = rmin2_j[rt, qt]
         iv = ivor_j[rt, qt]
 
-        e_lj = ff_module.lj_energy(rlen, alen, emin_v, rmin2_v, iv, dsq_eff, rr2)
+        e_lj = _lj_energy(rlen, alen, emin_v, rmin2_v, iv, dsq_eff, rr2)
         if plateau_mode == "correction":
-            e_lj = e_lj - ff_module.lj_energy(
-                rlen, alen, emin_v, rmin2_v, iv, pdsq_f, prr2_f
-            )
+            e_lj = e_lj - _lj_energy(rlen, alen, emin_v, rmin2_v, iv, pdsq_f, prr2_f)
 
         # Electrostatics
         charge = rec_ch_j[safe_rec] * qch  # (B, K)
-        e_elec = ff_module.elec_energy(charge, rr2)
+        e_elec = _call_elec_energy(charge, rr2, dsq_eff)
         if plateau_mode == "correction":
-            e_elec = e_elec - ff_module.elec_energy(charge, prr2_f)
+            e_elec = e_elec - _call_elec_energy(charge, prr2_f, pdsq_f)
 
         e_pair = jnp.where(valid, e_lj + e_elec, 0.0)
         return e_pair.sum(axis=-1)  # (B,)
 
+    _batch_energy = jax.jit(_batch_energy_raw)
+
+    def _lj_energy_sum_from_delta(rlen, alen, emin_v, rmin2_v, iv, dx_eff, dy_eff, dz_eff):
+        dsq_eff = dx_eff * dx_eff + dy_eff * dy_eff + dz_eff * dz_eff
+        rr2_eff = jnp.where(dsq_eff != 0.0, 1.0 / dsq_eff, 0.0)
+        return jnp.sum(_lj_energy(rlen, alen, emin_v, rmin2_v, iv, dsq_eff, rr2_eff))
+
+    _lj_force_autodiff = jax.value_and_grad(
+        _lj_energy_sum_from_delta, argnums=(5, 6, 7)
+    )
+
+    def _elec_energy_sum_from_delta(charge, dx_eff, dy_eff, dz_eff):
+        dsq_eff = dx_eff * dx_eff + dy_eff * dy_eff + dz_eff * dz_eff
+        rr2_eff = jnp.where(dsq_eff != 0.0, 1.0 / dsq_eff, 0.0)
+        return jnp.sum(_call_elec_energy(charge, rr2_eff, dsq_eff))
+
+    _elec_force_autodiff = jax.value_and_grad(
+        _elec_energy_sum_from_delta, argnums=(1, 2, 3)
+    )
+
     @jax.jit
     def _batch_energy_and_grad(qc_batch, nr_batch, nb_start_batch):
-        """Compute energy AND explicit gradients using the same clamp/correction
-        formula as the C kernel.  ``jax.grad`` is NOT used here because in clamp
-        mode the clamped energy is constant w.r.t. query position inside the
-        plateau sphere, yielding incorrect zero gradients.  The explicit formula
-        produces the "pseudo-gradient" stored in the ATTRACT grid channels 1-3,
-        which represent the force direction on the probe atom.
+        """Compute energy and pseudo-gradient matching the compiled kernel path.
 
-        Returns
-        -------
-        energies : (B,)
-        grads    : (B, 3)  — gradient convention: +(dE/dq)
+        For clamp mode this follows the same effective-displacement construction
+        as the C kernel and derives force components from autodiff of
+        ``lj_energy``/``elec_energy``.
         """
         B = qc_batch.shape[0]
         flat_nb = nb_start_batch[:, None] + offsets_j[None, :]  # (B, K)
@@ -466,17 +417,12 @@ def score_pairs_jax(
             eval_dsq = dsq
             valid = valid & within
 
-        # Avoid division by zero; invalid pairs will be masked out
+        # Avoid division by zero; invalid pairs will be masked out.
         safe_dsq = jnp.where(valid, dsq, 1.0)
         eval_dsq_safe = jnp.where(valid, eval_dsq, 1.0)
         eval_rr2 = 1.0 / eval_dsq_safe
 
-        # Displacement for gradient computation.
-        #   Clamp mode: "pseudo-gradient" d/dsq*ratio — points toward the plateau sphere
-        #               surface, matching the kernel's eval_dx = sdx * ratio convention.
-        #   Correction mode: actual gradient at real distance (d/dsq).  The correction
-        #               component V(pdsq) is constant w.r.t. query position, so its
-        #               gradient contribution is exactly zero and must NOT be subtracted.
+        # Effective (dx,dy,dz) input to the per-pair gradient convention.
         if plateau_mode == "clamp":
             eval_d = d / safe_dsq[..., None] * ratio[..., None]
         else:
@@ -491,51 +437,53 @@ def score_pairs_jax(
         rmin2_v = rmin2_j[rt, qt]
         iv = ivor_j[rt, qt]
 
-        # LJ energy + gradient via ff_module (routes through force-field implementation).
-        e_lj, gx_lj, gy_lj, gz_lj = ff_module.lj_grad(
+        # Pair energy at the effective distance.
+        e_lj = _lj_energy(rlen, alen, emin_v, rmin2_v, iv, eval_dsq_safe, eval_rr2)
+
+        # Reconstruct effective displacement vectors for autodiff.
+        eval_delta = jnp.where(
+            eval_rr2[..., None] != 0.0,
+            eval_d / eval_rr2[..., None],
+            0.0,
+        )
+        _, (dE_lj_x, dE_lj_y, dE_lj_z) = _lj_force_autodiff(
             rlen,
             alen,
             emin_v,
             rmin2_v,
             iv,
-            eval_dsq_safe,
-            eval_rr2,
-            eval_d[..., 0],
-            eval_d[..., 1],
-            eval_d[..., 2],
+            eval_delta[..., 0],
+            eval_delta[..., 1],
+            eval_delta[..., 2],
         )
-        g_lj = jnp.stack([gx_lj, gy_lj, gz_lj], axis=-1)  # (B, K, 3)
+        # Force direction convention (-dE/dx), matching lj_grad.h.
+        g_lj = jnp.stack([-dE_lj_x, -dE_lj_y, -dE_lj_z], axis=-1)
 
         if plateau_mode == "correction":
-            # Subtract energy at plateau distance (constant w.r.t. query → zero gradient).
-            e_lj = e_lj - ff_module.lj_energy(
-                rlen, alen, emin_v, rmin2_v, iv, pdsq_f, prr2_f
-            )
-            # g_lj is unchanged: gradient of the correction component is zero.
+            # Subtract plateau energy only; its gradient contribution is zero.
+            e_lj = e_lj - _lj_energy(rlen, alen, emin_v, rmin2_v, iv, pdsq_f, prr2_f)
 
-        # Electrostatics: energy + gradient via ff_module.
         charge = rec_ch_j[safe_rec] * qch
-        e_elec, gx_el, gy_el, gz_el = ff_module.elec_grad(
+        e_elec = _call_elec_energy(charge, eval_rr2, eval_dsq_safe)
+        _, (dE_el_x, dE_el_y, dE_el_z) = _elec_force_autodiff(
             charge,
-            eval_rr2,
-            eval_d[..., 0],
-            eval_d[..., 1],
-            eval_d[..., 2],
+            eval_delta[..., 0],
+            eval_delta[..., 1],
+            eval_delta[..., 2],
         )
-        g_elec = jnp.stack([gx_el, gy_el, gz_el], axis=-1)  # (B, K, 3)
+        # Force direction convention (-dE/dx), matching elec_grad.h.
+        g_elec = jnp.stack([-dE_el_x, -dE_el_y, -dE_el_z], axis=-1)
 
         if plateau_mode == "correction":
-            # Subtract elec energy at plateau distance (constant → zero gradient).
-            e_elec = e_elec - ff_module.elec_energy(charge, prr2_f)
-            # g_elec is unchanged.
+            # Subtract plateau energy only; its gradient contribution is zero.
+            e_elec = e_elec - _call_elec_energy(charge, prr2_f, pdsq_f)
 
         mask3 = valid[..., None]
         e_pair = jnp.where(valid, e_lj + e_elec, 0.0)
         g_pair = jnp.where(mask3, g_lj + g_elec, 0.0)  # (B, K, 3)
 
         energies = e_pair.sum(axis=-1)  # (B,)
-        # Sum over neighbours; negate because lj_grad/elec_grad return force
-        # direction (-dE/dq); negating gives gradient convention (+dE/dq).
+        # Convert summed force-direction components to gradient direction.
         grads = -g_pair.sum(axis=-2)  # (B, 3)
         return energies, grads
 
@@ -750,6 +698,7 @@ def score_pairs(
     plateaudis_sq: float,
     plateau_mode: str = "clamp",
     return_gradients: bool = False,
+    force_jax: bool = False,
     batch_size: int = 16384,
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """Evaluate pairwise NB energy over neighbour lists.
@@ -798,6 +747,9 @@ def score_pairs(
     return_gradients : bool
         Return dE/d(query_pos) alongside energies (JAX backend) or from the
         kernel's grad symbol (kernel backend).
+    force_jax : bool
+        If True, always use the pure-JAX backend even when a compiled kernel
+        is available (overrides auto-selection based on ``lj.h``).
     batch_size : int
         JAX backend: queries per JIT call.
 
@@ -822,7 +774,7 @@ def score_pairs(
 
     ff_module, lib = _load_ff_and_lib(forcefield)
 
-    if lib is not None:
+    if lib is not None and not force_jax:
         return score_pairs_kernel(
             query_coords=query_coords,
             rec_coords=rec_coords,

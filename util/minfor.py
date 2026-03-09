@@ -1039,7 +1039,9 @@ def resolve_ligand_inputs(args, test_dir: str, nposes: int):
         return result
 
     ligand_pdb_path = args.ligand_pdb or os.path.join(test_dir, "ligandr.pdb")
-    lig_coords0, lig_atomtypes0, lig_charge0, _lig_w = parse_reduced_pdb(ligand_pdb_path)
+    lig_coords0, lig_atomtypes0, lig_charge0, _lig_w = parse_reduced_pdb(
+        ligand_pdb_path
+    )
     return {
         "mode": "pdb",
         "ligand_pdb_path": ligand_pdb_path,
@@ -1284,6 +1286,18 @@ def parse_args():
             "generated just-in-time and used directly (not saved)."
         ),
     )
+    ap.add_argument(
+        "--lig-atomtypes",
+        default=None,
+        metavar="INT[,INT,...]",
+        help=(
+            "Comma-separated ATTRACT atom type indices used to restrict the grid "
+            "VDW alphabet (e.g. '1' or '1,5,30').  Only relevant with "
+            "--generate-grid and when no ligand PDB/ensemble is provided.  "
+            "When omitted the alphabet defaults to all atom types present in "
+            "the receptor."
+        ),
+    )
     ap.add_argument("--attract-par-npz", default=None, help="path to attract-par.npz")
     ap.add_argument(
         "--receptor-ens-list", default=None, help="path to receptor ensemble list"
@@ -1388,11 +1402,20 @@ def parse_args():
     )
     ap.add_argument(
         "--nb-kernel",
-        default="nonbon8",
-        choices=["jax", "nonbon8"],
+        default="compiled",
+        choices=["jax", "compiled"],
         help=(
-            "JAX-only NB backend: 'nonbon8' (C++ nonbon8 NB kernel, default) or "
-            "'jax' (pure JAX)"
+            "JAX-only NB backend: 'compiled' (C++ NB kernel for the selected "
+            "--forcefield, default) or 'jax' (pure JAX, bypasses the compiled "
+            "kernel even when available)"
+        ),
+    )
+    ap.add_argument(
+        "--forcefield",
+        default="nonbon8",
+        help=(
+            "JAX-only: force-field name (default: 'nonbon8').  Controls which "
+            "parameter set and physics module are used for grid generation and scoring."
         ),
     )
     ap.add_argument(
@@ -1437,6 +1460,7 @@ def parse_args():
             "--score-batch-size",
             "--pool-conformers",
             "--nb-kernel",
+            "--forcefield",
             "--autodiff-potentials",
             "--disable-jit",
         ]
@@ -1485,8 +1509,10 @@ def parse_args():
         ap.error("--pool-conformers currently requires --energy-only")
     if args.pool_conformers and args.nb_kernel != "jax":
         ap.error("--pool-conformers currently requires --nb-kernel jax")
-    receptor_mode_count = int(bool(args.receptor_ens_list)) + int(bool(args.receptor_pdb)) + int(
-        bool(args.receptor_coordinates)
+    receptor_mode_count = (
+        int(bool(args.receptor_ens_list))
+        + int(bool(args.receptor_pdb))
+        + int(bool(args.receptor_coordinates))
     )
     if receptor_mode_count > 1:
         ap.error(
@@ -1498,8 +1524,10 @@ def parse_args():
         ap.error("--receptor-atomtypes is only valid with --receptor-coordinates")
     if args.receptor_charges and not args.receptor_coordinates:
         ap.error("--receptor-charges is only valid with --receptor-coordinates")
-    ligand_mode_count = int(bool(args.ligand_pdb)) + int(bool(args.ligand_ensemble)) + int(
-        bool(args.ligand_pdb_list)
+    ligand_mode_count = (
+        int(bool(args.ligand_pdb))
+        + int(bool(args.ligand_ensemble))
+        + int(bool(args.ligand_pdb_list))
     )
     if ligand_mode_count > 1:
         ap.error(
@@ -1512,12 +1540,16 @@ def parse_args():
     if args.ligand_charges and not args.ligand_ensemble:
         ap.error("--ligand-charges is only valid with --ligand-ensemble")
     if args.ligand_conformers and not (args.ligand_ensemble or args.ligand_pdb_list):
-        ap.error(
-            "--ligand-conformers requires --ligand-ensemble or --ligand-pdb-list"
-        )
-    nx6_inputs = int(bool(args.input_npy)) + int(bool(args.input_rotvec)) + int(bool(args.input_euler))
+        ap.error("--ligand-conformers requires --ligand-ensemble or --ligand-pdb-list")
+    nx6_inputs = (
+        int(bool(args.input_npy))
+        + int(bool(args.input_rotvec))
+        + int(bool(args.input_euler))
+    )
     if nx6_inputs > 1:
-        ap.error("--input-npy, --input-rotvec, and --input-euler are mutually exclusive")
+        ap.error(
+            "--input-npy, --input-rotvec, and --input-euler are mutually exclusive"
+        )
     if args.input_rotvec:
         args.input_npy = args.input_rotvec
         args.input_format = "rotvec"
@@ -1534,16 +1566,17 @@ def parse_args():
         if args.oracle != "jax":
             ap.error("--input-npy requires --oracle jax")
     else:
-        if not args.input_dat:
-            ap.error("input_dat is required unless --input-npy is provided")
+        if not args.input_dat and not args.generate_grid:
+            ap.error(
+                "input_dat is required unless --input-npy is provided "
+                "(or --generate-grid for grid-only generation)"
+            )
     if args.input_conformers and not args.input_npy:
         ap.error("--input-conformers requires --input-npy")
     if args.input_ens and not args.input_npy:
         ap.error("--input-ens requires --input-npy")
     if (
-        args.input_world_centered
-        or args.input_pivot_centered
-        or args.input_centered
+        args.input_world_centered or args.input_pivot_centered or args.input_centered
     ) and args.input_format != "rotvec":
         ap.error(
             "--input-world-centered/--input-pivot-centered currently only apply to --input-format rotvec"
@@ -1568,6 +1601,79 @@ def main():
         raise ValueError("--out-prefix is required unless --score is used")
     ligand_ens_dat = None
 
+    # ------------------------------------------------------------------
+    # Early-exit path: --generate-grid without any input poses.
+    # No ligand PDB or input .dat is needed to build a potential grid.
+    # ------------------------------------------------------------------
+    if args.generate_grid and not args.input_dat and not args.input_npy:
+        import math as _math
+        import sys as _sys
+
+        _util_dir = os.path.dirname(os.path.abspath(__file__))
+        _jax_root = os.path.dirname(_util_dir)
+        for _p in (_util_dir, _jax_root):
+            if _p not in _sys.path:
+                _sys.path.insert(0, _p)
+        from grid_generator import generate_grid as _gen_grid
+        from reproduce_grid_score import (
+            parse_reduced_pdb as _parse_pdb,
+            write_grid_npz as _write_npz,
+        )
+        import importlib as _importlib
+
+        _ff_params_mod = _importlib.import_module(
+            f"native.nb_kernel.forcefields.{args.forcefield}.params"
+        )
+        _ff_params = _ff_params_mod.load_params(args.attract_par_npz)
+        _ffelec = _math.sqrt(332.053986 / args.epsilon)
+
+        rec_inputs = resolve_receptor_inputs(args, args.test_dir or ".")
+        _rc = rec_inputs["receptor_ensemble"]
+        _rt = rec_inputs["receptor_atomtypes"]
+        _rq = rec_inputs["receptor_charges"]
+        _rec_pdb = None
+        if _rc is None:
+            ens_list_path = rec_inputs["receptor_ens_list"]
+            _ens_lines = [
+                l.strip() for l in open(ens_list_path).read().splitlines() if l.strip()
+            ]
+            _rec_pdb = _ens_lines[0]
+            if not os.path.isabs(_rec_pdb):
+                _rec_pdb = os.path.join(os.path.dirname(ens_list_path), _rec_pdb)
+            _rc, _rt, _rq, _ = _parse_pdb(_rec_pdb)
+        if _rc.ndim == 3:
+            _rc = _rc[0]
+
+        _rec_label = (
+            _rec_pdb
+            if _rec_pdb is not None
+            else (rec_inputs["receptor_ens_list"] or "receptor")
+        )
+        # Alphabet: use --lig-atomtypes if given, else restrict to receptor types
+        if args.lig_atomtypes is not None:
+            _lig_atomtypes_early = np.array(
+                [int(x.strip()) for x in args.lig_atomtypes.split(",")], dtype=np.int32
+            )
+        else:
+            _lig_atomtypes_early = _rt  # receptor-only alphabet (no universal grid)
+        if verbose:
+            print(f"Generating grid in-house from {_rec_label} (all atomtypes) ...")
+        grid_object = _gen_grid(
+            rec_coords=_rc,
+            rec_atomtypes=_rt,
+            rec_charges_raw=_rq,
+            ff_params=_ff_params,
+            forcefield=args.forcefield,
+            ffelec=_ffelec,
+            lig_atomtypes=_lig_atomtypes_early,
+            force_jax=(args.nb_kernel == "jax"),
+            return_gradients=not args.autodiff_potentials,
+        )
+        _write_npz(grid_object, args.grid)
+        if verbose:
+            print(f"Grid written to {args.grid}")
+        return
+
     if args.disable_jit and args.oracle == "jax":
         import jax
 
@@ -1581,11 +1687,11 @@ def main():
         test_dir = args.test_dir or str(Path(args.input_npy).resolve().parent)
         dofs0 = np.load(args.input_npy).astype(np.float64)
         if dofs0.ndim != 2 or dofs0.shape[1] != 6:
-            raise ValueError(
-                f"Nx6 input must have shape (N,6), got {dofs0.shape}"
-            )
+            raise ValueError(f"Nx6 input must have shape (N,6), got {dofs0.shape}")
         if args.input_conformers:
-            ligand_conformers_rotvec = np.load(args.input_conformers).astype(np.int32).reshape(-1)
+            ligand_conformers_rotvec = (
+                np.load(args.input_conformers).astype(np.int32).reshape(-1)
+            )
         else:
             ligand_conformers_rotvec = None
         if args.input_ens:
@@ -1633,8 +1739,8 @@ def main():
         test_dir = args.test_dir or str(Path(args.input_dat).resolve().parent)
         # Read poses (max_poses includes offset, so read offset + max_poses total)
         total_read = (args.pose_offset + args.max_poses) if args.max_poses else 0
-        header, pivots, ens, dofs0, _, centered_ligands, ligand_ens_dat = parse_dat_two_body(
-            args.input_dat, max_poses=total_read
+        header, pivots, ens, dofs0, _, centered_ligands, ligand_ens_dat = (
+            parse_dat_two_body(args.input_dat, max_poses=total_read)
         )
         # Apply offset
         if args.pose_offset > 0:
@@ -1648,7 +1754,9 @@ def main():
                 f"Poses: {n} (offset={args.pose_offset}), "
                 f"maxfun: {args.maxfun}, oracle: {args.oracle}"
             )
-            print(f"Ensemble ids: {np.unique(ens)}, centered_ligands: {centered_ligands}")
+            print(
+                f"Ensemble ids: {np.unique(ens)}, centered_ligands: {centered_ligands}"
+            )
 
     ligand_inputs = resolve_ligand_inputs(args, test_dir, n)
     ligand_pdb_path = ligand_inputs["ligand_pdb_path"]
@@ -1730,9 +1838,12 @@ def main():
                     _sys.path.insert(0, _p)
             from grid_generator import generate_grid as _gen_grid
             from reproduce_grid_score import parse_reduced_pdb as _parse_pdb
-            from native.nb_kernel.forcefields.nonbon8.params import (
-                load_params as _load_params,
+            import importlib as _importlib
+
+            _ff_params_mod = _importlib.import_module(
+                f"native.nb_kernel.forcefields.{args.forcefield}.params"
             )
+            _load_params = _ff_params_mod.load_params
 
             # Load receptor coordinates and atom types via the generic path
             _rc = receptor_inputs["receptor_ensemble"]
@@ -1752,7 +1863,16 @@ def main():
             _ffelec = _math.sqrt(332.053986 / args.epsilon)
             # Ligand alphabet: prefer explicit ligand metadata when available.
             _lig_atomtypes = ligand_inputs["ligand_atomtypes_for_grid"]
-            if _lig_atomtypes is None and ligand_pdb_path and os.path.isfile(ligand_pdb_path):
+            if _lig_atomtypes is None and args.lig_atomtypes is not None:
+                _lig_atomtypes = np.array(
+                    [int(x.strip()) for x in args.lig_atomtypes.split(",")],
+                    dtype=np.int32,
+                )
+            if (
+                _lig_atomtypes is None
+                and ligand_pdb_path
+                and os.path.isfile(ligand_pdb_path)
+            ):
                 _, _lt, _, _ = _parse_pdb(ligand_pdb_path)
                 _lig_atomtypes = _lt
             _rec_label = _rec_pdb if _rec_pdb is not None else ens_list_path
@@ -1771,9 +1891,11 @@ def main():
                 rec_atomtypes=_rt,
                 rec_charges_raw=_rq,
                 ff_params=_ff_params,
-                forcefield="nonbon8",
+                forcefield=args.forcefield,
                 ffelec=_ffelec,
                 lig_atomtypes=_lig_atomtypes,
+                force_jax=(args.nb_kernel == "jax"),
+                return_gradients=not args.autodiff_potentials,
             )
             if args.generate_grid:
                 # --generate-grid: write to --grid <path> and exit.

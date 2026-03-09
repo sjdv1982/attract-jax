@@ -124,6 +124,7 @@ def _compute_potential_grid(
     nb_start: np.ndarray,  # (N,)
     nb_concat: np.ndarray,  # (total,)
     return_gradients: bool = True,
+    force_jax: bool = False,
 ) -> np.ndarray:
     """Evaluate potential (and optionally gradients) at ``corners``.
 
@@ -155,6 +156,7 @@ def _compute_potential_grid(
         plateaudis_sq=plateaudis_sq,
         plateau_mode="clamp",
         return_gradients=return_gradients,
+        force_jax=force_jax,
     )
     # Channel layout: [E, +(dE/dx), +(dE/dy), +(dE/dz)]  — gradient convention.
     # score_pairs_kernel already returns +dE/dx (the pose loop negates lj_grad's
@@ -181,6 +183,7 @@ def generate_grid(
     neighbourdis: float = 12.0,
     lig_atomtypes: Optional[np.ndarray] = None,
     return_gradients: bool = True,
+    force_jax: bool = False,
 ):
     """Generate a nonbonded potential grid from receptor coordinates.
 
@@ -211,11 +214,14 @@ def generate_grid(
         if that fails.
     return_gradients : bool
         If True (default), compute and store gradient channels 1–3 in the
-        grid (``+dE/d_i``).  When using the JAX backend this requires
-        ``lj_grad`` / ``elec_grad`` in the force-field module.
-        If False, channels 1–3 are stored as zero.  Use this when the
-        force field has no Python gradient implementation and only autodiff
-        scoring (``--autodiff-potentials``) is needed.
+        grid (``+dE/d_i``).  In the JAX backend these gradients are derived
+        from the force-field energy functions via autodiff in ``score_pairs``.
+        If False, channels 1–3 are stored as zero and scoring must use
+        ``--autodiff-potentials``.
+    force_jax : bool
+        If True, bypass the compiled-kernel auto-selection and use the pure-JAX
+        backend for all potential evaluations (equivalent to passing
+        ``force_jax=True`` to every ``score_pairs()`` call).
     ffelec : float
         Electrostatics scaling factor √(332.054 / ε).
     gridspacing : float
@@ -399,6 +405,7 @@ def generate_grid(
             nb_start=lj_ns_inner,
             nb_concat=lj_nc_inner,
             return_gradients=return_gradients,
+            force_jax=force_jax,
         )
 
     # ------------------------------------------------------------------
@@ -425,6 +432,7 @@ def generate_grid(
             nb_start=elec_ns_inner,
             nb_concat=elec_nc_inner,
             return_gradients=return_gradients,
+            force_jax=force_jax,
         )
 
     # ------------------------------------------------------------------
@@ -453,6 +461,7 @@ def generate_grid(
             nb_start=lj_ns_outer,
             nb_concat=lj_nc_outer,
             return_gradients=return_gradients,
+            force_jax=force_jax,
         )
 
     # ------------------------------------------------------------------
@@ -478,6 +487,7 @@ def generate_grid(
             nr_neigh=elec_nr_outer,
             nb_start=elec_ns_outer,
             nb_concat=elec_nc_outer,
+            force_jax=force_jax,
             return_gradients=return_gradients,
         )
 

@@ -22,21 +22,9 @@ from .lj import lj_energy
 from .elec import elec_energy
 from .params import load_params, FFParams
 
-try:
-    from .lj_grad import lj_grad
-except ImportError:
-    lj_grad = None  # type: ignore[assignment]
-
-try:
-    from .elec_grad import elec_grad
-except ImportError:
-    elec_grad = None  # type: ignore[assignment]
-
 __all__ = [
     "lj_energy",
     "elec_energy",
-    "lj_grad",
-    "elec_grad",
     "load_params",
     "FFParams",
 ]
