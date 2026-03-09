@@ -1734,13 +1734,20 @@ def main():
                 load_params as _load_params,
             )
 
-            # Load first receptor ensemble member
-            _ens_lines = open(ens_list_path).read().splitlines()
-            _ens_lines = [l.strip() for l in _ens_lines if l.strip()]
-            _rec_pdb = _ens_lines[0]
-            if not os.path.isabs(_rec_pdb):
-                _rec_pdb = os.path.join(os.path.dirname(ens_list_path), _rec_pdb)
-            _rc, _rt, _rq, _ = _parse_pdb(_rec_pdb)
+            # Load receptor coordinates and atom types via the generic path
+            _rc = receptor_inputs["receptor_ensemble"]
+            _rt = receptor_inputs["receptor_atomtypes"]
+            _rq = receptor_inputs["receptor_charges"]
+            _rec_pdb = None
+            if _rc is None:
+                _ens_lines = open(ens_list_path).read().splitlines()
+                _ens_lines = [l.strip() for l in _ens_lines if l.strip()]
+                _rec_pdb = _ens_lines[0]
+                if not os.path.isabs(_rec_pdb):
+                    _rec_pdb = os.path.join(os.path.dirname(ens_list_path), _rec_pdb)
+                _rc, _rt, _rq, _ = _parse_pdb(_rec_pdb)
+            if _rc.ndim == 3:
+                _rc = _rc[0]
             _ff_params = _load_params(par_npz)
             _ffelec = _math.sqrt(332.053986 / args.epsilon)
             # Ligand alphabet: prefer explicit ligand metadata when available.
@@ -1748,15 +1755,16 @@ def main():
             if _lig_atomtypes is None and ligand_pdb_path and os.path.isfile(ligand_pdb_path):
                 _, _lt, _, _ = _parse_pdb(ligand_pdb_path)
                 _lig_atomtypes = _lt
+            _rec_label = _rec_pdb if _rec_pdb is not None else ens_list_path
             if verbose:
                 if _lig_atomtypes is not None:
                     print(
-                        f"Generating grid in-house from {_rec_pdb} "
+                        f"Generating grid in-house from {_rec_label} "
                         "(ligand alphabet restricted to ligand metadata) ..."
                     )
                 else:
                     print(
-                        f"Generating grid in-house from {_rec_pdb} (all atomtypes) ..."
+                        f"Generating grid in-house from {_rec_label} (all atomtypes) ..."
                     )
             grid_object = _gen_grid(
                 rec_coords=_rc,
