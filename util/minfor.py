@@ -1622,7 +1622,7 @@ def main():
         import importlib as _importlib
 
         _ff_params_mod = _importlib.import_module(
-            f"native.nb_kernel.forcefields.{args.forcefield}.params"
+            f"nb_kernel.forcefields.{args.forcefield}.params"
         )
         _ff_params = _ff_params_mod.load_params(args.attract_par_npz)
         _ffelec = _math.sqrt(332.053986 / args.epsilon)
@@ -1841,7 +1841,7 @@ def main():
             import importlib as _importlib
 
             _ff_params_mod = _importlib.import_module(
-                f"native.nb_kernel.forcefields.{args.forcefield}.params"
+                f"nb_kernel.forcefields.{args.forcefield}.params"
             )
             _load_params = _ff_params_mod.load_params
 

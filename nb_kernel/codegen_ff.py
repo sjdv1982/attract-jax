@@ -23,7 +23,7 @@ Gradient wrappers are only emitted when BOTH lj_grad.h and elec_grad.h exist.
 The actual .h files in the directory always take precedence over has_lj_grad /
 has_elec_grad flags in ff.yaml.
 
-The generated .cpp is designed to be compiled from the native/nb_kernel/
+The generated .cpp is designed to be compiled from the nb_kernel/
 root directory (where this script lives), with -I. so that includes are
 resolved relative to that root.
 """
@@ -33,7 +33,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-# Directory where this script lives = native/nb_kernel/ root
+# Directory where this script lives = nb_kernel/ root
 SCRIPT_DIR = Path(__file__).parent.resolve()
 
 # ---------------------------------------------------------------------------

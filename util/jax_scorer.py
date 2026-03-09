@@ -652,7 +652,7 @@ class JaxScoreOracle:
         plateaudissq,
     ):
         repo_root = Path(__file__).resolve().parents[1]
-        kernel_root = repo_root / "native" / "nb_kernel"
+        kernel_root = repo_root / "nb_kernel"
         if not kernel_root.exists():
             raise RuntimeError(f"Missing kernel root: {kernel_root}")
 

@@ -74,7 +74,7 @@ def _load_ff_and_lib(forcefield: str):
     - Otherwise the kernel backend is required.  The compiled
       ``nb_kernel_<forcefield>.so`` is located by walking up the directory
       tree from the FF package.  If it is not found, ``make nb_kernel_<name>.so``
-      is attempted in the ``native/nb_kernel`` build directory.  If compilation
+      is attempted in the ``nb_kernel`` build directory.  If compilation
       fails, a ``RuntimeError`` is raised.
 
     Results are cached so subsequent calls for the same name are free.
@@ -92,7 +92,7 @@ def _load_ff_and_lib(forcefield: str):
     if forcefield in _ff_lib_cache:
         return _ff_lib_cache[forcefield]
 
-    kernel_root = Path(__file__).resolve().parents[1] / "native" / "nb_kernel"
+    kernel_root = Path(__file__).resolve().parents[1] / "nb_kernel"
     if str(kernel_root) not in sys.path:
         sys.path.insert(0, str(kernel_root))
 
