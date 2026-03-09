@@ -217,11 +217,11 @@ def parse_dat_two_body_loadtxt(
     receptor_has_ens = first_fields == 7
     ligand_has_ens = second_fields == 7
     receptor_ens = np.rint(rec[:, 0]).astype(np.int32) if receptor_has_ens else np.ones(len(rec), dtype=np.int32)
-    rec_dofs = rec[:, 1:] if receptor_has_ens else rec
+    rec_dofs = rec[:, 1:] if target_fields == 7 else rec
     if not np.allclose(rec_dofs, 0.0):
         raise ValueError("Receptor DOF line must contain only zeros in two-body fixed-receptor mode")
     ligand_ens = np.rint(lig[:, 0]).astype(np.int32) if ligand_has_ens else np.zeros(len(lig), dtype=np.int32)
-    dofs = lig[:, 1:] if ligand_has_ens else lig
+    dofs = lig[:, 1:] if target_fields == 7 else lig
     return (
         header,
         pivots,
