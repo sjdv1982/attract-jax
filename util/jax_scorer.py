@@ -23,6 +23,29 @@ import ctypes
 import subprocess
 import sys
 
+
+"""
+NOTE: experiments on the MBI cluster reveal the CPU "knobs" to play with
+Primarily OMP_NUM_THREADS etc, not so much intra_op_parallelism_threads
+
+
+<HEADER>
+
+#!/bin/bash
+threads1=1
+threads2=8   # best value on mbi-cluster was the number of physical cores, but hypercores is ok
+
+XLA_FLAGS="--xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=$threads1" \
+OMP_NUM_THREADS=$threads2 \
+OPENBLAS_NUM_THREADS=$threads2 \
+MKL_NUM_THREADS=$threads2 \
+VECLIB_MAXIMUM_THREADS=$threads2 \
+NUMEXPR_NUM_THREADS=$threads2 \
+
+/<HEADER>
+
+<COMMENTED OUT CODE>
+
 # Keep host memory bounded on CPU — set before importing jax.
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
@@ -36,6 +59,9 @@ if "--xla_cpu_multi_thread_eigen=false" in _xla_flags:
     if "--xla_cpu_multi_thread_eigen" not in _xla_flags:
         _xla_flags += " --xla_cpu_multi_thread_eigen=true"
     os.environ["XLA_FLAGS"] = _xla_flags.strip()
+
+</COMMENTED OUT CODE>
+"""
 
 import math
 import time
