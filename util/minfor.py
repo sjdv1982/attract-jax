@@ -1230,6 +1230,16 @@ def parse_args():
         help="with --score: print energy-only legacy-style blocks (omit Gradients lines)",
     )
     ap.add_argument(
+        "--output-npy",
+        default=None,
+        metavar="FILE",
+        help=(
+            "with --score: write NumPy output instead of legacy text. "
+            "Saves float32 energies (N,) when --energy-only, else float32 "
+            "array (N,7) with [energy, grad0..grad5]."
+        ),
+    )
+    ap.add_argument(
         "--benchmark-steady-state",
         action="store_true",
         help=(
@@ -1495,6 +1505,8 @@ def parse_args():
             ap.error("--score-batch-size must be >= 1")
     if args.energy_only and not args.score:
         ap.error("--energy-only is only valid together with --score")
+    if args.output_npy and not args.score:
+        ap.error("--output-npy is only valid together with --score")
     if args.benchmark_steady_state and not args.score:
         ap.error("--benchmark-steady-state is only valid together with --score")
     if args.benchmark_steady_state and args.oracle != "jax":
@@ -2006,11 +2018,25 @@ def main():
                 ens, dofs0, conformers=ligand_conformers
             )
         if args.score:
-            print_legacy_score(
-                start_e,
-                start_g,
-                include_gradients=(not bool(args.energy_only)),
-            )
+            if args.output_npy:
+                e32 = np.asarray(start_e, dtype=np.float32).reshape(-1)
+                if args.energy_only:
+                    out = e32
+                else:
+                    g = np.asarray(start_g, dtype=np.float32)
+                    if g.ndim != 2 or g.shape[0] != e32.shape[0] or g.shape[1] != 6:
+                        raise ValueError(
+                            "Expected gradients with shape (N,6) in score mode, got "
+                            f"{g.shape}"
+                        )
+                    out = np.concatenate((e32[:, None], g), axis=1)
+                np.save(args.output_npy, out)
+            else:
+                print_legacy_score(
+                    start_e,
+                    start_g,
+                    include_gradients=(not bool(args.energy_only)),
+                )
             return
         print(
             f"  Starting energies: min={start_e.min():.3f} mean={start_e.mean():.3f} "
