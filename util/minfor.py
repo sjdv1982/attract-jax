@@ -918,6 +918,40 @@ def _load_required_vector(path: str, expected_len: int, name: str, dtype) -> np.
     return arr
 
 
+def _load_ligand_atomtypes_file(
+    path: str,
+    *,
+    name: str = "--ligand-atomtypes",
+    expected_len: Optional[int] = None,
+) -> np.ndarray:
+    p = str(path)
+    if p.lower().endswith(".npy"):
+        raw = np.load(p)
+        arr = np.asarray(raw)
+        if arr.ndim != 1:
+            raise ValueError(f"{name}: expected shape (N,), got {arr.shape} from {p}")
+        if not np.issubdtype(arr.dtype, np.integer):
+            raise ValueError(f"{name}: .npy input must use an integer dtype, got {arr.dtype}")
+        vals = arr.astype(np.int64, copy=False)
+    else:
+        vals = np.asarray(np.loadtxt(p, dtype=np.int64, ndmin=1))
+        if vals.ndim != 1:
+            raise ValueError(f"{name}: expected one integer per line in {p}")
+
+    vals = vals.reshape(-1)
+    if vals.size == 0:
+        raise ValueError(f"{name}: expected at least one atom type in {p}")
+    if expected_len is not None and vals.size != expected_len:
+        raise ValueError(
+            f"{name}: expected shape ({expected_len},), got {vals.shape} from {p}"
+        )
+    if np.any(vals <= 0):
+        raise ValueError(f"{name}: atom types must be positive integers")
+    if np.any((vals < 1) | (vals > 98)):
+        raise ValueError(f"{name}: atom types must be in [1, 98]")
+    return vals.astype(np.uint16, copy=False)
+
+
 def _load_ligand_conformers(
     path: Optional[str], nposes: int, nconformers: int
 ) -> Optional[np.ndarray]:
@@ -1002,8 +1036,10 @@ def resolve_ligand_inputs(args, test_dir: str, nposes: int):
             np.load(args.ligand_ensemble), "--ligand-ensemble"
         )
         natoms = lig_coords.shape[1]
-        lig_atomtypes = _load_required_vector(
-            args.ligand_atomtypes, natoms, "--ligand-atomtypes", np.int32
+        lig_atomtypes = _load_ligand_atomtypes_file(
+            args.ligand_atomtypes,
+            name="--ligand-atomtypes",
+            expected_len=natoms,
         )
         if args.ligand_charges:
             lig_charges = _load_required_vector(
@@ -1296,18 +1332,6 @@ def parse_args():
             "generated just-in-time and used directly (not saved)."
         ),
     )
-    ap.add_argument(
-        "--lig-atomtypes",
-        default=None,
-        metavar="INT[,INT,...]",
-        help=(
-            "Comma-separated ATTRACT atom type indices used to restrict the grid "
-            "VDW alphabet (e.g. '1' or '1,5,30').  Only relevant with "
-            "--generate-grid and when no ligand PDB/ensemble is provided.  "
-            "When omitted the alphabet defaults to all atom types present in "
-            "the receptor."
-        ),
-    )
     ap.add_argument("--attract-par-npz", default=None, help="path to attract-par.npz")
     ap.add_argument(
         "--receptor-ens-list", default=None, help="path to receptor ensemble list"
@@ -1356,7 +1380,11 @@ def parse_args():
     ap.add_argument(
         "--ligand-atomtypes",
         default=None,
-        help="required with --ligand-ensemble: per-atom ATTRACT types (.npy, shape (N,))",
+        help=(
+            "path to ligand atom types: .npy (integer vector) or text (one positive int/line). "
+            "Required with --ligand-ensemble; with --generate-grid can also be used as "
+            "a grid VDW alphabet hint."
+        ),
     )
     ap.add_argument(
         "--ligand-charges",
@@ -1547,7 +1575,7 @@ def parse_args():
         )
     if args.ligand_ensemble and not args.ligand_atomtypes:
         ap.error("--ligand-ensemble requires --ligand-atomtypes")
-    if args.ligand_atomtypes and not args.ligand_ensemble:
+    if args.ligand_atomtypes and not args.ligand_ensemble and not args.generate_grid:
         ap.error("--ligand-atomtypes is only valid with --ligand-ensemble")
     if args.ligand_charges and not args.ligand_ensemble:
         ap.error("--ligand-charges is only valid with --ligand-ensemble")
@@ -1661,15 +1689,21 @@ def main():
             if _rec_pdb is not None
             else (rec_inputs["receptor_ens_list"] or "receptor")
         )
-        # Alphabet: use --lig-atomtypes if given, else restrict to receptor types
-        if args.lig_atomtypes is not None:
-            _lig_atomtypes_early = np.array(
-                [int(x.strip()) for x in args.lig_atomtypes.split(",")], dtype=np.int32
+        # In --generate-grid mode, --ligand-atomtypes acts as a grid-alphabet hint.
+        if args.ligand_atomtypes is not None:
+            _lig_atomtypes_early = _load_ligand_atomtypes_file(
+                args.ligand_atomtypes, name="--ligand-atomtypes"
             )
         else:
             _lig_atomtypes_early = _rt  # receptor-only alphabet (no universal grid)
         if verbose:
-            print(f"Generating grid in-house from {_rec_label} (all atomtypes) ...")
+            if args.ligand_atomtypes is not None:
+                print(
+                    f"Generating grid in-house from {_rec_label} "
+                    "(ligand alphabet restricted to --ligand-atomtypes) ..."
+                )
+            else:
+                print(f"Generating grid in-house from {_rec_label} (all atomtypes) ...")
         grid_object = _gen_grid(
             rec_coords=_rc,
             rec_atomtypes=_rt,
@@ -1697,21 +1731,36 @@ def main():
     _dof_type = "euler"
     if args.input_npy:
         test_dir = args.test_dir or str(Path(args.input_npy).resolve().parent)
-        dofs0 = np.load(args.input_npy).astype(np.float64)
-        if dofs0.ndim != 2 or dofs0.shape[1] != 6:
-            raise ValueError(f"Nx6 input must have shape (N,6), got {dofs0.shape}")
+        dofs_all = np.load(args.input_npy, mmap_mode="r")
+        if dofs_all.ndim != 2 or dofs_all.shape[1] != 6:
+            raise ValueError(f"Nx6 input must have shape (N,6), got {dofs_all.shape}")
+        total_poses = int(dofs_all.shape[0])
+        start = min(max(int(args.pose_offset), 0), total_poses)
+        stop = total_poses
+        if args.max_poses:
+            stop = min(total_poses, start + int(args.max_poses))
+        dofs0 = np.asarray(dofs_all[start:stop], dtype=np.float64)
         if args.input_conformers:
-            ligand_conformers_rotvec = (
-                np.load(args.input_conformers).astype(np.int32).reshape(-1)
+            ligand_conformers_all = np.load(args.input_conformers, mmap_mode="r")
+            ligand_conformers_all = np.reshape(ligand_conformers_all, (-1,))
+            if len(ligand_conformers_all) != total_poses:
+                raise ValueError(
+                    "--input-conformers length mismatch: "
+                    f"expected {total_poses}, got {len(ligand_conformers_all)}"
+                )
+            ligand_conformers_rotvec = np.asarray(
+                ligand_conformers_all[start:stop], dtype=np.int32
             )
         else:
             ligand_conformers_rotvec = None
         if args.input_ens:
-            ens = np.load(args.input_ens).astype(np.int64).reshape(-1)
-            if len(ens) != len(dofs0):
+            ens_all = np.load(args.input_ens, mmap_mode="r")
+            ens_all = np.reshape(ens_all, (-1,))
+            if len(ens_all) != total_poses:
                 raise ValueError(
-                    f"--input-ens length mismatch: expected {len(dofs0)}, got {len(ens)}"
+                    f"--input-ens length mismatch: expected {total_poses}, got {len(ens_all)}"
                 )
+            ens = np.asarray(ens_all[start:stop], dtype=np.int64)
             if ens.size:
                 if ens.min() >= 1:
                     ens = ens.astype(np.int32)
@@ -1723,16 +1772,6 @@ def main():
                 ens = ens.astype(np.int32)
         else:
             ens = np.ones(len(dofs0), dtype=np.int32)
-        if args.pose_offset > 0:
-            dofs0 = dofs0[args.pose_offset :]
-            if ligand_conformers_rotvec is not None:
-                ligand_conformers_rotvec = ligand_conformers_rotvec[args.pose_offset :]
-            ens = ens[args.pose_offset :]
-        if args.max_poses:
-            dofs0 = dofs0[: args.max_poses]
-            if ligand_conformers_rotvec is not None:
-                ligand_conformers_rotvec = ligand_conformers_rotvec[: args.max_poses]
-            ens = ens[: args.max_poses]
         n = len(dofs0)
         if ligand_conformers_rotvec is not None and len(ligand_conformers_rotvec) != n:
             raise ValueError(
@@ -1875,10 +1914,9 @@ def main():
             _ffelec = _math.sqrt(332.053986 / args.epsilon)
             # Ligand alphabet: prefer explicit ligand metadata when available.
             _lig_atomtypes = ligand_inputs["ligand_atomtypes_for_grid"]
-            if _lig_atomtypes is None and args.lig_atomtypes is not None:
-                _lig_atomtypes = np.array(
-                    [int(x.strip()) for x in args.lig_atomtypes.split(",")],
-                    dtype=np.int32,
+            if args.generate_grid and args.ligand_atomtypes is not None:
+                _lig_atomtypes = _load_ligand_atomtypes_file(
+                    args.ligand_atomtypes, name="--ligand-atomtypes"
                 )
             if (
                 _lig_atomtypes is None
@@ -2014,9 +2052,46 @@ def main():
                 file=sys.stderr,
             )
         else:
-            start_e, start_g = oracle.score_batch(
-                ens, dofs0, conformers=ligand_conformers
-            )
+            progress_base = args.score_batch_size or 8192
+            progress_chunk = max(int(progress_base), max(1, (n + 19) // 20))
+            if args.score and n > progress_chunk:
+                print(
+                    f"Scoring {n} poses in {((n + progress_chunk - 1) // progress_chunk)} chunks "
+                    f"(chunk_size={progress_chunk})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                start_e = np.empty(n, dtype=np.float64)
+                start_g = (
+                    np.empty((0, 6), dtype=np.float64)
+                    if args.energy_only
+                    else np.empty((n, 6), dtype=np.float64)
+                )
+                score_t0 = time.perf_counter()
+                for chunk_start in range(0, n, progress_chunk):
+                    chunk_stop = min(n, chunk_start + progress_chunk)
+                    chunk_conformers = None
+                    if ligand_conformers is not None:
+                        chunk_conformers = ligand_conformers[chunk_start:chunk_stop]
+                    chunk_e, chunk_g = oracle.score_batch(
+                        ens[chunk_start:chunk_stop],
+                        dofs0[chunk_start:chunk_stop],
+                        conformers=chunk_conformers,
+                    )
+                    start_e[chunk_start:chunk_stop] = chunk_e
+                    if not args.energy_only:
+                        start_g[chunk_start:chunk_stop] = chunk_g
+                    elapsed = time.perf_counter() - score_t0
+                    print(
+                        f"Score progress: {chunk_stop}/{n} poses "
+                        f"({chunk_stop / n:.1%}) elapsed={elapsed:.1f}s",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            else:
+                start_e, start_g = oracle.score_batch(
+                    ens, dofs0, conformers=ligand_conformers
+                )
         if args.score:
             if args.output_npy:
                 e32 = np.asarray(start_e, dtype=np.float32).reshape(-1)

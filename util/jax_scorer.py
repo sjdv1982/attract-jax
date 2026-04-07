@@ -651,6 +651,12 @@ class JaxScoreOracle:
             self.score_batch_size if self._score_mode == "bulk" else self.energy_batch
         )
 
+    def _iter_score_chunks(self, ens: np.ndarray, dofs: np.ndarray):
+        chunk = self._score_chunk_size()
+        for start in range(0, len(dofs), chunk):
+            end = min(start + chunk, len(dofs))
+            yield slice(start, end), ens[start:end], dofs[start:end]
+
     def _pad_batch_size(self, batch_len: int) -> int:
         if self._nb_kernel == "compiled":
             return batch_len
@@ -1137,7 +1143,11 @@ class JaxScoreOracle:
     def _score_batch_grouped(self, ens, dofs, conformers, compute_grad: bool):
         n = len(dofs)
         energies = np.zeros(n, dtype=np.float64)
-        gradients = np.zeros((n, 6), dtype=np.float64)
+        gradients = (
+            np.zeros((n, 6), dtype=np.float64)
+            if compute_grad
+            else np.empty((0, 6), dtype=np.float64)
+        )
 
         chunk = self._score_chunk_size()
         for ens0, conformer0, idx in self._iter_group_slices(ens, conformers):
@@ -1182,7 +1192,7 @@ class JaxScoreOracle:
     def _score_batch_pooled_conformers(self, ens, dofs, conformers):
         n = len(dofs)
         energies = np.zeros(n, dtype=np.float64)
-        gradients = np.zeros((n, 6), dtype=np.float64)
+        gradients = np.empty((0, 6), dtype=np.float64)
         chunk = self._score_chunk_size()
         for ens_id in np.unique(ens):
             ens0 = int(ens_id) - 1
@@ -1222,19 +1232,33 @@ class JaxScoreOracle:
 
         if self._energy_only:
             if self._nb_kernel == "compiled":
-                e_pot = self.score_potential_energy_batch(ens, dofs)
-                e_nb, _ = self._score_nb_nonbon8_batch(ens, dofs, compute_grad=False)
-                gradients = np.zeros((len(dofs), 6), dtype=np.float64)
-                return e_pot + e_nb, gradients
+                energies = np.zeros((len(dofs),), dtype=np.float64)
+                gradients = np.empty((0, 6), dtype=np.float64)
+                for chunk_slice, ens_chunk, dofs_chunk in self._iter_score_chunks(
+                    ens, dofs
+                ):
+                    e_pot = self.score_potential_energy_batch(ens_chunk, dofs_chunk)
+                    e_nb, _ = self._score_nb_nonbon8_batch(
+                        ens_chunk, dofs_chunk, compute_grad=False
+                    )
+                    energies[chunk_slice] = e_pot + e_nb
+                return energies, gradients
 
             energies = self._energy_batch_raw(np.asarray(ens), np.asarray(dofs))
-            gradients = np.zeros((len(dofs), 6), dtype=np.float64)
+            gradients = np.empty((0, 6), dtype=np.float64)
             return energies, gradients
 
         if self._nb_kernel == "compiled":
-            e_pot, g_pot = self.score_potential_batch(ens, dofs)
-            e_nb, g_nb = self._score_nb_nonbon8_batch(ens, dofs)
-            return e_pot + e_nb, g_pot + g_nb
+            energies = np.zeros((len(dofs),), dtype=np.float64)
+            gradients = np.zeros((len(dofs), 6), dtype=np.float64)
+            for chunk_slice, ens_chunk, dofs_chunk in self._iter_score_chunks(
+                ens, dofs
+            ):
+                e_pot, g_pot = self.score_potential_batch(ens_chunk, dofs_chunk)
+                e_nb, g_nb = self._score_nb_nonbon8_batch(ens_chunk, dofs_chunk)
+                energies[chunk_slice] = e_pot + e_nb
+                gradients[chunk_slice] = g_pot + g_nb
+            return energies, gradients
 
         # Pure-JAX path (potential + NB in a single AD-evaluated kernel).
         n = len(dofs)
