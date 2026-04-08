@@ -847,15 +847,39 @@ def rotvec_dofs_to_mats_np(dofs, pivot):
     return mats
 
 
-def rotvec_world_to_attr_np(dofs, pivot):
+def rotvec_world_to_attr_np(dofs, pivot, chunk_size=250000, copy=True):
     """Convert world-centered rotvec DOFs to ATTRACT pivot-centered DOFs.
 
     `pivot` is the single fixed ligand pivot used by ATTRACT semantics.
     For ligand ensembles, this is the pivot of conformer 1 / index 0.
     """
-    out = np.asarray(dofs, dtype=np.float64).copy()
-    rot_col = rotvec2rotmat_np(out[:, :3])
-    out[:, 3:6] += np.einsum("bij,j->bi", rot_col, pivot) - pivot[None, :]
+    out = np.asarray(dofs, dtype=np.float64)
+    if copy or not out.flags.writeable:
+        out = out.copy()
+    if chunk_size is None or chunk_size <= 0:
+        chunk_size = len(out) or 1
+    for start in range(0, len(out), chunk_size):
+        stop = min(len(out), start + chunk_size)
+        rot_col = rotvec2rotmat_np(out[start:stop, :3])
+        out[start:stop, 3:6] += (
+            np.einsum("bij,j->bi", rot_col, pivot) - pivot[None, :]
+        )
+    return out
+
+
+def rotvec_world_to_attr_memmap(dofs, pivot, scratch_path, chunk_size=250000):
+    """Stream world-centered rotvec DOFs into a float64 temp .npy memmap."""
+    src = np.asarray(dofs)
+    out = np.lib.format.open_memmap(
+        scratch_path, mode="w+", dtype=np.float64, shape=src.shape
+    )
+    for start in range(0, len(src), chunk_size):
+        stop = min(len(src), start + chunk_size)
+        chunk = np.array(src[start:stop], dtype=np.float64, copy=True)
+        rot_col = rotvec2rotmat_np(chunk[:, :3])
+        chunk[:, 3:6] += np.einsum("bij,j->bi", rot_col, pivot) - pivot[None, :]
+        out[start:stop] = chunk
+    out.flush()
     return out
 
 
@@ -1640,6 +1664,7 @@ def main():
     if not args.score and not args.out_prefix and not args.generate_grid:
         raise ValueError("--out-prefix is required unless --score is used")
     ligand_ens_dat = None
+    input_tmpdir_ctx = None
 
     # ------------------------------------------------------------------
     # Early-exit path: --generate-grid without any input poses.
@@ -1739,7 +1764,11 @@ def main():
         stop = total_poses
         if args.max_poses:
             stop = min(total_poses, start + int(args.max_poses))
-        dofs0 = np.asarray(dofs_all[start:stop], dtype=np.float64)
+        dofs_view = dofs_all[start:stop]
+        if args.score:
+            dofs0 = dofs_view
+        else:
+            dofs0 = np.asarray(dofs_view, dtype=np.float64)
         if args.input_conformers:
             ligand_conformers_all = np.load(args.input_conformers, mmap_mode="r")
             ligand_conformers_all = np.reshape(ligand_conformers_all, (-1,))
@@ -1748,9 +1777,13 @@ def main():
                     "--input-conformers length mismatch: "
                     f"expected {total_poses}, got {len(ligand_conformers_all)}"
                 )
-            ligand_conformers_rotvec = np.asarray(
-                ligand_conformers_all[start:stop], dtype=np.int32
-            )
+            ligand_conformer_view = ligand_conformers_all[start:stop]
+            if args.score and ligand_conformer_view.dtype == np.int32:
+                ligand_conformers_rotvec = ligand_conformer_view
+            else:
+                ligand_conformers_rotvec = np.asarray(
+                    ligand_conformer_view, dtype=np.int32
+                )
         else:
             ligand_conformers_rotvec = None
         if args.input_ens:
@@ -1846,7 +1879,12 @@ def main():
 
     # --- Convert world-frame translations → ATTRACT DOFs (rotvec path) ---
     if _dof_type == "rotvec" and args.input_world_centered:
-        dofs0 = rotvec_world_to_attr_np(dofs0, lig_pivot)
+        if args.score and args.input_npy and len(dofs0) >= 1_000_000:
+            input_tmpdir_ctx = tempfile.TemporaryDirectory(prefix="minfor_input_")
+            scratch_path = os.path.join(input_tmpdir_ctx.name, "dofs0-attr.npy")
+            dofs0 = rotvec_world_to_attr_memmap(dofs0, lig_pivot, scratch_path)
+        else:
+            dofs0 = rotvec_world_to_attr_np(dofs0, lig_pivot, copy=False)
         if verbose:
             print(
                 "Converted world-frame rotvec translations to ATTRACT DOFs using the ligand pivot"
@@ -2052,24 +2090,38 @@ def main():
                 file=sys.stderr,
             )
         else:
-            progress_base = args.score_batch_size or 8192
-            progress_chunk = max(int(progress_base), max(1, (n + 19) // 20))
-            if args.score and n > progress_chunk:
+            score_chunk = int(args.score_batch_size or 8192)
+            report_every = max(score_chunk, max(1, (n + 19) // 20))
+            if args.score and n > score_chunk:
+                n_chunks = (n + score_chunk - 1) // score_chunk
                 print(
-                    f"Scoring {n} poses in {((n + progress_chunk - 1) // progress_chunk)} chunks "
-                    f"(chunk_size={progress_chunk})",
+                    f"Scoring {n} poses in {n_chunks} chunks "
+                    f"(chunk_size={score_chunk}, report_every={report_every})",
                     file=sys.stderr,
                     flush=True,
                 )
-                start_e = np.empty(n, dtype=np.float64)
-                start_g = (
-                    np.empty((0, 6), dtype=np.float64)
-                    if args.energy_only
-                    else np.empty((n, 6), dtype=np.float64)
-                )
+                stream_energy_output = bool(args.output_npy and args.energy_only)
+                if stream_energy_output:
+                    energy_out = np.lib.format.open_memmap(
+                        args.output_npy,
+                        mode="w+",
+                        dtype=np.float32,
+                        shape=(n,),
+                    )
+                    start_e = None
+                    start_g = np.empty((0, 6), dtype=np.float64)
+                else:
+                    start_e = np.empty(n, dtype=np.float64)
+                    start_g = (
+                        np.empty((0, 6), dtype=np.float64)
+                        if args.energy_only
+                        else np.empty((n, 6), dtype=np.float64)
+                    )
+                next_report = report_every
+                report_count = 0
                 score_t0 = time.perf_counter()
-                for chunk_start in range(0, n, progress_chunk):
-                    chunk_stop = min(n, chunk_start + progress_chunk)
+                for chunk_start in range(0, n, score_chunk):
+                    chunk_stop = min(n, chunk_start + score_chunk)
                     chunk_conformers = None
                     if ligand_conformers is not None:
                         chunk_conformers = ligand_conformers[chunk_start:chunk_stop]
@@ -2078,16 +2130,30 @@ def main():
                         dofs0[chunk_start:chunk_stop],
                         conformers=chunk_conformers,
                     )
-                    start_e[chunk_start:chunk_stop] = chunk_e
-                    if not args.energy_only:
-                        start_g[chunk_start:chunk_stop] = chunk_g
-                    elapsed = time.perf_counter() - score_t0
-                    print(
-                        f"Score progress: {chunk_stop}/{n} poses "
-                        f"({chunk_stop / n:.1%}) elapsed={elapsed:.1f}s",
-                        file=sys.stderr,
-                        flush=True,
-                    )
+                    if stream_energy_output:
+                        energy_out[chunk_start:chunk_stop] = np.asarray(
+                            chunk_e, dtype=np.float32
+                        )
+                    else:
+                        start_e[chunk_start:chunk_stop] = chunk_e
+                        if not args.energy_only:
+                            start_g[chunk_start:chunk_stop] = chunk_g
+                    if chunk_stop >= next_report or chunk_stop == n:
+                        elapsed = time.perf_counter() - score_t0
+                        print(
+                            f"Score progress: {chunk_stop}/{n} poses "
+                            f"({chunk_stop / n:.1%}) elapsed={elapsed:.1f}s",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        report_count += 1
+                        next_report = max(
+                            next_report + report_every,
+                            ((report_count + 1) * report_every),
+                        )
+                if stream_energy_output:
+                    energy_out.flush()
+                    return
             else:
                 start_e, start_g = oracle.score_batch(
                     ens, dofs0, conformers=ligand_conformers
@@ -2138,6 +2204,8 @@ def main():
 
         t2 = time.time()
     finally:
+        if input_tmpdir_ctx is not None:
+            input_tmpdir_ctx.cleanup()
         if receptor_ens_list_ctx is not None:
             receptor_ens_list_ctx.cleanup()
         if tmpdir_ctx is not None:
