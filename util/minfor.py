@@ -1489,6 +1489,37 @@ def parse_args():
         ),
     )
     ap.add_argument(
+        "--no-nb-grid-eval",
+        action="store_true",
+        default=False,
+        help=(
+            "[INSTRUMENTATION] Skip the compiled neighbour-grid correction (e_nb) "
+            "and score using only the JAX potential-grid energy (e_pot). "
+            "Produces incorrect energies — for throughput benchmarking only."
+        ),
+    )
+    ap.add_argument(
+        "--no-pot-grid-eval",
+        action="store_true",
+        default=False,
+        help=(
+            "[INSTRUMENTATION] Skip the JAX potential-grid energy (e_pot) "
+            "and score using only the compiled neighbour-grid correction (e_nb). "
+            "Produces incorrect energies — for throughput benchmarking only."
+        ),
+    )
+    ap.add_argument(
+        "--no-conformer-grouping",
+        action="store_true",
+        default=False,
+        help=(
+            "Disable per-conformer grouping for JAX potential-grid evaluation. "
+            "Uses a pooled kernel that handles mixed conformers in one batch call, "
+            "which is more efficient when poses have many distinct conformers. "
+            "Only affects compiled nb_kernel + energy-only scoring."
+        ),
+    )
+    ap.add_argument(
         "--disable-jit",
         action="store_true",
         help="disable JAX JIT compilation (slower per-eval but no compilation time)",
@@ -2030,6 +2061,9 @@ def main():
             energy_only=bool(args.energy_only),
             grid_object=grid_object,
             dof_type=_dof_type,
+            no_nb_grid_eval=bool(args.no_nb_grid_eval),
+            no_pot_grid_eval=bool(args.no_pot_grid_eval),
+            no_conformer_grouping=bool(args.no_conformer_grouping),
         )
         if verbose:
             print(

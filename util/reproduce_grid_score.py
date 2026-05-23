@@ -1376,8 +1376,27 @@ def build_kernel(
     else:
         main.ad = None
 
+    @jit
+    def potential_pooled(
+        dofs,
+        coor_lig_ens,
+        conformers,
+        lig_vdw_channel_idx0,
+        lig_charge_raw0,
+        grid0,
+        lig_pivot0,
+    ):
+        """Pot-grid energy for a batch with mixed conformers (no nb-grid)."""
+        mats = _dofs_to_mats(dofs, lig_pivot0)
+        all_coors_lig = transform_ligand_pooled(mats, coor_lig_ens, conformers)
+        pot_e = potential_atom_energies(
+            all_coors_lig, lig_vdw_channel_idx0, lig_charge_raw0, grid0
+        ).sum(axis=1)
+        return pot_e.sum(), pot_e
+
     main.pooled = main_pooled
     main.pot_ad = potential_ad
+    main.pot_pooled = potential_pooled
     return main
 
 

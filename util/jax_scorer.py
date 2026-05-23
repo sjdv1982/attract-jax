@@ -203,8 +203,14 @@ class JaxScoreOracle:
         energy_only: bool = False,
         grid_object=None,
         dof_type: str = "euler",
+        no_nb_grid_eval: bool = False,
+        no_pot_grid_eval: bool = False,
+        no_conformer_grouping: bool = False,
     ):
         _ = cdie  # Milestone 1: nonbon8 + rdie fixed, keep arg for compatibility.
+        self._no_nb_grid_eval = bool(no_nb_grid_eval)
+        self._no_pot_grid_eval = bool(no_pot_grid_eval)
+        self._no_conformer_grouping = bool(no_conformer_grouping)
         self._dof_type = str(dof_type)
         self.energy_batch = int(max(1, energy_batch))
         self._score_mode = str(score_mode)
@@ -510,6 +516,7 @@ class JaxScoreOracle:
         kernel_ad = kernel_main.ad
         kernel_pot_ad = kernel_main.pot_ad
         self._kernel_pot_ad = kernel_pot_ad
+        self._kernel_pot_pooled = getattr(kernel_main, "pot_pooled", None)
         if kernel_ad is not None:
 
             def _single_energy(dof_1d, rec_coor, rec_charge_scaled):
@@ -629,7 +636,7 @@ class JaxScoreOracle:
             self._pot_vg_batch_dynamic = None
             self._pot_e_batch_dynamic = None
 
-        if self._nb_kernel == "compiled":
+        if self._nb_kernel == "compiled" and not self._no_nb_grid_eval:
             self._init_nonbon8_backend(
                 grid=grid,
                 rec_coords_ens=rec_coords_ens,
@@ -1150,6 +1157,38 @@ class JaxScoreOracle:
         )
 
         chunk = self._score_chunk_size()
+
+        # Fast path: pot-grid without conformer grouping (one pooled call per chunk).
+        # Only applies to energy-only compiled-kernel scoring with pot_pooled available.
+        if (
+            self._no_conformer_grouping
+            and self._nb_kernel == "compiled"
+            and not compute_grad
+            and self._kernel_pot_pooled is not None
+        ):
+            if not self._no_pot_grid_eval:
+                for ens_id in np.unique(ens):
+                    idx = np.where(ens == ens_id)[0]
+                    for start in range(0, len(idx), chunk):
+                        sub = idx[start : start + chunk]
+                        dofs_j = jnp.array(dofs[sub], dtype=jnp.float64)
+                        conformers_j = jnp.array(conformers[sub], dtype=jnp.int32)
+                        energies[sub] = self._score_potential_energy_batch_pooled(
+                            dofs_j, conformers_j
+                        )
+            if not self._no_nb_grid_eval:
+                for ens0, conformer0, idx in self._iter_group_slices(ens, conformers):
+                    for start in range(0, len(idx), chunk):
+                        sub = idx[start : start + chunk]
+                        e_nb, _ = self._score_nb_nonbon8_batch(
+                            ens[sub],
+                            dofs[sub],
+                            compute_grad=False,
+                            ligand_conformer=conformer0,
+                        )
+                        energies[sub] += e_nb
+            return energies, gradients
+
         for ens0, conformer0, idx in self._iter_group_slices(ens, conformers):
             for start in range(0, len(idx), chunk):
                 sub = idx[start : start + chunk]
@@ -1173,15 +1212,21 @@ class JaxScoreOracle:
                         gradients[sub] = g_b
                 else:
                     if self._nb_kernel == "compiled":
-                        e_pot = self._score_potential_energy_batch_group(
-                            ens0, conformer0, dofs_j
-                        )
-                        e_nb, _ = self._score_nb_nonbon8_batch(
-                            ens[sub],
-                            dofs[sub],
-                            compute_grad=False,
-                            ligand_conformer=conformer0,
-                        )
+                        if not self._no_pot_grid_eval:
+                            e_pot = self._score_potential_energy_batch_group(
+                                ens0, conformer0, dofs_j
+                            )
+                        else:
+                            e_pot = 0.0
+                        if not self._no_nb_grid_eval:
+                            e_nb, _ = self._score_nb_nonbon8_batch(
+                                ens[sub],
+                                dofs[sub],
+                                compute_grad=False,
+                                ligand_conformer=conformer0,
+                            )
+                        else:
+                            e_nb = 0.0
                         energies[sub] = e_pot + e_nb
                     else:
                         energies[sub] = self._energy_ensemble_conformer(
@@ -1237,10 +1282,16 @@ class JaxScoreOracle:
                 for chunk_slice, ens_chunk, dofs_chunk in self._iter_score_chunks(
                     ens, dofs
                 ):
-                    e_pot = self.score_potential_energy_batch(ens_chunk, dofs_chunk)
-                    e_nb, _ = self._score_nb_nonbon8_batch(
-                        ens_chunk, dofs_chunk, compute_grad=False
-                    )
+                    if not self._no_pot_grid_eval:
+                        e_pot = self.score_potential_energy_batch(ens_chunk, dofs_chunk)
+                    else:
+                        e_pot = 0.0
+                    if not self._no_nb_grid_eval:
+                        e_nb, _ = self._score_nb_nonbon8_batch(
+                            ens_chunk, dofs_chunk, compute_grad=False
+                        )
+                    else:
+                        e_nb = 0.0
                     energies[chunk_slice] = e_pot + e_nb
                 return energies, gradients
 
@@ -1309,6 +1360,30 @@ class JaxScoreOracle:
             self._lig_charge_raw_j,
             self._lig_charge_scaled_j,
             self._ff,
+            self._grid_j,
+            self._lig_pivot_j,
+        )
+        e_b.block_until_ready()
+        self._total_kernel_time += time.monotonic() - t0
+        self._total_kernel_calls += 1
+        return np.asarray(e_b[:m])
+
+    def _score_potential_energy_batch_pooled(
+        self, dofs_j: jnp.ndarray, conformers_j: jnp.ndarray
+    ):
+        """Pot-grid energy for a mixed-conformer batch using the pooled kernel."""
+        m = int(dofs_j.shape[0])
+        pad_n = self._pad_batch_size(m)
+        if m < pad_n:
+            dofs_j = jnp.pad(dofs_j, ((0, pad_n - m), (0, 0)))
+            conformers_j = jnp.pad(conformers_j, ((0, pad_n - m),), constant_values=0)
+        t0 = time.monotonic()
+        _, e_b = self._kernel_pot_pooled(
+            dofs_j,
+            self._coor_lig_ens_stacked_j,
+            conformers_j,
+            self._lig_vdw_channel_idx_j,
+            self._lig_charge_raw_j,
             self._grid_j,
             self._lig_pivot_j,
         )
