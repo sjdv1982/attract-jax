@@ -14,7 +14,6 @@ __pycache__/*
 # Generated per-FF kernel sources (codegen_ff.py output)
 native/nb_kernel/forcefields/*/nb_kernel_*.cpp
 gmon.out
-attract-par.npz
 sxl-2stack/2stack-chunk-*
 sxl-2stack/2stack-chunk-*.lrmsd
 sxl-2stack/3sxl_dom2-r.grid

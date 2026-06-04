@@ -19,4 +19,4 @@ ac =abc*rbc**6
 # emin=-27.0*ac**4/(256.0*rc**3) # at runtime
 # rmin2=4.0*rc/(3.0*ac) # at runtime
 ivor = ipon
-np.savez("../attract-par.npz", rc=rc, ac=ac, ivor=ivor)
+np.savez("attract-par.npz", rc=rc, ac=ac, ivor=ivor)
