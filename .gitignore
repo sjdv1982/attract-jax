@@ -11,6 +11,8 @@ mono-leu/gmon.out
 __pycache__/*
 *.pyc
 *.so
+build/
+*.egg-info/
 # Generated per-FF kernel sources (codegen_ff.py output)
 native/nb_kernel/forcefields/*/nb_kernel_*.cpp
 gmon.out

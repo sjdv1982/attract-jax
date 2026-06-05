@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "attract-jax"
+version = "0.1.0"
+description = "JAX scoring and minimization utilities for ATTRACT-style force fields"
+requires-python = ">=3.10"
+dependencies = [
+    "jax",
+    "numpy>=2.0",
+    "scipy",
+    "pyyaml",
+]
+
+[tool.setuptools]
+package-dir = {"" = "nb_kernel"}
+
+[tool.setuptools.packages.find]
+where = ["nb_kernel"]
+include = ["forcefields*"]
+
+[tool.setuptools.package-data]
+"forcefields.nonbon8" = ["*.h", "*.yaml", "*.cpp"]
+
+[tool.setuptools.data-files]
+"share/attract-jax/attract-original" = ["attract-original/attract-par.npz"]
