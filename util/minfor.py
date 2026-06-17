@@ -1223,6 +1223,12 @@ def parse_args():
         help="Nx6 float64 array: rotations+translations; interpretation set by --input-format",
     )
     ap.add_argument(
+        "--identity",
+        action="store_true",
+        help="No input poses: receptor and ligand PDB have the identity matrix",
+    )
+
+    ap.add_argument(
         "--input-format",
         choices=("rotvec", "euler"),
         default=None,
@@ -1661,9 +1667,9 @@ def parse_args():
         if args.oracle != "jax":
             ap.error("--input-npy requires --oracle jax")
     else:
-        if not args.input_dat and not args.generate_grid:
+        if not args.identity and not args.input_dat and not args.generate_grid:
             ap.error(
-                "input_dat is required unless --input-npy is provided "
+                "input_dat is required unless --identity  or --input-npy is provided "
                 "(or --generate-grid for grid-only generation)"
             )
     if args.input_conformers and not args.input_npy:
@@ -1701,7 +1707,7 @@ def main():
     # Early-exit path: --generate-grid without any input poses.
     # No ligand PDB or input .dat is needed to build a potential grid.
     # ------------------------------------------------------------------
-    if args.generate_grid and not args.input_dat and not args.input_npy:
+    if args.generate_grid and not args.input_dat and not args.input_npy :
         import math as _math
         import sys as _sys
 
@@ -1785,7 +1791,15 @@ def main():
 
     # --- Nx6 input path ---
     _dof_type = "euler"
-    if args.input_npy:
+    if args.identity:
+        _dof_type = "rotvec"
+        dofs0 = np.zeros((1, 6), dtype=np.float64)
+        ligand_conformers_rotvec = None
+        ens = np.ones(len(dofs0), dtype=np.int32)
+        test_dir = args.test_dir
+        n = 1
+
+    elif args.input_npy:
         test_dir = args.test_dir or str(Path(args.input_npy).resolve().parent)
         dofs_all = np.load(args.input_npy, mmap_mode="r")
         if dofs_all.ndim != 2 or dofs_all.shape[1] != 6:
