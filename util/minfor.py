@@ -1798,6 +1798,9 @@ def main():
         ens = np.ones(len(dofs0), dtype=np.int32)
         test_dir = args.test_dir
         n = 1
+        header = []
+        pivots = {}
+        centered_ligands = None
 
     elif args.input_npy:
         test_dir = args.test_dir or str(Path(args.input_npy).resolve().parent)
