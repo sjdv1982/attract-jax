@@ -9,7 +9,7 @@ description = "JAX scoring and minimization utilities for ATTRACT-style force fi
 requires-python = ">=3.10"
 dependencies = [
     "jax",
-    "numpy>=2.0",
+    "numpy",
     "scipy",
     "pyyaml",
 ]
