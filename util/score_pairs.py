@@ -370,122 +370,123 @@ def score_pairs_jax(
 
     _batch_energy = jax.jit(_batch_energy_raw)
 
-    def _lj_energy_sum_from_delta(rlen, alen, emin_v, rmin2_v, iv, dx_eff, dy_eff, dz_eff):
-        dsq_eff = dx_eff * dx_eff + dy_eff * dy_eff + dz_eff * dz_eff
-        rr2_eff = jnp.where(dsq_eff != 0.0, 1.0 / dsq_eff, 0.0)
-        return jnp.sum(_lj_energy(rlen, alen, emin_v, rmin2_v, iv, dsq_eff, rr2_eff))
+    if return_gradients:
+        def _lj_energy_sum_from_delta(rlen, alen, emin_v, rmin2_v, iv, dx_eff, dy_eff, dz_eff):
+            dsq_eff = dx_eff * dx_eff + dy_eff * dy_eff + dz_eff * dz_eff
+            rr2_eff = jnp.where(dsq_eff != 0.0, 1.0 / dsq_eff, 0.0)
+            return jnp.sum(_lj_energy(rlen, alen, emin_v, rmin2_v, iv, dsq_eff, rr2_eff))
 
-    _lj_force_autodiff = jax.value_and_grad(
-        _lj_energy_sum_from_delta, argnums=(5, 6, 7)
-    )
-
-    def _elec_energy_sum_from_delta(charge, dx_eff, dy_eff, dz_eff):
-        dsq_eff = dx_eff * dx_eff + dy_eff * dy_eff + dz_eff * dz_eff
-        rr2_eff = jnp.where(dsq_eff != 0.0, 1.0 / dsq_eff, 0.0)
-        return jnp.sum(_call_elec_energy(charge, rr2_eff, dsq_eff))
-
-    _elec_force_autodiff = jax.value_and_grad(
-        _elec_energy_sum_from_delta, argnums=(1, 2, 3)
-    )
-
-    @jax.jit
-    def _batch_energy_and_grad(qc_batch, nr_batch, nb_start_batch):
-        """Compute energy and pseudo-gradient matching the compiled kernel path.
-
-        For clamp mode this follows the same effective-displacement construction
-        as the C kernel and derives force components from autodiff of
-        ``lj_energy``/``elec_energy``.
-        """
-        B = qc_batch.shape[0]
-        flat_nb = nb_start_batch[:, None] + offsets_j[None, :]  # (B, K)
-        flat_nb_clip = jnp.clip(flat_nb, 0, nb_c_j.shape[0] - 1)
-        rec_idx = nb_c_j[flat_nb_clip]  # (B, K)
-        valid = offsets_j[None, :] < nr_batch[:, None]  # (B, K)
-
-        safe_rec = jnp.clip(rec_idx, 0, M - 1)
-        rec_c = rec_c_j[safe_rec]  # (B, K, 3)
-        d = qc_batch[:, None, :] - rec_c  # (B, K, 3)  q - r
-        dsq = (d * d).sum(axis=-1)  # (B, K)
-
-        # ---- plateau mode ----
-        if plateau_mode == "clamp":
-            within = dsq < pdsq_f
-            ratio = jnp.where(within, jnp.sqrt(dsq / pdsq_f), 1.0)
-            eval_dsq = jnp.where(within, pdsq_f, dsq)
-        else:  # correction
-            within = dsq <= pdsq_f
-            eval_dsq = dsq
-            valid = valid & within
-
-        # Avoid division by zero; invalid pairs will be masked out.
-        safe_dsq = jnp.where(valid, dsq, 1.0)
-        eval_dsq_safe = jnp.where(valid, eval_dsq, 1.0)
-        eval_rr2 = 1.0 / eval_dsq_safe
-
-        # Effective (dx,dy,dz) input to the per-pair gradient convention.
-        if plateau_mode == "clamp":
-            eval_d = d / safe_dsq[..., None] * ratio[..., None]
-        else:
-            eval_d = d / safe_dsq[..., None]
-
-        rt = rec_t_j[safe_rec]
-        qt = jnp.full_like(rt, qt_scalar)
-
-        rlen = rc_j[rt, qt]
-        alen = ac_j[rt, qt]
-        emin_v = emin_j[rt, qt]
-        rmin2_v = rmin2_j[rt, qt]
-        iv = ivor_j[rt, qt]
-
-        # Pair energy at the effective distance.
-        e_lj = _lj_energy(rlen, alen, emin_v, rmin2_v, iv, eval_dsq_safe, eval_rr2)
-
-        # Reconstruct effective displacement vectors for autodiff.
-        eval_delta = jnp.where(
-            eval_rr2[..., None] != 0.0,
-            eval_d / eval_rr2[..., None],
-            0.0,
+        _lj_force_autodiff = jax.value_and_grad(
+            _lj_energy_sum_from_delta, argnums=(5, 6, 7)
         )
-        _, (dE_lj_x, dE_lj_y, dE_lj_z) = _lj_force_autodiff(
-            rlen,
-            alen,
-            emin_v,
-            rmin2_v,
-            iv,
-            eval_delta[..., 0],
-            eval_delta[..., 1],
-            eval_delta[..., 2],
+
+        def _elec_energy_sum_from_delta(charge, dx_eff, dy_eff, dz_eff):
+            dsq_eff = dx_eff * dx_eff + dy_eff * dy_eff + dz_eff * dz_eff
+            rr2_eff = jnp.where(dsq_eff != 0.0, 1.0 / dsq_eff, 0.0)
+            return jnp.sum(_call_elec_energy(charge, rr2_eff, dsq_eff))
+
+        _elec_force_autodiff = jax.value_and_grad(
+            _elec_energy_sum_from_delta, argnums=(1, 2, 3)
         )
-        # Force direction convention (-dE/dx), matching lj_grad.h.
-        g_lj = jnp.stack([-dE_lj_x, -dE_lj_y, -dE_lj_z], axis=-1)
 
-        if plateau_mode == "correction":
-            # Subtract plateau energy only; its gradient contribution is zero.
-            e_lj = e_lj - _lj_energy(rlen, alen, emin_v, rmin2_v, iv, pdsq_f, prr2_f)
+        @jax.jit
+        def _batch_energy_and_grad(qc_batch, nr_batch, nb_start_batch):
+            """Compute energy and pseudo-gradient matching the compiled kernel path.
 
-        charge = rec_ch_j[safe_rec] * qch
-        e_elec = _call_elec_energy(charge, eval_rr2, eval_dsq_safe)
-        _, (dE_el_x, dE_el_y, dE_el_z) = _elec_force_autodiff(
-            charge,
-            eval_delta[..., 0],
-            eval_delta[..., 1],
-            eval_delta[..., 2],
-        )
-        # Force direction convention (-dE/dx), matching elec_grad.h.
-        g_elec = jnp.stack([-dE_el_x, -dE_el_y, -dE_el_z], axis=-1)
+            For clamp mode this follows the same effective-displacement construction
+            as the C kernel and derives force components from autodiff of
+            ``lj_energy``/``elec_energy``.
+            """
+            B = qc_batch.shape[0]
+            flat_nb = nb_start_batch[:, None] + offsets_j[None, :]  # (B, K)
+            flat_nb_clip = jnp.clip(flat_nb, 0, nb_c_j.shape[0] - 1)
+            rec_idx = nb_c_j[flat_nb_clip]  # (B, K)
+            valid = offsets_j[None, :] < nr_batch[:, None]  # (B, K)
 
-        if plateau_mode == "correction":
-            # Subtract plateau energy only; its gradient contribution is zero.
-            e_elec = e_elec - _call_elec_energy(charge, prr2_f, pdsq_f)
+            safe_rec = jnp.clip(rec_idx, 0, M - 1)
+            rec_c = rec_c_j[safe_rec]  # (B, K, 3)
+            d = qc_batch[:, None, :] - rec_c  # (B, K, 3)  q - r
+            dsq = (d * d).sum(axis=-1)  # (B, K)
 
-        mask3 = valid[..., None]
-        e_pair = jnp.where(valid, e_lj + e_elec, 0.0)
-        g_pair = jnp.where(mask3, g_lj + g_elec, 0.0)  # (B, K, 3)
+            # ---- plateau mode ----
+            if plateau_mode == "clamp":
+                within = dsq < pdsq_f
+                ratio = jnp.where(within, jnp.sqrt(dsq / pdsq_f), 1.0)
+                eval_dsq = jnp.where(within, pdsq_f, dsq)
+            else:  # correction
+                within = dsq <= pdsq_f
+                eval_dsq = dsq
+                valid = valid & within
 
-        energies = e_pair.sum(axis=-1)  # (B,)
-        # Convert summed force-direction components to gradient direction.
-        grads = -g_pair.sum(axis=-2)  # (B, 3)
-        return energies, grads
+            # Avoid division by zero; invalid pairs will be masked out.
+            safe_dsq = jnp.where(valid, dsq, 1.0)
+            eval_dsq_safe = jnp.where(valid, eval_dsq, 1.0)
+            eval_rr2 = 1.0 / eval_dsq_safe
+
+            # Effective (dx,dy,dz) input to the per-pair gradient convention.
+            if plateau_mode == "clamp":
+                eval_d = d / safe_dsq[..., None] * ratio[..., None]
+            else:
+                eval_d = d / safe_dsq[..., None]
+
+            rt = rec_t_j[safe_rec]
+            qt = jnp.full_like(rt, qt_scalar)
+
+            rlen = rc_j[rt, qt]
+            alen = ac_j[rt, qt]
+            emin_v = emin_j[rt, qt]
+            rmin2_v = rmin2_j[rt, qt]
+            iv = ivor_j[rt, qt]
+
+            # Pair energy at the effective distance.
+            e_lj = _lj_energy(rlen, alen, emin_v, rmin2_v, iv, eval_dsq_safe, eval_rr2)
+
+            # Reconstruct effective displacement vectors for autodiff.
+            eval_delta = jnp.where(
+                eval_rr2[..., None] != 0.0,
+                eval_d / eval_rr2[..., None],
+                0.0,
+            )
+            _, (dE_lj_x, dE_lj_y, dE_lj_z) = _lj_force_autodiff(
+                rlen,
+                alen,
+                emin_v,
+                rmin2_v,
+                iv,
+                eval_delta[..., 0],
+                eval_delta[..., 1],
+                eval_delta[..., 2],
+            )
+            # Force direction convention (-dE/dx), matching lj_grad.h.
+            g_lj = jnp.stack([-dE_lj_x, -dE_lj_y, -dE_lj_z], axis=-1)
+
+            if plateau_mode == "correction":
+                # Subtract plateau energy only; its gradient contribution is zero.
+                e_lj = e_lj - _lj_energy(rlen, alen, emin_v, rmin2_v, iv, pdsq_f, prr2_f)
+
+            charge = rec_ch_j[safe_rec] * qch
+            e_elec = _call_elec_energy(charge, eval_rr2, eval_dsq_safe)
+            _, (dE_el_x, dE_el_y, dE_el_z) = _elec_force_autodiff(
+                charge,
+                eval_delta[..., 0],
+                eval_delta[..., 1],
+                eval_delta[..., 2],
+            )
+            # Force direction convention (-dE/dx), matching elec_grad.h.
+            g_elec = jnp.stack([-dE_el_x, -dE_el_y, -dE_el_z], axis=-1)
+
+            if plateau_mode == "correction":
+                # Subtract plateau energy only; its gradient contribution is zero.
+                e_elec = e_elec - _call_elec_energy(charge, prr2_f, pdsq_f)
+
+            mask3 = valid[..., None]
+            e_pair = jnp.where(valid, e_lj + e_elec, 0.0)
+            g_pair = jnp.where(mask3, g_lj + g_elec, 0.0)  # (B, K, 3)
+
+            energies = e_pair.sum(axis=-1)  # (B,)
+            # Convert summed force-direction components to gradient direction.
+            grads = -g_pair.sum(axis=-2)  # (B, 3)
+            return energies, grads
 
     out_e = np.empty(N, dtype=np.float64)
     out_g = np.empty((N, 3), dtype=np.float64) if return_gradients else None

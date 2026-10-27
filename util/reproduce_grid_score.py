@@ -568,7 +568,9 @@ def build_kernel(
     max_nb_cap: int = 0,
     use_precomputed_grid_gradients: bool = True,
     rotation: str = "euler",
+    energy_only: bool = False,
 ):
+    """Build pose-energy kernels; omit derivative setup when energy_only is true."""
     _dofs_to_mats = rotvec_dofs_to_mats if rotation == "rotvec" else dofs_to_mats
     plateaudissq = jnp.float64(grid.plateaudis**2)
     inv50sq = jnp.float64(1.0 / (50.0 * 50.0))
@@ -581,14 +583,6 @@ def build_kernel(
         (n_charged,), np.int32(grid.elec_channel_index), dtype=np.int32
     )
 
-    grad_nonbon = jax.grad(nonbon)
-    grad_elec = jax.grad(elec_dsq_cdie if cdie else elec_dsq_const)
-
-    _at1, _at2 = jnp.indices((ff.rc.shape[0], ff.rc.shape[1]))
-    plateau_nonbon_grad = jnp.vectorize(
-        grad_nonbon, excluded=(1,), signature="(),(),()->()"
-    )(plateaudissq, ff, _at1, _at2)
-
     def pair_dif(d, ff0, at1, at2, charge):
         dsq = (d * d).sum()
         charge0 = jnp.where(jnp.abs(charge) > 1.0e-3, charge, 0.0)
@@ -599,40 +593,49 @@ def build_kernel(
             e_el = elec_dsq_const(dsq, charge0) - elec_dsq_const(plateaudissq, charge0)
         return e_nb + e_el
 
-    pair_dif = jax.custom_jvp(pair_dif)
+    if not energy_only:
+        grad_nonbon = jax.grad(nonbon)
+        grad_elec = jax.grad(elec_dsq_cdie if cdie else elec_dsq_const)
 
-    @pair_dif.defjvp
-    @jit
-    def pair_dif_jvp(primals, tangents):
-        d, ff0, at1, at2, charge = primals
-        dsq0 = (d * d).sum()
-        charge00 = jnp.where(jnp.abs(charge) > 1.0e-3, charge, 0.0)
-        ans_nb = nonbon(dsq0, ff0, at1, at2) - nonbon(plateaudissq, ff0, at1, at2)
-        if cdie:
-            ans_el = elec_dsq_cdie(dsq0, charge00) - elec_dsq_cdie(
-                plateaudissq, charge00
-            )
-        else:
-            ans_el = elec_dsq_const(dsq0, charge00) - elec_dsq_const(
-                plateaudissq, charge00
-            )
-        ans = ans_nb + ans_el
-        d_dot = tangents[0]
-        dsq = dsq0
-        charge0 = charge00
-        grad_nb_main = grad_nonbon(dsq, ff0, at1, at2)
-        grad_nb_plateau = plateau_nonbon_grad[at1, at2]
-        if cdie:
-            grad_el_main = grad_elec(dsq, charge0)
-            grad_el_plateau = grad_elec(plateaudissq, charge0)
-        else:
-            grad_el_main = grad_elec(dsq, charge0)
-            grad_el_plateau = grad_elec(plateaudissq, charge0)
-        grad_main = 2.0 * (grad_nb_main + grad_el_main) * d
-        ratio = jnp.sqrt(plateaudissq / dsq)
-        grad_plateau = 2.0 * (grad_nb_plateau + grad_el_plateau) * d * ratio
-        tangent = ((grad_main - grad_plateau) * d_dot).sum()
-        return ans, tangent
+        _at1, _at2 = jnp.indices((ff.rc.shape[0], ff.rc.shape[1]))
+        plateau_nonbon_grad = jnp.vectorize(
+            grad_nonbon, excluded=(1,), signature="(),(),()->()"
+        )(plateaudissq, ff, _at1, _at2)
+
+        pair_dif = jax.custom_jvp(pair_dif)
+
+        @pair_dif.defjvp
+        @jit
+        def pair_dif_jvp(primals, tangents):
+            d, ff0, at1, at2, charge = primals
+            dsq0 = (d * d).sum()
+            charge00 = jnp.where(jnp.abs(charge) > 1.0e-3, charge, 0.0)
+            ans_nb = nonbon(dsq0, ff0, at1, at2) - nonbon(plateaudissq, ff0, at1, at2)
+            if cdie:
+                ans_el = elec_dsq_cdie(dsq0, charge00) - elec_dsq_cdie(
+                    plateaudissq, charge00
+                )
+            else:
+                ans_el = elec_dsq_const(dsq0, charge00) - elec_dsq_const(
+                    plateaudissq, charge00
+                )
+            ans = ans_nb + ans_el
+            d_dot = tangents[0]
+            dsq = dsq0
+            charge0 = charge00
+            grad_nb_main = grad_nonbon(dsq, ff0, at1, at2)
+            grad_nb_plateau = plateau_nonbon_grad[at1, at2]
+            if cdie:
+                grad_el_main = grad_elec(dsq, charge0)
+                grad_el_plateau = grad_elec(plateaudissq, charge0)
+            else:
+                grad_el_main = grad_elec(dsq, charge0)
+                grad_el_plateau = grad_elec(plateaudissq, charge0)
+            grad_main = 2.0 * (grad_nb_main + grad_el_main) * d
+            ratio = jnp.sqrt(plateaudissq / dsq)
+            grad_plateau = 2.0 * (grad_nb_plateau + grad_el_plateau) * d * ratio
+            tangent = ((grad_main - grad_plateau) * d_dot).sum()
+            return ans, tangent
 
     @jit
     def interpolate_grid(channel_idx, voxel, potential_grid):
@@ -695,7 +698,7 @@ def build_kernel(
             jnp.where(in_outergrid[:, :, None], outer, zeros),
         )
 
-    if use_precomputed_grid_gradients:
+    if use_precomputed_grid_gradients and not energy_only:
 
         @jit
         def potential_atom_energies(

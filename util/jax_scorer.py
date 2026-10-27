@@ -408,12 +408,14 @@ class JaxScoreOracle:
                 raise ValueError(
                     "--pool-conformers currently requires energy_only=True"
                 )
-        # Default behavior: use stored grid gradients via custom JVP.
-        # Optional behavior: AD through energy-only potentials.
-        self._use_precomputed_grid_gradients = not bool(autodiff_potentials)
+        # Stored gradients are only needed for derivative evaluations.
+        # Otherwise retain just the potential energy channels.
+        self._use_precomputed_grid_gradients = not (
+            autodiff_potentials or self._energy_only
+        )
 
         # Combine potential + electrostatic grids.
-        # For nonbon8 mode we only keep energy channels; JAX AD handles grid gradients.
+        # Energy-only and autodiff-potential modes only need energy channels.
         inner_all = np.concatenate(
             (grid.inner_potential_grid, grid.inner_elec_grid[None, ...]), axis=0
         )
@@ -452,7 +454,7 @@ class JaxScoreOracle:
         nb_chunk_thresholds += (int(grid.max_nr_neighbours),)
         grid_dim = tuple(int(x) for x in grid.dim)
 
-        # --- Build JAX kernel (forward pass only, no jax.grad) ---
+        # --- Build JAX kernel; energy-only scoring skips derivative setup ---
         n_lig_atoms = int(lig_coords.shape[1])
         kernel_batch_capacity = max(self.energy_batch, self.score_batch_size)
         padded_nb_size = (
@@ -470,6 +472,7 @@ class JaxScoreOracle:
             padded_nb_size=padded_nb_size,
             use_precomputed_grid_gradients=self._use_precomputed_grid_gradients,
             rotation=self._dof_type,
+            energy_only=self._energy_only,
         )
 
         # Store per-ensemble data
@@ -517,7 +520,7 @@ class JaxScoreOracle:
         kernel_pot_ad = kernel_main.pot_ad
         self._kernel_pot_ad = kernel_pot_ad
         self._kernel_pot_pooled = getattr(kernel_main, "pot_pooled", None)
-        if kernel_ad is not None:
+        if kernel_ad is not None and not self._energy_only:
 
             def _single_energy(dof_1d, rec_coor, rec_charge_scaled):
                 """Energy of a single pose (6,) → scalar."""
