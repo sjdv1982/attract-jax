@@ -3,6 +3,9 @@ jax_scorer.py
 grid_generator.py
 score_pairs.py
 dat_to_npy.py
+grid_io.py
+numpy_grid_score.py
+pdb_io.py
 ../nb_kernel/nb_kernel.h
 ../nb_kernel/include/pose_loop.h
 ../nb_kernel/include/euler_rot.h

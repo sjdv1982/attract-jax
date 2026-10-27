@@ -230,9 +230,9 @@ def generate_grid(
         Half-width of extra outer grid extension (in inner-half-voxels).
         Outer grid has 2× inner spacing.
     plateaudis : float
-        Soft-core plateau distance (Å).
+        Soft-core plateau distance (Å), default 10.
     neighbourdis : float
-        Correction-term neighbour cutoff (Å).
+        Correction-term neighbour cutoff (Å), default 12.
 
     Returns
     -------

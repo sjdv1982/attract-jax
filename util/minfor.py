@@ -28,6 +28,8 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+from pdb_io import parse_reduced_pdb
+
 # ---------------------------------------------------------------------------
 # DAT parsing (same as minimize_scipy.py)
 # ---------------------------------------------------------------------------
@@ -1002,8 +1004,6 @@ def _load_ligand_conformers(
 
 
 def _load_ligand_pdb_list(path: str):
-    from reproduce_grid_score import parse_reduced_pdb
-
     list_dir = Path(path).resolve().parent
     pdb_paths: List[str] = []
     coords: List[np.ndarray] = []
@@ -1053,8 +1053,6 @@ def _load_ligand_pdb_list(path: str):
 
 
 def resolve_ligand_inputs(args, test_dir: str, nposes: int):
-    from reproduce_grid_score import parse_reduced_pdb
-
     if args.ligand_ensemble:
         lig_coords = _normalize_ligand_ensemble_array(
             np.load(args.ligand_ensemble), "--ligand-ensemble"
@@ -1334,10 +1332,10 @@ def parse_args():
     ap.add_argument(
         "--oracle",
         default="jax",
-        choices=["jax", "legacy"],
+        choices=["jax", "numpy", "legacy"],
         help=(
-            "energy oracle: 'jax' (primary production path) or "
-            "'legacy' (fallback ATTRACT binary)"
+            "energy oracle: 'jax' (production), 'numpy' (energy-only), "
+            "or 'legacy' (fallback ATTRACT binary)"
         ),
     )
     ap.add_argument(
@@ -1346,9 +1344,16 @@ def parse_args():
         help=(
             "path to precomputed .grid or .npz file to use as the NB potential grid. "
             "If omitted, the grid is generated just-in-time from the receptor "
+            "with a 10 A plateau and 12 A pairlist distance "
             "(requires --receptor-ens-list and --attract-par-npz). "
+            "NumPy requires --grid or --no-grid. "
             "With --generate-grid: output path for the freshly generated .npz."
         ),
+    )
+    ap.add_argument(
+        "--no-grid",
+        action="store_true",
+        help="NumPy energy-only scoring: evaluate all atom pairs without loading or generating a grid",
     )
     ap.add_argument(
         "--generate-grid",
@@ -1358,6 +1363,7 @@ def parse_args():
             "JAX-only: generate the NB potential grid in-house and write it to "
             "--grid <output.npz>, then exit.  Requires --grid, "
             "--receptor-ens-list, --attract-par-npz.  "
+            "Default plateau/pairlist distances are 10/12 A. "
             "Without --generate-grid, omitting --grid causes the grid to be "
             "generated just-in-time and used directly (not saved)."
         ),
@@ -1587,11 +1593,25 @@ def parse_args():
                 "(the .npz path to write the generated grid to)"
             )
         if not args.attract_par_npz:
-            ap.error("--attract-par-npz is required for --oracle jax")
+            ap.error("--attract-par-npz is required for --oracle jax or numpy")
         if args.energy_batch <= 0:
             ap.error("--energy-batch must be >= 1")
         if args.score_batch_size is not None and args.score_batch_size <= 0:
             ap.error("--score-batch-size must be >= 1")
+    if args.no_grid:
+        if args.oracle != "numpy":
+            ap.error("--no-grid requires --oracle numpy")
+        if args.grid or args.generate_grid:
+            ap.error("--no-grid cannot be combined with --grid or --generate-grid")
+    if args.oracle == "numpy":
+        if not (args.score and args.energy_only):
+            ap.error("--oracle numpy requires --score --energy-only")
+        if not args.no_grid and (not args.grid or args.generate_grid):
+            ap.error("--oracle numpy requires --no-grid or a precomputed --grid (binary or .npz)")
+        for opt in ("--nb-kernel", "--autodiff-potentials", "--disable-jit",
+                    "--no-nb-grid-eval", "--no-pot-grid-eval", "--no-conformer-grouping"):
+            if _opt_used(opt):
+                ap.error(f"{opt} is only supported with --oracle jax")
     if args.energy_only and not args.score:
         ap.error("--energy-only is only valid together with --score")
     if args.output_npy and not args.score:
@@ -1608,7 +1628,7 @@ def parse_args():
         ap.error("--pool-conformers is only valid together with --score")
     if args.pool_conformers and not args.energy_only:
         ap.error("--pool-conformers currently requires --energy-only")
-    if args.pool_conformers and args.nb_kernel != "jax":
+    if args.pool_conformers and args.oracle != "numpy" and args.nb_kernel != "jax":
         ap.error("--pool-conformers currently requires --nb-kernel jax")
     receptor_mode_count = (
         int(bool(args.receptor_ens_list))
@@ -1664,8 +1684,8 @@ def parse_args():
     if args.input_npy:
         if args.input_dat:
             ap.error("input_dat is mutually exclusive with --input-npy")
-        if args.oracle != "jax":
-            ap.error("--input-npy requires --oracle jax")
+        if args.oracle not in ("jax", "numpy"):
+            ap.error("--input-npy requires --oracle jax or numpy")
     else:
         if not args.identity and not args.input_dat and not args.generate_grid:
             ap.error(
@@ -1717,10 +1737,7 @@ def main():
             if _p not in _sys.path:
                 _sys.path.insert(0, _p)
         from grid_generator import generate_grid as _gen_grid
-        from reproduce_grid_score import (
-            parse_reduced_pdb as _parse_pdb,
-            write_grid_npz as _write_npz,
-        )
+        from reproduce_grid_score import write_grid_npz as _write_npz
         import importlib as _importlib
 
         _ff_params_mod = _importlib.import_module(
@@ -1742,7 +1759,7 @@ def main():
             _rec_pdb = _ens_lines[0]
             if not os.path.isabs(_rec_pdb):
                 _rec_pdb = os.path.join(os.path.dirname(ens_list_path), _rec_pdb)
-            _rc, _rt, _rq, _ = _parse_pdb(_rec_pdb)
+            _rc, _rt, _rq, _ = parse_reduced_pdb(_rec_pdb)
         if _rc.ndim == 3:
             _rc = _rc[0]
 
@@ -1938,9 +1955,9 @@ def main():
                 "Converted world-frame rotvec translations to ATTRACT DOFs using the ligand pivot"
             )
 
-    # --- Convert centered → non-centered for JAX oracle only ---
+    # --- Convert centered → non-centered for the Python scoring oracles ---
     input_centered = bool(centered_ligands) if centered_ligands is not None else False
-    converted_for_oracle = input_centered and args.oracle == "jax"
+    converted_for_oracle = input_centered and args.oracle in ("jax", "numpy")
     if converted_for_oracle:
         dofs0 = dofs0.copy()
         dofs0[:, 3:6] -= lig_pivot[None, :]
@@ -1954,7 +1971,7 @@ def main():
     receptor_inputs = resolve_receptor_inputs(args, test_dir)
     receptor_ens_list_ctx = receptor_inputs["tmp_ctx"]
     oracle = None
-    if args.oracle == "jax":
+    if args.oracle in ("jax", "numpy"):
         from jax_scorer import JaxScoreOracle
 
         ens_list_path = receptor_inputs["receptor_ens_list"]
@@ -1964,7 +1981,7 @@ def main():
         # Build the grid object when no precomputed file is provided, or when
         # --generate-grid is given (generate + write + exit).
         grid_object = None
-        if args.generate_grid or not grid_path:
+        if not args.no_grid and (args.generate_grid or not grid_path):
             import math as _math
             import sys as _sys
 
@@ -1974,7 +1991,6 @@ def main():
                 if _p not in _sys.path:
                     _sys.path.insert(0, _p)
             from grid_generator import generate_grid as _gen_grid
-            from reproduce_grid_score import parse_reduced_pdb as _parse_pdb
             import importlib as _importlib
 
             _ff_params_mod = _importlib.import_module(
@@ -1993,7 +2009,7 @@ def main():
                 _rec_pdb = _ens_lines[0]
                 if not os.path.isabs(_rec_pdb):
                     _rec_pdb = os.path.join(os.path.dirname(ens_list_path), _rec_pdb)
-                _rc, _rt, _rq, _ = _parse_pdb(_rec_pdb)
+                _rc, _rt, _rq, _ = parse_reduced_pdb(_rec_pdb)
             if _rc.ndim == 3:
                 _rc = _rc[0]
             _ff_params = _load_params(par_npz)
@@ -2009,7 +2025,7 @@ def main():
                 and ligand_pdb_path
                 and os.path.isfile(ligand_pdb_path)
             ):
-                _, _lt, _, _ = _parse_pdb(ligand_pdb_path)
+                _, _lt, _, _ = parse_reduced_pdb(ligand_pdb_path)
                 _lig_atomtypes = _lt
             _rec_label = _rec_pdb if _rec_pdb is not None else ens_list_path
             if verbose:
@@ -2047,7 +2063,7 @@ def main():
 
         # Dispatch --grid on extension: .npz → read_grid_npz, else legacy binary.
         if grid_path is not None and grid_path.endswith(".npz"):
-            from reproduce_grid_score import read_grid_npz as _read_npz
+            from grid_io import read_grid_npz as _read_npz
 
             grid_object = _read_npz(grid_path)
             grid_path = None  # use grid_object path in JaxScoreOracle
@@ -2073,9 +2089,11 @@ def main():
             score_mode=args.score_mode,
             score_batch_size=args.score_batch_size,
             pool_conformers=bool(args.pool_conformers),
-            nb_kernel=args.nb_kernel,
+            nb_kernel=("jax" if args.oracle == "numpy" else args.nb_kernel),
             autodiff_potentials=bool(args.autodiff_potentials),
             energy_only=bool(args.energy_only),
+            backend=args.oracle,
+            grid_free=bool(args.no_grid),
             grid_object=grid_object,
             dof_type=_dof_type,
             no_nb_grid_eval=bool(args.no_nb_grid_eval),
@@ -2084,7 +2102,7 @@ def main():
         )
         if verbose:
             print(
-                "JAX oracle initialized "
+                f"{args.oracle.upper()} oracle initialized "
                 f"(energy_batch={args.energy_batch}, score_mode={args.score_mode}, "
                 f"score_batch_size={args.score_batch_size}, "
                 f"pool_conformers={bool(args.pool_conformers)}, "

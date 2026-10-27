@@ -2,7 +2,7 @@ ln -s ~/ssrna-attract-fraglib/clean-pdb/UGU
 ln -s ~/ssrna-attract-fraglib/clean-pdb/UGU.list
 
 awk '{print substr($0,58,2)}' frag3-r.pdb | sort -nu > receptorgrid.alphabet
-$ATTRACTDIR/make-grid-omp 3sxl_dom2-r.pdb $ATTRACTDIR/../attract.par 5 7 3sxl_dom2-r.grid --alphabet receptorgrid.alphabet
+$ATTRACTDIR/make-grid-omp 3sxl_dom2-r.pdb $ATTRACTDIR/../attract.par 10 12 3sxl_dom2-r.grid --alphabet receptorgrid.alphabet
 $ATTRACTDIR/shm-grid 3sxl_dom2-r.grid 3sxl_dom2-r.gridheader
 listr=UGU.list
 ligandr=`head -1 UGU.list`
