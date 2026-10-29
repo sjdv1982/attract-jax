@@ -3,6 +3,7 @@ jax_scorer.py
 grid_generator.py
 score_pairs.py
 dat_to_npy.py
+../attract-original/attract-par.npz
 grid_io.py
 numpy_grid_score.py
 pdb_io.py
