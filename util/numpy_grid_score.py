@@ -49,7 +49,13 @@ def _transform(mats, coords):
 def _interpolate(channels, voxel, grid):
     lo = np.floor(voxel).astype(np.intp)
     hi = np.ceil(voxel).astype(np.intp)
-    w0, w1 = hi - voxel, voxel - lo
+    exact = lo == hi
+    # At an exact voxel coordinate floor == ceil, so the usual linear
+    # weights both become zero.  Give the lower (identical) corner unit weight
+    # to preserve the stored value; otherwise an exact grid-node pose silently
+    # drops the potential energy contribution.
+    w0 = np.where(exact, 1.0, hi - voxel)
+    w1 = np.where(exact, 0.0, voxel - lo)
     # Inactive inner/outer grid lookups can be outside their grids. Clip them
     # before indexing; the caller masks their energies after interpolation.
     upper = np.array(grid.shape[1:4]) - 1
@@ -183,14 +189,53 @@ def build_kernel(
         safe = np.where(rec_atoms < len(rec_coords), rec_atoms, 0)
         delta = coords[pose, atom, None, :] - rec_coords[safe]
         dsq = (delta * delta).sum(axis=-1)
-        valid = (rec_atoms < 65535) & (dsq < pdsq)
-        dsq = np.where(valid, dsq, 1.)
+        valid = (rec_atoms < 65535) & (rec_atoms < len(rec_coords))
         at1, at2 = rec_types[safe], lig_types[atom, None]
-        e_lj = _lj(dsq, ff0, at1, at2) - plateau_lj[at1, at2]
+        # Deep inside the plateau every corner stores the same pair value, so
+        # the old direct-minus-plateau correction remains exact.  In cells
+        # crossing the plateau shell, subtract that pair's actual trilinear
+        # grid contribution instead, and include pairs just outside p as well.
+        d = np.sqrt(dsq)
+        shell = valid & (np.abs(d - grid0.plateaudis) <= np.sqrt(3.0) * grid0.gridspacing)
+        deep = valid & (dsq < pdsq) & ~shell
+        safe_dsq = np.maximum(np.where(valid, dsq, 1.), 0.001)
+        e_lj = _lj(safe_dsq, ff0, at1, at2)
         charge = rec_charges[safe] * lig_charges[atom, None]
         charge = np.where(np.abs(charge) > 1e-3, charge, 0.)
-        e_el = charge * (elec_per_charge(dsq) - plateau_el)
-        atom_energy = np.where(valid, e_lj + e_el, 0.).sum(axis=1)
+        e_el = charge * elec_per_charge(safe_dsq)
+
+        # Reconstruct the pairwise interpolation baseline at the same eight
+        # corners as the aggregate potential sampler.  The grid generator
+        # clamps each pair's corner energy to the plateau before interpolation.
+        ligand_xyz = coords[pose, atom]
+        voxel = (ligand_xyz - grid0.origin) / grid0.gridspacing
+        lo = np.floor(voxel).astype(np.intp)
+        hi = np.ceil(voxel).astype(np.intp)
+        exact = lo == hi
+        w0 = np.where(exact, 1., hi - voxel)
+        w1 = np.where(exact, 0., voxel - lo)
+        pair_baseline = np.zeros_like(dsq, dtype=np.float64)
+        for bx in (0, 1):
+            ix = hi[:, 0] if bx else lo[:, 0]
+            wx = w1[:, 0] if bx else w0[:, 0]
+            for by in (0, 1):
+                iy = hi[:, 1] if by else lo[:, 1]
+                wy = w1[:, 1] if by else w0[:, 1]
+                for bz in (0, 1):
+                    iz = hi[:, 2] if bz else lo[:, 2]
+                    wz = w1[:, 2] if bz else w0[:, 2]
+                    weight = wx * wy * wz
+                    corner = grid0.origin + np.column_stack((ix, iy, iz)) * grid0.gridspacing
+                    corner_delta = corner[:, None, :] - rec_coords[safe]
+                    corner_dsq = np.maximum((corner_delta * corner_delta).sum(axis=-1), pdsq)
+                    corner_lj = _lj(corner_dsq, ff0, at1, at2)
+                    corner_el = charge * elec_per_charge(corner_dsq)
+                    pair_baseline += weight[:, None] * (corner_lj + corner_el)
+
+        direct_pair = e_lj + e_el
+        correction = np.where(deep, direct_pair - plateau_lj[at1, at2] - charge * plateau_el,
+                              np.where(shell, direct_pair - pair_baseline, 0.))
+        atom_energy = np.where(valid, correction, 0.).sum(axis=1)
         np.add.at(energies, pose, atom_energy)
         return energies
 

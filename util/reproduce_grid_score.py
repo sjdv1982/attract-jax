@@ -316,7 +316,7 @@ def build_kernel(
     )
 
     def pair_dif(d, ff0, at1, at2, charge):
-        dsq = (d * d).sum()
+        dsq = jnp.maximum((d * d).sum(), 0.001)
         charge0 = jnp.where(jnp.abs(charge) > 1.0e-3, charge, 0.0)
         e_nb = nonbon(dsq, ff0, at1, at2) - nonbon(plateaudissq, ff0, at1, at2)
         if cdie:
@@ -324,6 +324,43 @@ def build_kernel(
         else:
             e_el = elec_dsq_const(dsq, charge0) - elec_dsq_const(plateaudissq, charge0)
         return e_nb + e_el
+
+    def pair_grid_correction(lig_xyz, rec_xyz, ff0, at1, at2, charge):
+        """Replace one shell pair's trilinear grid baseline with its exact energy."""
+        d = lig_xyz - rec_xyz
+        dsq = jnp.maximum((d * d).sum(), 0.001)
+        charge0 = jnp.where(jnp.abs(charge) > 1.0e-3, charge, 0.0)
+        direct_lj = nonbon(dsq, ff0, at1, at2)
+        if cdie:
+            direct_el = elec_dsq_cdie(dsq, charge0)
+        else:
+            direct_el = elec_dsq_const(dsq, charge0)
+
+        voxel = (lig_xyz - grid.origin) / grid.gridspacing
+        lo = jnp.floor(voxel).astype(jnp.int32)
+        hi = jnp.ceil(voxel).astype(jnp.int32)
+        exact = lo == hi
+        w0 = jnp.where(exact, 1.0, hi - voxel)
+        w1 = jnp.where(exact, 0.0, voxel - lo)
+        baseline = jnp.float64(0.0)
+        for bx in (0, 1):
+            ix = hi[0] if bx else lo[0]
+            wx = w1[0] if bx else w0[0]
+            for by in (0, 1):
+                iy = hi[1] if by else lo[1]
+                wy = w1[1] if by else w0[1]
+                for bz in (0, 1):
+                    iz = hi[2] if bz else lo[2]
+                    wz = w1[2] if bz else w0[2]
+                    corner = grid.origin + jnp.array([ix, iy, iz]) * grid.gridspacing
+                    corner_dsq = jnp.maximum(((corner - rec_xyz) ** 2).sum(), plateaudissq)
+                    corner_lj = nonbon(corner_dsq, ff0, at1, at2)
+                    if cdie:
+                        corner_el = elec_dsq_cdie(corner_dsq, charge0)
+                    else:
+                        corner_el = elec_dsq_const(corner_dsq, charge0)
+                    baseline = baseline + wx * wy * wz * (corner_lj + corner_el)
+        return direct_lj + direct_el - baseline
 
     if not energy_only:
         grad_nonbon = jax.grad(nonbon)
@@ -373,8 +410,12 @@ def build_kernel(
     def interpolate_grid(channel_idx, voxel, potential_grid):
         voxel0 = jnp.floor(voxel).astype(np.int32)
         voxel1 = jnp.ceil(voxel).astype(np.int32)
-        w0 = voxel1 - voxel
-        w1 = voxel - voxel0
+        exact = voxel0 == voxel1
+        # floor and ceil coincide at a grid node; the ordinary interpolation
+        # weights then both become zero. Preserve the node value with a unit
+        # lower-corner weight (the two corners have the same index).
+        w0 = jnp.where(exact, 1.0, voxel1 - voxel)
+        w1 = jnp.where(exact, 0.0, voxel - voxel0)
         bsz = voxel.shape[0]
         chan = jnp.broadcast_to(channel_idx[None, :], (bsz, channel_idx.shape[0]))
         result = jnp.zeros((voxel.shape[0], voxel.shape[1], 4), dtype=jnp.float64)
@@ -539,8 +580,30 @@ def build_kernel(
         d = lig_c - rec_c
         dsq = (d * d).sum()
         charge = rec_charge_scaled0[safe_atom] * lig_charge_scaled0[lig_atom]
-        valid = (receptor_atom < 2**16 - 1) & (dsq < plateaudissq)
-        return cond(valid, pair_dif, lambda *_: 0.0, d, ff0, at1, at2, charge)
+        valid = (receptor_atom < 2**16 - 1) & (receptor_atom < nrec)
+        in_shell = jnp.abs(jnp.sqrt(dsq) - grid.plateaudis) <= jnp.sqrt(3.0) * grid.gridspacing
+        deep = valid & (dsq < plateaudissq) & ~in_shell
+        shell = valid & in_shell
+        return cond(
+            deep,
+            pair_dif,
+            lambda *_: cond(
+                shell,
+                pair_grid_correction,
+                lambda *_: 0.0,
+                lig_c,
+                rec_c,
+                ff0,
+                at1,
+                at2,
+                charge,
+            ),
+            d,
+            ff0,
+            at1,
+            at2,
+            charge,
+        )
 
     nb_energy_vec = jnp.vectorize(
         nb_energy_single,
@@ -724,15 +787,18 @@ def build_kernel(
             d = lig_c - rec_c  # (N, K, 3)
             dsq = (d * d).sum(axis=-1)  # (N, K)
 
-            # Full validity: real neighbour & within plateau distance
-            valid = valid_nb & (dsq < plateaudissq)
+            # Retain every real candidate in the geometrically extended list;
+            # deep plateau pairs use the constant correction and shell pairs
+            # replace their actual trilinear baseline with exact energy.
+            valid = valid_nb & (receptor_atoms < nrec)
 
             # Atom types: (N, K) for receptor, (N, 1) for ligand
             at1 = rec_atomtypes[safe_atoms]  # (N, K)
             at2 = lig_atomtypes0[lig_atom][:, None]  # (N, 1)
 
             # --- LJ energy ---
-            safe_dsq = jnp.where(valid, dsq, 1.0)  # avoid div-by-zero
+            # Match the explicit gridless scorer's short-distance floor.
+            safe_dsq = jnp.maximum(jnp.where(valid, dsq, 1.0), 0.001)
             rr2 = 1.0 / safe_dsq
             alen = ff0.ac[at1, at2]
             rlen = ff0.rc[at1, at2]
@@ -745,9 +811,9 @@ def build_kernel(
                 vlj + (attraction - 1.0) * ff0.emin[at1, at2],
                 attraction * vlj,
             )
-            # Subtract plateau: (N, K)
+            # Direct pair energy, with the same short-distance floor as the
+            # gridless scorer.
             e_lj_plateau = _plateau_lj[at1, at2]
-            e_lj_corr = e_lj - e_lj_plateau
 
             # --- Electrostatic energy ---
             charge = (
@@ -755,17 +821,66 @@ def build_kernel(
             )
             charge_safe = jnp.where(jnp.abs(charge) > 1e-3, charge, 0.0)
             if cdie:
-                e_el = charge_safe * (
-                    jnp.maximum(1.0 / jnp.sqrt(safe_dsq) - inv50, 0.0)
-                    - _plateau_el_per_charge
-                )
+                e_el = charge_safe * jnp.maximum(1.0 / jnp.sqrt(safe_dsq) - inv50, 0.0)
             else:
-                e_el = charge_safe * (
-                    jnp.maximum(rr2 - inv50sq, 0.0) - _plateau_el_per_charge
-                )
+                e_el = charge_safe * jnp.maximum(rr2 - inv50sq, 0.0)
 
-            # Total per-pair energy, masked by validity
-            e_pair = jnp.where(valid, e_lj_corr + e_el, 0.0)  # (N, K)
+            # Build each candidate pair's trilinear baseline from the same
+            # eight clamped inner-grid corners used by potential interpolation.
+            voxel = (lig_c[:, 0, :] - grid.origin) / grid.gridspacing
+            lo = jnp.floor(voxel).astype(jnp.int32)
+            hi = jnp.ceil(voxel).astype(jnp.int32)
+            exact = lo == hi
+            w0 = jnp.where(exact, 1.0, hi - voxel)
+            w1 = jnp.where(exact, 0.0, voxel - lo)
+            pair_baseline = jnp.zeros_like(dsq, dtype=jnp.float64)
+            for bx in (0, 1):
+                ix = hi[:, 0] if bx else lo[:, 0]
+                wx = w1[:, 0] if bx else w0[:, 0]
+                for by in (0, 1):
+                    iy = hi[:, 1] if by else lo[:, 1]
+                    wy = w1[:, 1] if by else w0[:, 1]
+                    for bz in (0, 1):
+                        iz = hi[:, 2] if bz else lo[:, 2]
+                        wz = w1[:, 2] if bz else w0[:, 2]
+                        corner_idx = jnp.stack((ix, iy, iz), axis=-1)
+                        corner = grid.origin + corner_idx * grid.gridspacing
+                        corner_delta = corner[:, None, :] - rec_c
+                        corner_dsq = jnp.maximum(
+                            (corner_delta * corner_delta).sum(axis=-1), plateaudissq
+                        )
+                        corner_rr2 = 1.0 / corner_dsq
+                        corner_rr23 = corner_rr2 * corner_rr2 * corner_rr2
+                        corner_rep = ff0.rc[at1, at2] * corner_rr2
+                        corner_vlj = (corner_rep - ff0.ac[at1, at2]) * corner_rr23
+                        corner_lj = jnp.where(
+                            corner_dsq < ff0.rmin2[at1, at2],
+                            corner_vlj + (attraction - 1.0) * ff0.emin[at1, at2],
+                            attraction * corner_vlj,
+                        )
+                        if cdie:
+                            corner_el = charge_safe * jnp.maximum(
+                                1.0 / jnp.sqrt(corner_dsq) - inv50, 0.0
+                            )
+                        else:
+                            corner_el = charge_safe * jnp.maximum(
+                                corner_rr2 - inv50sq, 0.0
+                            )
+                        pair_baseline = pair_baseline + (wx * wy * wz)[:, None] * (
+                            corner_lj + corner_el
+                        )
+
+            deep = valid & (dsq < plateaudissq) & (
+                jnp.abs(jnp.sqrt(dsq) - grid.plateaudis)
+                > jnp.sqrt(3.0) * grid.gridspacing
+            )
+            shell = valid & (
+                jnp.abs(jnp.sqrt(dsq) - grid.plateaudis)
+                <= jnp.sqrt(3.0) * grid.gridspacing
+            )
+            e_deep = (e_lj - e_lj_plateau) + e_el - charge_safe * _plateau_el_per_charge
+            e_shell = e_lj + e_el - pair_baseline
+            e_pair = jnp.where(deep, e_deep, jnp.where(shell, e_shell, 0.0))
             return e_pair.sum(axis=1)  # (N,)
 
         @jit

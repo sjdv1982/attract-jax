@@ -19,8 +19,9 @@ Outer grid (dim2[0] × dim2[1] × dim2[2])
     where origin_outer = origin − gridextension * gridspacing
 
 Correction neighbour grid (inner dims)
-    Indices of receptor atoms within ``neighbourdis`` of each voxel *centre*
-    Used at scoring time for the NB-correction soft-core path.
+    Indices of receptor atoms within the effective correction radius of each
+    voxel *centre*. The radius is at least ``neighbourdis`` and is expanded to
+    cover every plateau-shell pair that can contribute through interpolation.
 
 Sign conventions (gradient convention — matches ``read_grid_with_electro()``)
 -----------------------------------------------------------------------------
@@ -232,7 +233,9 @@ def generate_grid(
     plateaudis : float
         Soft-core plateau distance (Å), default 10.
     neighbourdis : float
-        Correction-term neighbour cutoff (Å), default 12.
+        Requested correction-term neighbour cutoff (Å), default 12. The
+        generated radius may be expanded to cover the plateau interpolation
+        shell; the requested value remains in the returned grid metadata.
 
     Returns
     -------
@@ -496,8 +499,16 @@ def generate_grid(
     # ------------------------------------------------------------------
     print("Building correction neighbour grid...")
     voxel_centres = inner_corners + 0.5 * gs
+    # The neighbour list is queried at half-offset voxel centres, while the
+    # scorer selects its list with floor(voxel + 0.5). Under that indexing a
+    # query can be one full grid spacing from the selected list centre on each
+    # axis. Include the full plateau shell that can contribute through any
+    # interpolation corner (sqrt(3) * gs), plus that centre-to-query bound.
+    plateau_shell_radius = float(plateaudis) + 2.0 * math.sqrt(3.0) * gs
+    correction_radius = max(float(neighbourdis), plateau_shell_radius)
+    correction_radius = np.nextafter(correction_radius, np.inf)
     nb_nr, nb_ns, nb_nc = _build_kd_neighbour_list(
-        voxel_centres, rec_c, float(neighbourdis)
+        voxel_centres, rec_c, correction_radius
     )
     max_k = int(nb_nr.max()) if nb_nr.size and nb_nr.max() > 0 else 0
 
