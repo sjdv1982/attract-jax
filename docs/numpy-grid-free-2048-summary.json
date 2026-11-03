@@ -1,0 +1,101 @@
+{
+  "filter": {
+    "candidate_count": 2048,
+    "direct_energy_gt_100_count": 827,
+    "direct_energy_le_100_count": 1221,
+    "grid_energy_le_100_counts": {
+      "10-12_jax": 1221,
+      "10-12_jax-compiled": 1221,
+      "10-12_numpy": 1221,
+      "5-7_jax": 1221,
+      "5-7_jax-compiled": 1221,
+      "5-7_numpy": 1221
+    },
+    "retained_count": 1221
+  },
+  "float64_validation": {
+    "direct_vs_attract_infinite_max_abs": 8.142819751810748e-12,
+    "direct_vs_attract_infinite_mean_abs": 5.87501947968789e-13,
+    "grid_backend_max_abs_by_grid": {
+      "10-12": 1.057287590811029e-11,
+      "5-7": 1.0601297617540695e-11
+    }
+  },
+  "generation": {
+    "candidate_poses": 2048,
+    "direct_reference": "JaxScoreOracle backend=numpy, grid_free=True; full float64 API output",
+    "epsilon": 15.0,
+    "grid_spacing_angstroms": 0.9,
+    "grids": {
+      "10-12": "legacy make-grid-omp plateau=10 pairlist=12",
+      "5-7": "legacy make-grid-omp plateau=5 pairlist=7"
+    },
+    "identity_control": "candidate 0 set to six zeros",
+    "legacy_crosscheck": "attract-infinite --score on equivalent Euler .dat poses",
+    "ligand": "1B7F-bound/frag5r.pdb",
+    "ligand_pivot": "arithmetic mean of reduced ligand coordinates",
+    "pose_dofs": "rotvec radians xyz; translation in Angstroms; two independently sampled blocks of 1024",
+    "receptor": "1B7F-bound/receptorr.pdb",
+    "retention": "direct energy <= 100 kcal/mol; original zero-based candidate index retained",
+    "rng": "numpy.random.default_rng(20261027)",
+    "rotation_sigma_radians": 0.15,
+    "translation_sigma_angstroms": 1.0
+  },
+  "grid_accuracy": {
+    "10-12_jax": {
+      "maximum_absolute_error": 0.024834508941523836,
+      "mean_absolute_error": 0.005720873448420748,
+      "median_absolute_error": 0.004672571065346354,
+      "p95_absolute_error": 0.014132878480729971,
+      "poses_within_0_001": 129,
+      "rmse": 0.007248463797044162,
+      "signed_bias": 0.0020336434524375084
+    },
+    "10-12_jax-compiled": {
+      "maximum_absolute_error": 0.024834508941495415,
+      "mean_absolute_error": 0.005720873448448064,
+      "median_absolute_error": 0.00467257106551644,
+      "p95_absolute_error": 0.014132878480726419,
+      "poses_within_0_001": 129,
+      "rmse": 0.007248463797050475,
+      "signed_bias": 0.002033643452414262
+    },
+    "10-12_numpy": {
+      "maximum_absolute_error": 0.02483450894151673,
+      "mean_absolute_error": 0.0057208734484355825,
+      "median_absolute_error": 0.004672571065139852,
+      "p95_absolute_error": 0.01413287848074063,
+      "poses_within_0_001": 129,
+      "rmse": 0.007248463797033877,
+      "signed_bias": 0.002033643452440778
+    },
+    "5-7_jax": {
+      "maximum_absolute_error": 0.5349466156263212,
+      "mean_absolute_error": 0.13051178091046606,
+      "median_absolute_error": 0.10400270960220226,
+      "p95_absolute_error": 0.3363623522195667,
+      "poses_within_0_001": 10,
+      "rmse": 0.16631438244415117,
+      "signed_bias": 0.008148956803765539
+    },
+    "5-7_jax-compiled": {
+      "maximum_absolute_error": 0.5349466156258451,
+      "mean_absolute_error": 0.13051178091045892,
+      "median_absolute_error": 0.10400270960202818,
+      "p95_absolute_error": 0.33636235221954536,
+      "poses_within_0_001": 10,
+      "rmse": 0.16631438244412547,
+      "signed_bias": 0.008148956803741995
+    },
+    "5-7_numpy": {
+      "maximum_absolute_error": 0.5349466156257314,
+      "mean_absolute_error": 0.1305117809104552,
+      "median_absolute_error": 0.10400270960193936,
+      "p95_absolute_error": 0.3363623522195631,
+      "poses_within_0_001": 10,
+      "rmse": 0.1663143824441673,
+      "signed_bias": 0.008148956803768878
+    }
+  },
+  "schema": 1
+}

@@ -113,14 +113,23 @@ def print_legacy_score(energies, gradients, include_gradients=True):
 
     gradients are expected as +dE/dx; legacy prints forces (-dE/dx).
     """
-    for e, g in zip(np.asarray(energies), np.asarray(gradients)):
-        f = -np.asarray(g, dtype=np.float64)
+    energies = np.asarray(energies).reshape(-1)
+    gradients = np.asarray(gradients)
+    if include_gradients and (
+        gradients.ndim != 2 or gradients.shape != (len(energies), 6)
+    ):
+        raise ValueError(
+            "Expected gradients with shape (N,6) when printing score gradients, "
+            f"got {gradients.shape} for {len(energies)} energies"
+        )
+    for index, e in enumerate(energies):
         print(f" Energy: {float(e): .16f}     ")
         print(
             f"{float(e):12.3f}{0.0:12.3f}{0.0:12.3f}"
             f"{0.0:12.3f}{0.0:12.3f}{0.0:12.3f}"
         )
         if include_gradients:
+            f = -np.asarray(gradients[index], dtype=np.float64)
             print(" Gradients:" + "".join(f"{float(v):24.16E}" for v in f))
 
 
