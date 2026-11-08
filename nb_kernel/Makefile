@@ -44,6 +44,9 @@ SHARED_HEADERS := nb_kernel.h include/euler_rot.h include/pose_loop.h
 # Use 'make nb_kernel_<name>.so' to build a specific one.
 all: $(TARGET)
 
+nb_kernel_gridless_nonbon8.so: gridless_nonbon8.cpp nb_kernel.h include/euler_rot.h include/rotvec_rot.h forcefields/nonbon8/lj.h forcefields/nonbon8/elec.h
+	$(CXX) $(CXXFLAGS) $(CXXFLAGS_INTERNAL) gridless_nonbon8.cpp -o $@ $(LDFLAGS)
+
 $(TARGET): $(SRC) $(LEGACY_HEADERS)
 	$(CXX) $(CXXFLAGS) $(CXXFLAGS_INTERNAL) $(SRC) -o $@ $(LDFLAGS)
 
@@ -63,5 +66,5 @@ nb_kernel_%.so: forcefields/%/ff.yaml codegen_ff.py $(SHARED_HEADERS)
 	$(CXX) $(CXXFLAGS) $(CXXFLAGS_INTERNAL) forcefields/$*/nb_kernel_$*.cpp -o $@ $(LDFLAGS)
 
 clean:
-	rm -f $(TARGET) $(FF_SOS)
+	rm -f $(TARGET) $(FF_SOS) nb_kernel_gridless_nonbon8.so
 	find forcefields -name 'nb_kernel_*.cpp' -delete

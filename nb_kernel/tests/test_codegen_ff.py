@@ -697,14 +697,17 @@ class TestFFDiscovery(unittest.TestCase):
 
     @_requires_jax
     def test_find_kernel_so_returns_none_when_absent(self):
-        """Before building, no .so should be found for nonbon8 (unless it already exists)."""
-        ff = self.load_forcefield("forcefields.nonbon8")
-        so_path = NONBON8_DIR / "nb_kernel_nonbon8.so"
-        result = self.find_kernel_so(ff)
-        if so_path.exists():
-            self.assertIsNotNone(result)
-        else:
-            self.assertIsNone(result)
+        """An isolated empty forcefield must not discover a kernel from the checkout."""
+        import types
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ff_dir = Path(temp_dir) / "isolated_nonbon8"
+            ff_dir.mkdir()
+            module_file = ff_dir / "__init__.py"
+            module_file.write_text("# isolated forcefield module\n")
+            ff = types.ModuleType("forcefields.isolated_nonbon8")
+            ff.__file__ = str(module_file)
+            self.assertIsNone(self.find_kernel_so(ff))
 
     def test_probe_symbols_on_libnbkernel_nonbon8(self):
         """The main .so must contain the canonical nonbon8 symbols."""

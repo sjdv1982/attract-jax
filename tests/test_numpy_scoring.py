@@ -237,11 +237,32 @@ def test_direct_overlap_uses_legacy_distance_floor(scoring_inputs):
 
 
 @pytest.mark.parametrize("extra_args", [["--grid", "unused.grid"], ["--generate-grid"],
-                                       ["--oracle", "jax"]])
+                                       ["--oracle", "legacy"]])
 def test_no_grid_cli_rejects_incompatible_options(monkeypatch, extra_args):
     monkeypatch.setattr(sys, "argv", [
         "minfor.py", "--oracle", "numpy", "--score", "--energy-only", "--no-grid",
         "--identity", "--attract-par-npz", "unused.npz", *extra_args,
+    ])
+    with pytest.raises(SystemExit) as exc:
+        parse_args()
+    assert exc.value.code == 2
+
+
+def test_no_grid_cli_accepts_compiled_jax_energy_only(monkeypatch):
+    monkeypatch.setattr(sys, "argv", [
+        "minfor.py", "--oracle", "jax", "--score", "--energy-only", "--no-grid",
+        "--identity", "--attract-par-npz", "unused.npz",
+    ])
+    args = parse_args()
+    assert args.oracle == "jax"
+    assert args.nb_kernel == "compiled"
+    assert args.no_grid and args.energy_only
+
+
+def test_no_grid_cli_rejects_jax_nonbonded_kernel(monkeypatch):
+    monkeypatch.setattr(sys, "argv", [
+        "minfor.py", "--oracle", "jax", "--nb-kernel", "jax", "--score", "--energy-only",
+        "--no-grid", "--identity", "--attract-par-npz", "unused.npz",
     ])
     with pytest.raises(SystemExit) as exc:
         parse_args()

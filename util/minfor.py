@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimizer benchmark: batched VA13 minimizer with ATTRACT-style oracles.
+"""Batched ATTRACT minimization, scoring, and energy filtering.
 
 Implements a quasi-Newton minimizer matching the key parameters of legacy
 minfor (Harwell VA13 variable-metric method):
@@ -1208,7 +1208,7 @@ def resolve_attract_paths(test_dir, ligand_pdb=None):
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-def parse_args():
+def parse_args(argv=None):
     ap = argparse.ArgumentParser(
         description=(
             "Batched VA13/DFP minimizer. Primary path: ATTRACT-JAX "
@@ -1302,6 +1302,17 @@ def parse_args():
         action="store_true",
         help="with --score: print energy-only legacy-style blocks (omit Gradients lines)",
     )
+    ap.add_argument("--filter", action="store_true",
+                    help="compiled energy-only scoring; write white/grey pose indices, never minimize")
+    ap.add_argument("--energy-threshold", type=float,
+                    help="filter threshold T (lower, including more negative, is better)")
+    ap.add_argument("--energy-tolerance", type=float, help="non-negative filter tolerance m")
+    ap.add_argument("--output-white", help="NPY output of 0-based uint64 indices with E < T-m")
+    ap.add_argument("--output-grey", help="NPY output of 0-based uint64 indices with T-m <= E < T+m")
+    ap.add_argument("--pose-indices", help="NPY indices selecting poses from the original input arrays")
+    ap.add_argument("--filter-report", help="optional JSON route/count report")
+    ap.add_argument("--filter-precision-safe", action="store_true",
+                    help="reserve grid scores with inadequate float64 precision for exact scoring")
     ap.add_argument(
         "--output-npy",
         default=None,
@@ -1362,8 +1373,11 @@ def parse_args():
     ap.add_argument(
         "--no-grid",
         action="store_true",
-        help="NumPy energy-only scoring: evaluate all atom pairs without loading or generating a grid",
+        help="compiled or NumPy energy-only scoring: evaluate all pairs without a grid",
     )
+    ap.add_argument("--plateaudis", type=float, default=10.0, help="generated grid plateau distance (A)")
+    ap.add_argument("--neighbourdis", type=float, default=12.0, help="generated grid neighbour distance (A)")
+    ap.add_argument("--save-grid", metavar="FILE", help="save a generated NPZ grid and continue scoring")
     ap.add_argument(
         "--generate-grid",
         action="store_true",
@@ -1555,11 +1569,44 @@ def parse_args():
         action="store_true",
         help="print a progress line whenever a batched minimization tick completes",
     )
-    args = ap.parse_args()
-    argv = sys.argv[1:]
+    argv = sys.argv[1:] if argv is None else list(argv)
+    args = ap.parse_args(argv)
 
     def _opt_used(opt_name: str) -> bool:
         return any(tok == opt_name or tok.startswith(opt_name + "=") for tok in argv)
+
+    filter_options = ("--energy-threshold", "--energy-tolerance", "--output-white", "--output-grey",
+                      "--pose-indices", "--filter-report", "--filter-precision-safe")
+    if args.filter:
+        args.score = args.energy_only = True
+        if args.oracle != "jax" or args.nb_kernel != "compiled":
+            ap.error("--filter requires --oracle jax --nb-kernel compiled")
+        if args.energy_threshold is None or args.energy_tolerance is None or not args.output_white or not args.output_grey:
+            ap.error("--filter requires --energy-threshold, --energy-tolerance, --output-white and --output-grey")
+        if not math.isfinite(args.energy_threshold) or not math.isfinite(args.energy_tolerance) or args.energy_tolerance < 0:
+            ap.error("filter threshold must be finite; tolerance must be finite and non-negative")
+        outputs = [str(Path(path).resolve()) for path in (args.output_white, args.output_grey)]
+        if args.filter_report:
+            outputs.append(str(Path(args.filter_report).resolve()))
+        if len(set(outputs)) != len(outputs):
+            ap.error("white, grey and report outputs must be different files")
+        if args.output_npy or args.generate_grid or args.benchmark_steady_state:
+            ap.error("--filter cannot be combined with --output-npy, --generate-grid or --benchmark-steady-state")
+        if args.pose_indices and (not (args.input_npy or args.input_rotvec or args.input_euler) or args.pose_offset or args.max_poses):
+            ap.error("--pose-indices requires NPY pose input without --pose-offset/--max-poses")
+        if args.filter_precision_safe and not args.filter_report:
+            ap.error("--filter-precision-safe requires --filter-report")
+        if args.filter_precision_safe and args.no_grid:
+            ap.error("--filter-precision-safe applies only to grid filter passes")
+        if not _opt_used("--score-mode"):
+            args.score_mode = "bulk"
+    elif any(_opt_used(option) for option in filter_options):
+        ap.error("filter threshold, tolerance, index and output options require --filter")
+    if (not math.isfinite(args.plateaudis) or not math.isfinite(args.neighbourdis)
+            or args.plateaudis <= 0 or args.neighbourdis < args.plateaudis):
+        ap.error("grid distances must be finite, with 0 < plateaudis <= neighbourdis")
+    if args.save_grid and (args.grid or args.no_grid or args.generate_grid):
+        ap.error("--save-grid requires just-in-time grid generation")
 
     if args.oracle == "legacy":
         jax_only_opts = [
@@ -1577,6 +1624,9 @@ def parse_args():
             "--forcefield",
             "--autodiff-potentials",
             "--disable-jit",
+            "--plateaudis",
+            "--neighbourdis",
+            "--save-grid",
         ]
         used = [opt for opt in jax_only_opts if _opt_used(opt)]
         if used:
@@ -1608,8 +1658,8 @@ def parse_args():
         if args.score_batch_size is not None and args.score_batch_size <= 0:
             ap.error("--score-batch-size must be >= 1")
     if args.no_grid:
-        if args.oracle != "numpy":
-            ap.error("--no-grid requires --oracle numpy")
+        if args.oracle == "legacy" or (args.oracle == "jax" and (args.nb_kernel != "compiled" or not (args.score and args.energy_only))):
+            ap.error("--no-grid requires compiled or NumPy energy-only scoring")
         if args.grid or args.generate_grid:
             ap.error("--no-grid cannot be combined with --grid or --generate-grid")
     if args.oracle == "numpy":
@@ -1801,6 +1851,8 @@ def main():
             ffelec=_ffelec,
             lig_atomtypes=_lig_atomtypes_early,
             force_jax=(args.nb_kernel == "jax"),
+            plateaudis=args.plateaudis,
+            neighbourdis=args.neighbourdis,
             return_gradients=not args.autodiff_potentials,
         )
         _write_npz(grid_object, args.grid)
@@ -1952,7 +2004,7 @@ def main():
         print(f"Ligand pivot: {lig_pivot}")
 
     # --- Convert world-frame translations → ATTRACT DOFs (rotvec path) ---
-    if _dof_type == "rotvec" and args.input_world_centered:
+    if _dof_type == "rotvec" and args.input_world_centered and not args.filter:
         if args.score and args.input_npy and len(dofs0) >= 1_000_000:
             input_tmpdir_ctx = tempfile.TemporaryDirectory(prefix="minfor_input_")
             scratch_path = os.path.join(input_tmpdir_ctx.name, "dofs0-attr.npy")
@@ -1967,7 +2019,7 @@ def main():
     # --- Convert centered → non-centered for the Python scoring oracles ---
     input_centered = bool(centered_ligands) if centered_ligands is not None else False
     converted_for_oracle = input_centered and args.oracle in ("jax", "numpy")
-    if converted_for_oracle:
+    if converted_for_oracle and not args.filter:
         dofs0 = dofs0.copy()
         dofs0[:, 3:6] -= lig_pivot[None, :]
         if verbose:
@@ -2056,8 +2108,14 @@ def main():
                 ffelec=_ffelec,
                 lig_atomtypes=_lig_atomtypes,
                 force_jax=(args.nb_kernel == "jax"),
-                return_gradients=not args.autodiff_potentials,
+                plateaudis=args.plateaudis,
+                neighbourdis=args.neighbourdis,
+                return_gradients=not (args.autodiff_potentials or args.filter),
             )
+            if args.save_grid:
+                from reproduce_grid_score import write_grid_npz as _write_npz
+
+                _write_npz(grid_object, args.save_grid)
             if args.generate_grid:
                 # --generate-grid: write to --grid <path> and exit.
                 from reproduce_grid_score import write_grid_npz as _write_npz
@@ -2141,6 +2199,26 @@ def main():
         )
 
     try:
+        if args.filter:
+            from minfor_filter import filter_poses
+
+            def prepare_filter_batch(batch):
+                if _dof_type == "rotvec" and args.input_world_centered:
+                    batch = rotvec_world_to_attr_np(batch, lig_pivot, copy=True)
+                if converted_for_oracle:
+                    batch = np.array(batch, dtype=np.float64, copy=True)
+                    batch[:, 3:6] -= lig_pivot[None, :]
+                return batch
+
+            filter_poses(
+                oracle, dofs0, ens, ligand_conformers,
+                threshold=args.energy_threshold, tolerance=args.energy_tolerance,
+                white_output=args.output_white, grey_output=args.output_grey,
+                pose_indices=args.pose_indices, offset=max(args.pose_offset, 0),
+                batch_size=int(args.score_batch_size or 8192), transform=prepare_filter_batch,
+                precision_safe=args.filter_precision_safe, report_path=args.filter_report,
+            )
+            return
         # Score starting poses
         if verbose:
             print("Scoring starting poses...")

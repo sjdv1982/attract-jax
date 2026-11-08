@@ -1,5 +1,7 @@
 reproduce_grid_score.py
 jax_scorer.py
+compiled_gridless.py
+minfor_filter.py
 grid_generator.py
 score_pairs.py
 dat_to_npy.py
@@ -8,6 +10,7 @@ grid_io.py
 numpy_grid_score.py
 pdb_io.py
 ../nb_kernel/nb_kernel.h
+../nb_kernel/gridless_nonbon8.cpp
 ../nb_kernel/include/pose_loop.h
 ../nb_kernel/include/euler_rot.h
 ../nb_kernel/include/rotvec_rot.h

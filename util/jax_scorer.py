@@ -165,8 +165,8 @@ class JaxScoreOracle:
     backend : {"jax", "numpy"}
         NumPy requires energy_only=True and uses NumPy neighbour correction.
     grid_free : bool
-        With NumPy, evaluate all receptor-ligand pairs directly. No grid may
-        be supplied; both loading and generation are bypassed.
+        Evaluate all receptor-ligand pairs directly, using either the compiled
+        energy-only backend or NumPy reference. No grid may be supplied.
     grid_object : Grid namedtuple or None
         Pre-built Grid (e.g. from ``generate_grid()``).  If provided,
         ``grid_file`` is ignored.  Exactly one of ``grid_file`` or
@@ -204,8 +204,31 @@ class JaxScoreOracle:
         grid_free: bool = False,
     ):
         self._grid_free = bool(grid_free)
+        self._compiled_gridless = None
+        if grid_free and backend == "jax" and nb_kernel == "compiled":
+            if not energy_only:
+                raise ValueError("Compiled grid-free scoring requires energy_only=True")
+            if grid_file is not None or grid_object is not None:
+                raise ValueError("grid_free=True cannot be combined with a grid")
+            from compiled_gridless import CompiledGridlessScoreOracle
+
+            self._energy_only = True
+            self._backend = backend
+            self._nb_kernel = nb_kernel
+            self._call_count = 0
+            self._total_kernel_calls = 0
+            self._total_kernel_time = 0.0
+            self._compiled_gridless = CompiledGridlessScoreOracle(
+                receptor_ensemble=receptor_ensemble, receptor_atomtypes=receptor_atomtypes,
+                receptor_charges=receptor_charges, receptor_ens_list=receptor_ens_list,
+                ligand_ensemble=ligand_ensemble, ligand_atomtypes=ligand_atomtypes,
+                ligand_charges=ligand_charges, ligand_pdb=ligand_pdb,
+                attract_par_npz=attract_par_npz, lig_pivot=lig_pivot, epsilon=epsilon,
+                dof_type=dof_type,
+            )
+            return
         if grid_free and backend != "numpy":
-            raise ValueError("grid_free=True requires backend='numpy'")
+            raise ValueError("grid_free=True requires the compiled or NumPy energy-only backend")
         if grid_free and (grid_file is not None or grid_object is not None):
             raise ValueError("grid_free=True cannot be combined with a grid")
         self._backend = backend
@@ -1302,6 +1325,12 @@ class JaxScoreOracle:
         energies  : (N,) float64
         gradients : (N, 6) float64
         """
+        if self._compiled_gridless is not None:
+            self._call_count += 1
+            result = self._compiled_gridless.score_batch(ens, dofs, conformers)
+            self._total_kernel_calls = self._compiled_gridless._total_kernel_calls
+            self._total_kernel_time = self._compiled_gridless._total_kernel_time
+            return result
         self._call_count += 1
         ens = np.asarray(ens, dtype=np.int32)
         dofs = np.asarray(dofs, dtype=np.float64)
@@ -1575,6 +1604,8 @@ class JaxScoreOracle:
 
     def print_stats(self):
         """Print kernel timing statistics."""
+        if self._compiled_gridless is not None:
+            return self._compiled_gridless.print_stats()
         if self._total_kernel_calls > 0:
             avg = self._total_kernel_time / self._total_kernel_calls * 1000
             print(
