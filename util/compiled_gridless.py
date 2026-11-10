@@ -91,7 +91,7 @@ class CompiledGridlessScoreOracle:
         kernel_dir = Path(__file__).resolve().parents[1] / "nb_kernel"
         library = kernel_dir / "nb_kernel_gridless_nonbon8.so"
         dependencies = [kernel_dir / name for name in (
-            "gridless_nonbon8.cpp", "nb_kernel.h", "include/euler_rot.h", "include/rotvec_rot.h",
+            "Makefile", "gridless_nonbon8.cpp", "nb_kernel.h", "include/euler_rot.h", "include/rotvec_rot.h",
             "forcefields/nonbon8/lj.h", "forcefields/nonbon8/elec.h")]
         if not library.exists() or any(path.stat().st_mtime > library.stat().st_mtime for path in dependencies):
             subprocess.run(["make", "-C", str(kernel_dir), library.name], check=True)

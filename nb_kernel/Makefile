@@ -1,5 +1,21 @@
 CXX ?= g++
-CXXFLAGS ?= -O3 -DNDEBUG -std=c++17 -march=native -fPIC
+# Target ISA.  Deliberately NOT -march=native: the .so files are built lazily
+# by whichever process first needs them and are cached next to the sources, so
+# on a shared filesystem a native build made on one node is executed on every
+# other node.  A build node with AVX-512 then dies with SIGILL on an AVX2-only
+# node (GCC emits AVX-512-only encodings even for this scalar code).  The
+# kernels are scalar, so a fixed baseline costs little, and a fixed target also
+# makes energies bit-identical across heterogeneous nodes (FMA contraction is
+# the same everywhere).  Pick the level of the OLDEST node that will run it:
+#   nehalem   ~ x86-64-v2  (SSE4.2; Intel 2008+, AMD 2011+)
+#   haswell   ~ x86-64-v3  (AVX2+FMA+BMI2; Intel 2013+, AMD Zen 2017+)
+# The x86-64-v* spellings need gcc>=11 / clang>=12; the CPU names work on any
+# compiler of the last decade.  -mtune=generic keeps scheduling neutral.
+# Override per build: `make ARCH=haswell ...`, or ARCH=native for one machine.
+# Every .so lists this Makefile as a prerequisite, so changing ARCH/CXXFLAGS here
+# rebuilds the cached libraries on the next use.
+ARCH ?= haswell
+CXXFLAGS ?= -O3 -DNDEBUG -std=c++17 -march=$(ARCH) -mtune=generic -fPIC
 # Always add current-directory include so that headers in include/ and
 # forcefields/ can find nb_kernel.h via plain #include "nb_kernel.h".
 CXXFLAGS_INTERNAL := -I.
@@ -37,6 +53,15 @@ FF_SOS   := $(foreach n,$(FF_NAMES),nb_kernel_$(n).so)
 # Headers shared by every per-FF .so compilation (rotation policy + pose loop).
 SHARED_HEADERS := nb_kernel.h include/euler_rot.h include/pose_loop.h
 
+# Link a shared library atomically: compile into a temporary file and rename it
+# over the target.  Several processes on a shared filesystem may rebuild a stale
+# .so at the same time, and a reader must never dlopen a half-written file.
+# rename(2) is atomic, and a process that already mapped the old file keeps it.
+# ($$$$ is the shell PID: unique per recipe line, identical within it.)
+define LINK_SO
+$(CXX) $(CXXFLAGS) $(CXXFLAGS_INTERNAL) $(1) -o $@.tmp.$$$$ $(LDFLAGS) && mv -f $@.tmp.$$$$ $@ || { rm -f $@.tmp.$$$$; exit 1; }
+endef
+
 .PHONY: all ffs clean
 
 # 'all' builds only the legacy library (unchanged behaviour through M3).
@@ -44,11 +69,11 @@ SHARED_HEADERS := nb_kernel.h include/euler_rot.h include/pose_loop.h
 # Use 'make nb_kernel_<name>.so' to build a specific one.
 all: $(TARGET)
 
-nb_kernel_gridless_nonbon8.so: gridless_nonbon8.cpp nb_kernel.h include/euler_rot.h include/rotvec_rot.h forcefields/nonbon8/lj.h forcefields/nonbon8/elec.h
-	$(CXX) $(CXXFLAGS) $(CXXFLAGS_INTERNAL) gridless_nonbon8.cpp -o $@ $(LDFLAGS)
+nb_kernel_gridless_nonbon8.so: gridless_nonbon8.cpp nb_kernel.h include/euler_rot.h include/rotvec_rot.h forcefields/nonbon8/lj.h forcefields/nonbon8/elec.h Makefile
+	$(call LINK_SO,gridless_nonbon8.cpp)
 
-$(TARGET): $(SRC) $(LEGACY_HEADERS)
-	$(CXX) $(CXXFLAGS) $(CXXFLAGS_INTERNAL) $(SRC) -o $@ $(LDFLAGS)
+$(TARGET): $(SRC) $(LEGACY_HEADERS) Makefile
+	$(call LINK_SO,$(SRC))
 
 # Build all per-FF libraries discovered via forcefields/*/ff.yaml.
 ffs: $(FF_SOS)
@@ -61,10 +86,10 @@ ffs: $(FF_SOS)
 # $(SHARED_HEADERS) is listed so that changes to euler_rot.h / pose_loop.h
 # trigger a rebuild.  Changes to FF physics .h files do NOT auto-trigger a
 # rebuild; touch forcefields/<name>/ff.yaml to force one.
-nb_kernel_%.so: forcefields/%/ff.yaml codegen_ff.py $(SHARED_HEADERS)
+nb_kernel_%.so: forcefields/%/ff.yaml codegen_ff.py $(SHARED_HEADERS) Makefile
 	python3 codegen_ff.py codegen $* forcefields/$*/
-	$(CXX) $(CXXFLAGS) $(CXXFLAGS_INTERNAL) forcefields/$*/nb_kernel_$*.cpp -o $@ $(LDFLAGS)
+	$(call LINK_SO,forcefields/$*/nb_kernel_$*.cpp)
 
 clean:
-	rm -f $(TARGET) $(FF_SOS) nb_kernel_gridless_nonbon8.so
+	rm -f $(TARGET) $(FF_SOS) nb_kernel_gridless_nonbon8.so *.so.tmp.*
 	find forcefields -name 'nb_kernel_*.cpp' -delete

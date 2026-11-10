@@ -11,6 +11,7 @@ mono-leu/gmon.out
 __pycache__/*
 *.pyc
 *.so
+*.so.tmp.*
 build/
 *.egg-info/
 # Generated per-FF kernel sources (codegen_ff.py output)
