@@ -14,12 +14,27 @@ CXX ?= g++
 # Override per build: `make ARCH=haswell ...`, or ARCH=native for one machine.
 # Every .so lists this Makefile as a prerequisite, so changing ARCH/CXXFLAGS here
 # rebuilds the cached libraries on the next use.
+# These are x86 names; on 64-bit ARM (e.g. Apple silicon) the baseline is armv8-a.
+UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
+ifneq (,$(filter arm64 aarch64,$(UNAME_M)))
+ARCH ?= armv8-a
+else
 ARCH ?= haswell
+endif
 CXXFLAGS ?= -O3 -DNDEBUG -std=c++17 -march=$(ARCH) -mtune=generic -fPIC
 # Always add current-directory include so that headers in include/ and
 # forcefields/ can find nb_kernel.h via plain #include "nb_kernel.h".
 CXXFLAGS_INTERNAL := -I.
+ifeq ($(UNAME_S),Darwin)
+# Apple clang has no -fopenmp driver flag and ships no OpenMP runtime: use
+# libomp (`brew install libomp`).  Override LIBOMP_PREFIX if it lives elsewhere.
+LIBOMP_PREFIX ?= $(shell brew --prefix libomp 2>/dev/null)
+CXXFLAGS_INTERNAL += -Xpreprocessor -fopenmp -I$(LIBOMP_PREFIX)/include
+LDFLAGS ?= -shared -L$(LIBOMP_PREFIX)/lib -lomp
+else
 LDFLAGS ?= -shared -fopenmp
+endif
 
 # ---------------------------------------------------------------------------
 # Legacy target: hand-written nonbon8 kernel (backward-compatible).
